@@ -1,0 +1,13 @@
+# Normalize line endings to LF on checkout across all platforms. The Windows CI
+# job (and any Windows contributor) must get byte-identical fixtures — several
+# test/fixtures/* are parsed/decoded and the bridge prebuild does byte cmp of
+# copied sources, so CRLF conversion would be a portability hazard.
+* text=auto eol=lf
+
+# Binary assets: never touch.
+*.png binary
+*.gif binary
+*.ttf binary
+*.woff binary
+*.woff2 binary
+*.vsix binary

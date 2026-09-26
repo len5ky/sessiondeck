@@ -1,0 +1,68 @@
+SessionDeck — Source-Available License
+Copyright (c) 2026 Eugene Lensky
+
+This is source-available software, not open source. You may read the source and
+modify it for your own use. It is not free for unlimited commercial use, and the
+terms below are what make it sustainable to maintain. They are written to be read.
+
+1. What you may do. You may run the software on any of your own machines, read the
+   source, and modify it for your own private use. You may share unmodified copies —
+   the marketplace listing, a vsix, or the source — as long as this license and the
+   copyright notice stay attached. Distribution of modified copies is covered in
+   section 6.
+
+2. Free evaluation. Everything works, with no limits, for 3 days from the first
+   time you run it. Try the whole thing before you decide.
+
+3. Free tier. After the evaluation, light use stays free forever: up to 3 sessions
+   (top-level sessions — subagents and workflow children never count, and remote
+   hosts don't count toward the limit). Your 3 covered sessions — active ones taking
+   the slots first — always render in full; sessions beyond the cap collapse
+   to a locked placeholder row until you hold a license. Nothing on your disk is
+   touched or altered — the cap only limits what this tool displays. For this
+   section, a "session" is one top-level agent conversation SessionDeck shows on
+   the machine it runs on; subagents, workflow children and sessions on remote
+   hosts are never counted. A session is "active" while it is working or waiting
+   for you. Active sessions fill the 3 covered slots first, then the most recently
+   active of the rest. Any session beyond the 3 covered ones is shown as a locked
+   row.
+
+4. Paid use. To lift the free-tier limits, buy a license: monthly or lifetime, per
+   person (not per machine). One person's key covers that person on all of their own
+   machines. Site or volume licensing is available on request. Current prices are
+   on the purchase page. A lifetime license comes with a 7-day money-back guarantee:
+   ask within 7 days of purchase and you get a full refund.
+
+5. Honesty over enforcement. The license check is deliberately light — a local
+   modulo check on an offline key, nothing more. There is no phone-home, no
+   telemetry, and no network call anywhere in license validation. We trust you to
+   pay for what you use. In return, we keep it offline and private.
+
+6. What you may not do. You may not resell or sublicense this software. You may not
+   distribute modified copies — including, especially, a copy that removes,
+   disables, or circumvents the free-tier limits or the license check
+   ("de-paywalled forks"); modifications are for your own private use, or for
+   contributing back. And you may not share, resell, or publish license keys.
+
+   Contributions are welcome and encouraged. By submitting a contribution (a pull
+   request, patch, or similar) for inclusion in this project, you license it to the
+   project owner under these same terms, and you confirm you have the right to do so.
+
+7. The name. "SessionDeck" — the name, icon, and branding — identifies this product as
+   published by its author. Don't use them on a modified copy or a derived product,
+   or in a way that suggests your work is the original or is endorsed by it.
+   "Claude", "Codex" and "Cursor" are trademarks of their respective owners; this
+   software is an independent tool that observes those tools and is not affiliated
+   with or endorsed by them.
+
+8. No warranty. The software is provided "as is", without warranty of any kind,
+   express or implied. To the maximum extent permitted by law, the author is not
+   liable for any claim, damages, or other liability arising from the software or
+   its use. Status is inferred from your own disk and can be briefly wrong — see the
+   README's "Honest limitations".
+
+These terms are governed by the law of the State of Delaware, USA — where the
+publisher is incorporated — without regard to its conflict-of-law rules. If the law
+where you live gives you rights that can't be waived by contract, you keep them. If
+part of these terms turns out to be unenforceable where you are, the rest still
+stands. If any of this is unclear, or you need terms this doesn't cover, ask.

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- SessionDeck product icon: a compass rose in brand gold on a dark-navy
+       squircle. Two colors drawn from
+       the Session Watch dashboard palette: navy #0c1420–#17273a and gold #d69a34–#f2c766.
+       Self-contained tile so it reads on both dark and light surfaces; the frame-filling
+       rose + bezel keep it legible from 256px down to 16px. No hairlines, no text.
+       This is the master; media/icon.png and media/icon-preview.png are rendered from
+       it via `bun run scripts/render-icon.mjs`. -->
+  <defs>
+    <linearGradient id="navy" x1="0" y1="0" x2="0" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#17273a"/>
+      <stop offset="1" stop-color="#0c1420"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0" y1="16" x2="0" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f2c766"/>
+      <stop offset="1" stop-color="#d69a34"/>
+    </linearGradient>
+  </defs>
+
+  <!-- navy tile -->
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#navy)"/>
+
+  <!-- compass bezel -->
+  <circle cx="128" cy="128" r="104" fill="none" stroke="url(#gold)" stroke-width="9"/>
+
+  <!-- diagonal (intercardinal) points, deeper gold for two-tone depth -->
+  <path d="M174.7 81.3 L140.0 128.0 L174.7 174.7 L128.0 140.0 L81.3 174.7 L116.0 128.0 L81.3 81.3 L128.0 116.0 Z" fill="#a9741b"/>
+
+  <!-- cardinal points, bright gold -->
+  <path d="M128.0 32.0 L145.0 111.0 L224.0 128.0 L145.0 145.0 L128.0 224.0 L111.0 145.0 L32.0 128.0 L111.0 111.0 Z" fill="url(#gold)"/>
+
+  <!-- north pointer: navy notch splits the north spike into a two-tone arrowhead -->
+  <path d="M128 40 L119 122 L137 122 Z" fill="#0c1420"/>
+
+  <!-- hub -->
+  <circle cx="128" cy="128" r="9" fill="#0c1420"/>
+  <circle cx="128" cy="128" r="4" fill="url(#gold)"/>
+</svg>

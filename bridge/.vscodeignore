@@ -1,0 +1,9 @@
+# ALLOWLIST packaging (see ../.vscodeignore): exclude everything, re-include the
+# runtime bundle and the listing files. Enforced by scripts/verify-vsix.ts.
+**
+!out/extension.js
+!package.json
+!README.md
+!LICENSE
+# copied from ../CHANGELOG.md by the package script
+!CHANGELOG.md

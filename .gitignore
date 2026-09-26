@@ -1,0 +1,15 @@
+node_modules/
+out/
+*.vsix
+tmp/
+demo/
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# packaged VSIXes (scripts/release.sh, bun run package)
+dist-vsix/
+# copied from the root CHANGELOG.md at bridge package time (bridge/package.json)
+bridge/CHANGELOG.md

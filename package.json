@@ -1,0 +1,806 @@
+{
+  "name": "sessiondeck",
+  "displayName": "SessionDeck",
+  "description": "One panel for every Claude Code, Codex and Cursor session on this host: grouped by project, live status, subagent activity, unread and approval alerts, click-to-navigate.",
+  "version": "0.41.1",
+  "icon": "media/icon.png",
+  "publisher": "len5ky",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/len5ky/sessiondeck"
+  },
+  "bugs": {
+    "url": "https://github.com/len5ky/sessiondeck/issues"
+  },
+  "homepage": "https://github.com/len5ky/sessiondeck#readme",
+  "keywords": [
+    "claude-code",
+    "claude",
+    "session-monitor",
+    "sessions",
+    "agents",
+    "codex",
+    "cursor",
+    "sessiondeck",
+    "coding-agent",
+    "ai"
+  ],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "sessionDeck",
+          "title": "SessionDeck",
+          "icon": "$(compass)"
+        }
+      ]
+    },
+    "views": {
+      "sessionDeck": [
+        {
+          "id": "sessionDeck.sessions",
+          "name": "Sessions",
+          "icon": "$(compass)",
+          "when": "!sessionDeck.columns"
+        },
+        {
+          "id": "sessionDeck.table",
+          "name": "Sessions",
+          "type": "webview",
+          "when": "sessionDeck.columns"
+        },
+        {
+          "id": "sessionDeck.controlPanel",
+          "name": "Control Panel",
+          "icon": "$(settings-gear)",
+          "visibility": "collapsed"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "sessionDeck.refresh",
+        "title": "Refresh",
+        "icon": "$(refresh)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.doctor",
+        "title": "Run Diagnostics",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.captureDriftFixture",
+        "title": "Capture Drift Fixture",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.copyDebugReport",
+        "title": "Copy Debug Report",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.debugLicense",
+        "title": "Debug License (temporary)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.openFloatingWindow",
+        "title": "Open as Floating Window",
+        "icon": "$(multiple-windows)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.toggleActivityTree",
+        "title": "Show Activity Tree",
+        "icon": "$(list-tree)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.toggleActivityTreeActive",
+        "title": "Hide Activity Tree",
+        "icon": "$(list-flat)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.toggleDensity",
+        "title": "Toggle Compact View",
+        "icon": "$(fold)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.toggleDensityActive",
+        "title": "Toggle Comfortable View",
+        "icon": "$(unfold)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.toggleLayout",
+        "title": "Column View",
+        "icon": "$(table)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.toggleLayoutActive",
+        "title": "List View",
+        "icon": "$(list-selection)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.markAllRead",
+        "title": "Mark All as Read",
+        "icon": "$(check-all)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.setFilter",
+        "title": "Filter Sessions",
+        "icon": "$(filter)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.setFilterFilled",
+        "title": "Filter Sessions (active)",
+        "icon": "$(filter-filled)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.triage",
+        "title": "Triage Sessions Needing You",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.nextAttention",
+        "title": "Next Session Needing You",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.prevAttention",
+        "title": "Previous Session Needing You",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.returnToFocus",
+        "title": "Return to Last Focused Session",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.setSort",
+        "title": "Sort Sessions",
+        "icon": "$(list-ordered)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.collapseAll",
+        "title": "Collapse All",
+        "icon": "$(collapse-all)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.expandAll",
+        "title": "Expand All",
+        "icon": "$(expand-all)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.clearFilter",
+        "title": "Show All Sessions",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.openSession",
+        "title": "Go to Session",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.showLastMessage",
+        "title": "Show Last Message",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.sessionProperties",
+        "title": "Session Properties",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.showRemoteLastMessage",
+        "title": "Show Last Message",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.focusRemoteSession",
+        "title": "Focus Session on Host",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.openCursor",
+        "title": "Focus Cursor Agent Session",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.openComposer",
+        "title": "Show Composer Session Details",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.enableCursorMonitoring",
+        "title": "Enable Cursor Monitoring",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.disableCursorMonitoring",
+        "title": "Disable Cursor Monitoring",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.removeAllIntegrations",
+        "title": "Remove All Integrations",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.openCodex",
+        "title": "Focus Codex Session",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.openProject",
+        "title": "Open Project in New Window",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.pinProject",
+        "title": "Pin Project",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.unpinProject",
+        "title": "Unpin Project",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.hideSession",
+        "title": "Hide Session",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.showHidden",
+        "title": "Show Hidden Sessions",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.dismissOrphans",
+        "title": "Dismiss all orphaned runs",
+        "category": "SessionDeck",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "sessionDeck.installHooks",
+        "title": "Install Hooks (instant updates + approval alerts)",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.removeHooks",
+        "title": "Remove Hooks",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.enterLicenseKey",
+        "title": "Enter License Key",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.buyLicense",
+        "title": "Buy License",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.licenseMenu",
+        "title": "License Options",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.whatsIncluded",
+        "title": "What's Included",
+        "category": "SessionDeck"
+      }
+    ],
+    "viewsWelcome": [
+      {
+        "view": "sessionDeck.sessions",
+        "when": "!sessionDeck.filterActive",
+        "contents": "No sessions yet.\nSessionDeck watches this host — sessions appear automatically when Claude Code, cursor-agent or codex run anywhere on it.\n[Run Diagnostics](command:sessionDeck.doctor)"
+      },
+      {
+        "view": "sessionDeck.sessions",
+        "when": "!sessionDeck.filterActive && !sessionDeck.hooksInstalled && !isWindows",
+        "contents": "Install hooks once for instant updates and an approval alert whenever a session blocks — so a blocked session can't stall silently.\n[Install Hooks](command:sessionDeck.installHooks)"
+      },
+      {
+        "view": "sessionDeck.sessions",
+        "when": "!sessionDeck.filterActive && sessionDeck.inCursor && !sessionDeck.cursorMonitoring && !isWindows",
+        "contents": "Monitor your Cursor Composer/agent sessions live.\n[Enable Cursor Monitoring](command:sessionDeck.enableCursorMonitoring)"
+      },
+      {
+        "view": "sessionDeck.sessions",
+        "when": "!sessionDeck.filterActive && sessionDeck.crossHost && !sessionDeck.bridgeAvailable",
+        "contents": "Desktop companion not connected — set up for names, todos, tab titles & other hosts.\n[Run Diagnostics](command:sessionDeck.doctor)"
+      },
+      {
+        "view": "sessionDeck.sessions",
+        "when": "sessionDeck.filterActive",
+        "contents": "No sessions match the current filter.\n[Show All Sessions](command:sessionDeck.clearFilter)"
+      }
+    ],
+    "configuration": {
+      "title": "SessionDeck",
+      "properties": {
+        "sessionDeck.enableNavigation": {
+          "type": "boolean",
+          "default": true,
+          "description": "Clicking a session navigates to its window and tab. When disabled (or when navigation isn't possible), clicking shows the session's last message instead."
+        },
+        "sessionDeck.activityTree": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show workflows, subagents and tasks as expandable children under each session."
+        },
+        "sessionDeck.density": {
+          "type": "string",
+          "enum": [
+            "comfortable",
+            "compact"
+          ],
+          "enumDescriptions": [
+            "Fully expanded — every project shows its session rows (the default).",
+            "Collapse project rows by default and fold an at-a-glance pressure summary (needs-you · working · unread · newest age) into each header. Projects that need you auto-expand, so the fleet stays legible at 30 agents across many projects."
+          ],
+          "default": "comfortable",
+          "description": "View density for the sessions tree and the floating panel. \"compact\" collapses project rows by default (auto-expanding any that need you) and shows a per-project pressure summary; \"comfortable\" is the fully-expanded default."
+        },
+        "sessionDeck.layout": {
+          "type": "string",
+          "enum": [
+            "list",
+            "columns"
+          ],
+          "enumDescriptions": [
+            "Inline flow — each session's age, status and metrics run together in the row description (the default).",
+            "Aligned columns — render time, status, model and tokens as strictly-ordered, consistently-delimited fields so they line up down the list (a real grid with headers in the floating panel; ordered slots in the sidebar tree, where a proportional font can't pixel-align)."
+          ],
+          "default": "list",
+          "description": "Layout for the session rows in the sessions tree and the floating panel. \"columns\" lines up time · status · model · tokens as aligned fields (a true CSS grid with headers in the panel); \"list\" is the inline description flow. Toggle from the view toolbar."
+        },
+        "sessionDeck.inboxLane": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a \"Needs you\" inbox at the top of the tree (and the floating panel): a virtual section listing only the sessions that need you, urgency-ranked (approvals & questions first, then finished-unread, then live remote), above project grouping. It is a view of the rows below — they stay in their projects, and counts are unaffected. Turn off for a pure project tree."
+        },
+        "sessionDeck.showCursorAgents": {
+          "type": "boolean",
+          "default": true,
+          "description": "Also show Cursor Agent CLI (cursor-agent) sessions — recently active or running chats from ~/.cursor/chats — alongside Claude Code sessions."
+        },
+        "sessionDeck.showCursorComposer": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show Cursor GUI Composer/agent sessions (from ~/.cursor hooks) alongside Claude Code sessions. Requires enabling Cursor monitoring once (SessionDeck: Enable Cursor Monitoring). No approval detection exists for Composer — these rows never raise alerts."
+        },
+        "sessionDeck.showCodexAgents": {
+          "type": "boolean",
+          "default": true,
+          "description": "Also show Codex CLI (codex / codex exec) sessions — recently active or running rollouts from ~/.codex/sessions — alongside Claude Code sessions."
+        },
+        "sessionDeck.floatAlwaysOnTop": {
+          "type": "boolean",
+          "default": true,
+          "description": "When opening SessionDeck as a floating window, pin it always-on-top. Ignored on hosts/platforms where always-on-top is unavailable."
+        },
+        "sessionDeck.editorCliPath": {
+          "type": "string",
+          "default": "",
+          "description": "Explicit path or name of the editor CLI used to focus other windows (e.g. 'code', 'code-insiders', 'codium', 'cursor', 'windsurf'). Auto-detected from the running editor when empty."
+        },
+        "sessionDeck.cursorCliPath": {
+          "type": "string",
+          "default": "",
+          "description": "(Deprecated — use editorCliPath) Path to the editor CLI used to focus other windows. Leave empty to auto-detect from the running editor."
+        },
+        "sessionDeck.extraConfigDirs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional Claude Code config directories to scan (e.g. ~/.claude-work or a CLAUDE_CONFIG_DIR value). Config homes of running sessions are auto-detected on Linux; add entries for homes without live sessions or on other platforms."
+        },
+        "sessionDeck.crossHost": {
+          "type": "boolean",
+          "default": true,
+          "description": "Master toggle for cross-host SessionDeck: aggregate sessions from every host you have a VS Code / Cursor window open to, via the local SessionDeck Bridge companion. When off, publishing, fetching and the bridge install prompt are all disabled."
+        },
+        "sessionDeck.notifications": {
+          "type": "string",
+          "enum": [
+            "urgent",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Show a warning notification the moment a local session blocks on an approval prompt or a pending question — once per incident, never per refresh.",
+            "No notifications. The status-bar chip still shows how many sessions need you."
+          ],
+          "default": "urgent",
+          "description": "In-window notifications when a local Claude session needs you. \"urgent\" toasts on approval prompts and pending questions; \"off\" disables toasts only — the status-bar triage chip always reflects reality."
+        },
+        "sessionDeck.unfocusedSound": {
+          "type": "boolean",
+          "default": false,
+          "description": "Play a short sound when a local or live-remote session comes to need you WHILE this VS Code window is unfocused (an in-window toast is easy to miss then). Rides the same incidents as notifications; rate-limited to one per 30s. Delivery: afplay (macOS), paplay/pw-play (Linux, incl. WSLg), powershell.exe system sound (WSL/Windows); silent no-op where no player is available. No session title or text is ever passed to the player."
+        },
+        "sessionDeck.unfocusedOsNotification": {
+          "type": "boolean",
+          "default": false,
+          "description": "Post a real OS notification (not just VS Code's in-window toast, which never reaches the OS notification centre) when a session comes to need you while this window is unfocused. Rides the same incidents as notifications; rate-limited to one per 30s. Delivery: notify-send (Linux) or osascript (macOS) — WSL/Windows have no dependable zero-setup toast, so it no-ops there (use the sound channel). Only a generic title + a session count is shown; never a session title or reason."
+        },
+        "sessionDeck.publishLastText": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include each session's last message text in the snapshot published to the local bridge, so other hosts can preview it. The data never leaves your own machines. Turn off to publish status and titles only."
+        },
+        "sessionDeck.licenseKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Your license key (`CMC-YYYYMM-XXXX-XXXX-XXXX`). Validated **entirely offline** — a local check, never a network call, so nothing ever phones home. Everything is free for a 3-day evaluation, and light use stays free after that (up to 3 top-level sessions; subagents and remote hosts don't count); a key lifts that cap for your whole fleet. Because this setting is per-person, leaving Settings Sync on carries your license across your own machines automatically."
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "sessionDeck.nextAttention",
+        "key": "ctrl+alt+]",
+        "mac": "cmd+alt+]"
+      },
+      {
+        "command": "sessionDeck.prevAttention",
+        "key": "ctrl+alt+[",
+        "mac": "cmd+alt+["
+      },
+      {
+        "command": "sessionDeck.returnToFocus",
+        "key": "ctrl+alt+\\",
+        "mac": "cmd+alt+\\"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "sessionDeck.setFilter",
+          "when": "view == sessionDeck.sessions && !sessionDeck.filterActive",
+          "group": "navigation@1"
+        },
+        {
+          "command": "sessionDeck.setFilterFilled",
+          "when": "view == sessionDeck.sessions && sessionDeck.filterActive",
+          "group": "navigation@1"
+        },
+        {
+          "command": "sessionDeck.toggleActivityTree",
+          "when": "view == sessionDeck.sessions && !sessionDeck.activityTree",
+          "group": "navigation@2"
+        },
+        {
+          "command": "sessionDeck.toggleActivityTreeActive",
+          "when": "view == sessionDeck.sessions && sessionDeck.activityTree",
+          "group": "navigation@2"
+        },
+        {
+          "command": "sessionDeck.toggleDensity",
+          "when": "view == sessionDeck.sessions && !sessionDeck.compact",
+          "group": "navigation@2.5"
+        },
+        {
+          "command": "sessionDeck.toggleDensityActive",
+          "when": "view == sessionDeck.sessions && sessionDeck.compact",
+          "group": "navigation@2.5"
+        },
+        {
+          "command": "sessionDeck.toggleLayout",
+          "when": "view == sessionDeck.sessions && !sessionDeck.columns",
+          "group": "navigation@2.6"
+        },
+        {
+          "command": "sessionDeck.toggleLayoutActive",
+          "when": "view == sessionDeck.sessions && sessionDeck.columns",
+          "group": "navigation@2.6"
+        },
+        {
+          "command": "sessionDeck.setSort",
+          "when": "view == sessionDeck.sessions",
+          "group": "navigation@3"
+        },
+        {
+          "command": "sessionDeck.markAllRead",
+          "when": "view == sessionDeck.sessions",
+          "group": "navigation@4"
+        },
+        {
+          "command": "sessionDeck.collapseAll",
+          "when": "view == sessionDeck.sessions && !sessionDeck.collapsed",
+          "group": "navigation@5"
+        },
+        {
+          "command": "sessionDeck.expandAll",
+          "when": "view == sessionDeck.sessions && sessionDeck.collapsed",
+          "group": "navigation@5"
+        },
+        {
+          "command": "sessionDeck.openFloatingWindow",
+          "when": "view == sessionDeck.sessions",
+          "group": "z_more@1"
+        },
+        {
+          "command": "sessionDeck.showHidden",
+          "when": "view == sessionDeck.sessions",
+          "group": "z_more@2"
+        },
+        {
+          "command": "sessionDeck.refresh",
+          "when": "view == sessionDeck.sessions",
+          "group": "z_more@4"
+        },
+        {
+          "command": "sessionDeck.setFilter",
+          "when": "view == sessionDeck.table && !sessionDeck.filterActive",
+          "group": "navigation@1"
+        },
+        {
+          "command": "sessionDeck.setFilterFilled",
+          "when": "view == sessionDeck.table && sessionDeck.filterActive",
+          "group": "navigation@1"
+        },
+        {
+          "command": "sessionDeck.toggleActivityTree",
+          "when": "view == sessionDeck.table && !sessionDeck.activityTree",
+          "group": "navigation@2"
+        },
+        {
+          "command": "sessionDeck.toggleActivityTreeActive",
+          "when": "view == sessionDeck.table && sessionDeck.activityTree",
+          "group": "navigation@2"
+        },
+        {
+          "command": "sessionDeck.toggleDensity",
+          "when": "view == sessionDeck.table && !sessionDeck.compact",
+          "group": "navigation@2.5"
+        },
+        {
+          "command": "sessionDeck.toggleDensityActive",
+          "when": "view == sessionDeck.table && sessionDeck.compact",
+          "group": "navigation@2.5"
+        },
+        {
+          "command": "sessionDeck.toggleLayoutActive",
+          "when": "view == sessionDeck.table && sessionDeck.columns",
+          "group": "navigation@2.6"
+        },
+        {
+          "command": "sessionDeck.setSort",
+          "when": "view == sessionDeck.table",
+          "group": "navigation@3"
+        },
+        {
+          "command": "sessionDeck.markAllRead",
+          "when": "view == sessionDeck.table",
+          "group": "navigation@4"
+        },
+        {
+          "command": "sessionDeck.collapseAll",
+          "when": "view == sessionDeck.table && !sessionDeck.collapsed",
+          "group": "navigation@5"
+        },
+        {
+          "command": "sessionDeck.expandAll",
+          "when": "view == sessionDeck.table && sessionDeck.collapsed",
+          "group": "navigation@5"
+        },
+        {
+          "command": "sessionDeck.openFloatingWindow",
+          "when": "view == sessionDeck.table",
+          "group": "z_more@1"
+        },
+        {
+          "command": "sessionDeck.showHidden",
+          "when": "view == sessionDeck.table",
+          "group": "z_more@2"
+        },
+        {
+          "command": "sessionDeck.refresh",
+          "when": "view == sessionDeck.table",
+          "group": "z_more@4"
+        }
+      ],
+      "webview/context": [
+        {
+          "command": "sessionDeck.pinProject",
+          "when": "webviewId == sessionDeck.table && webviewSection == project-unpinned",
+          "group": "1_pin@1"
+        },
+        {
+          "command": "sessionDeck.unpinProject",
+          "when": "webviewId == sessionDeck.table && webviewSection == project-pinned",
+          "group": "1_pin@1"
+        },
+        {
+          "command": "sessionDeck.openProject",
+          "when": "webviewId == sessionDeck.table && webviewSection == project-unpinned",
+          "group": "9_open@1"
+        },
+        {
+          "command": "sessionDeck.openProject",
+          "when": "webviewId == sessionDeck.table && webviewSection == project-pinned",
+          "group": "9_open@1"
+        },
+        {
+          "command": "sessionDeck.hideSession",
+          "when": "webviewId == sessionDeck.table && (webviewSection == session || webviewSection == cursor || webviewSection == codex || webviewSection == composer)",
+          "group": "1_hide@1"
+        },
+        {
+          "command": "sessionDeck.showLastMessage",
+          "when": "webviewId == sessionDeck.table && webviewSection == session",
+          "group": "9_open@1"
+        },
+        {
+          "command": "sessionDeck.sessionProperties",
+          "when": "webviewId == sessionDeck.table && (webviewSection == session || webviewSection == cursor || webviewSection == codex || webviewSection == composer)",
+          "group": "9_open@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "sessionDeck.pinProject",
+          "when": "view == sessionDeck.sessions && viewItem == project-unpinned",
+          "group": "1_pin@1"
+        },
+        {
+          "command": "sessionDeck.unpinProject",
+          "when": "view == sessionDeck.sessions && viewItem == project-pinned",
+          "group": "1_pin@1"
+        },
+        {
+          "command": "sessionDeck.openProject",
+          "when": "view == sessionDeck.sessions && viewItem =~ /^project/"
+        },
+        {
+          "command": "sessionDeck.dismissOrphans",
+          "when": "view == sessionDeck.sessions && viewItem == orphanBucket",
+          "group": "inline"
+        },
+        {
+          "command": "sessionDeck.dismissOrphans",
+          "when": "view == sessionDeck.sessions && viewItem == orphanBucket"
+        },
+        {
+          "command": "sessionDeck.hideSession",
+          "when": "view == sessionDeck.sessions && (viewItem =~ /^session/ || viewItem == cursor || viewItem == composerSession || viewItem == codex)",
+          "group": "1_hide@1"
+        },
+        {
+          "command": "sessionDeck.showLastMessage",
+          "when": "view == sessionDeck.sessions && viewItem =~ /^session/"
+        },
+        {
+          "command": "sessionDeck.sessionProperties",
+          "when": "view == sessionDeck.sessions && (viewItem =~ /^session/ || viewItem == cursor || viewItem == composerSession || viewItem == codex)"
+        },
+        {
+          "command": "sessionDeck.showRemoteLastMessage",
+          "when": "view == sessionDeck.sessions && viewItem == remoteSession"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "sessionDeck.openSession",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.showLastMessage",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.sessionProperties",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.showRemoteLastMessage",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.focusRemoteSession",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.openCursor",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.openComposer",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.openCodex",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.openProject",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.pinProject",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.unpinProject",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.hideSession",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.setFilterFilled",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.toggleActivityTreeActive",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.toggleDensityActive",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.toggleLayoutActive",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.collapseAll",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.expandAll",
+          "when": "false"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p .",
+    "vscode:prepublish": "tsc -p .",
+    "package": "mkdir -p dist-vsix && vsce package --no-dependencies --allow-missing-repository --out dist-vsix/"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/codicons": "^0.0.45",
+    "@vscode/vsce": "^3.2.1",
+    "sharp": "^0.35.3",
+    "typescript": "^5.5.0"
+  }
+}

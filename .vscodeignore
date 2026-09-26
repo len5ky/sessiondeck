@@ -1,0 +1,17 @@
+# ALLOWLIST packaging: exclude everything, then re-include exactly what the
+# extension needs at runtime. scripts/verify-vsix.ts enforces the same list on
+# the built VSIX, so a file added here without updating scripts/leak-guard.ts
+# fails the release. (The old denylist shipped repository tooling and notes in
+# 0.35.0-0.41.1.)
+**
+!out/**/*.js
+!media/icon.png
+!media/codicon.css
+!media/codicon.ttf
+!media/cursor-dark.svg
+!media/codex-dark.svg
+!media/unfocused-ping.wav
+!package.json
+!README.md
+!LICENSE
+!CHANGELOG.md

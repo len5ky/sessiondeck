@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- SessionDeck activity-bar / view-container mark. A single solid-alpha compass-rose
+       SILHOUETTE: opaque #000 fills only, NO stroke, NO currentColor, explicit
+       viewBox. VS Code paints this as a -webkit-mask, which samples the ALPHA channel
+       and tints it with the theme color; currentColor does NOT resolve to an opaque
+       paint in that isolated mask document (it read as empty for the owner), so the
+       shape must carry its own opaque alpha. The bezel is a filled annulus (evenodd)
+       and the rose is a filled 8-point star; both opaque, so they union in alpha. -->
+  <path fill="#000000" fill-rule="evenodd" d="M 0.8 12 A 11.2 11.2 0 1 0 23.2 12 A 11.2 11.2 0 1 0 0.8 12 Z M 2.6 12 A 9.4 9.4 0 1 0 21.4 12 A 9.4 9.4 0 1 0 2.6 12 Z"/>
+  <path fill="#000000" d="M 12 3.6 L 12.73 10.24 L 15.54 8.46 L 13.76 11.27 L 20.4 12 L 13.76 12.73 L 15.54 15.54 L 12.73 13.76 L 12 20.4 L 11.27 13.76 L 8.46 15.54 L 10.24 12.73 L 3.6 12 L 10.24 11.27 L 8.46 8.46 L 11.27 10.24 Z"/>
+</svg>

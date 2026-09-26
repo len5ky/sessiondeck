@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "lib": ["ES2022"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "skipLibCheck": true,
+    // Typecheck only — the shippable bundle is produced by `bun build` (see the
+    // build script), which pulls the shared trio from ../src directly. tsc here
+    // just type-checks bridge/src plus the exact shared files it imports; no
+    // rootDir/outDir so referencing ../src/*.ts doesn't trip TS6059.
+    "noEmit": true
+  },
+  "include": [
+    "src",
+    "../src/bridgeSchema.ts",
+    "../src/sqliteRead.ts",
+    "../src/titleExtract.ts"
+  ]
+}
