@@ -8,6 +8,7 @@ import {
   EventTail,
   EVENTS_FILE,
   hooksInstalled,
+  hooksInstalledInAnyHome,
   hookScriptStale,
   installHooks,
   isPermissionRequest,
@@ -17,7 +18,7 @@ import {
   enableCursorMonitoring,
   disableCursorMonitoring,
   cursorMonitoringInstalled,
-  renewLease,
+  renewLeaseIfDue,
   CURSOR_SPOOL,
 } from "./hooks";
 import { focusLocalTerminal } from "./injector";
@@ -858,7 +859,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let lastBuiltSignature = "";
   let panelWasOpen = false;
 
-  let lastLeaseRenew = 0;
+  // The hook scripts stop forwarding once the lease is 7 days old. Renew at activation
+  // (a user back after a week recovers immediately) and then daily from the tick,
+  // whenever Claude hooks (in any config home) OR Cursor monitoring is installed.
+  const leaseInPlay = (): boolean => cursorMonitoringInstalled() || hooksInstalledInAnyHome(computeHomes());
+  let lastLeaseRenew = renewLeaseIfDue(0, Date.now(), leaseInPlay);
   const refresh = (): void => {
     const homes = computeHomes();
     reconcileWatchers(homes);
@@ -895,10 +900,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     let errMsg: string | undefined;
     try {
       syncTopologyContext();
-      if (Date.now() - lastLeaseRenew > 24 * 60 * 60_000 && cursorMonitoringInstalled()) {
-        lastLeaseRenew = Date.now();
-        try { renewLease(); } catch { /* monitoring remains fail-soft */ }
-      }
+      lastLeaseRenew = renewLeaseIfDue(lastLeaseRenew, Date.now(), leaseInPlay);
       navigator?.setHomes(homes);
       titles.poke();
       // reload phase = provider.reload, dominated by the discovery snapshot() (which

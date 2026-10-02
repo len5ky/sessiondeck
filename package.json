@@ -1,8 +1,8 @@
 {
   "name": "sessiondeck",
   "displayName": "SessionDeck",
-  "description": "One panel for every Claude Code, Codex and Cursor session on this host: grouped by project, live status, subagent activity, unread and approval alerts, click-to-navigate.",
-  "version": "0.42.2",
+  "description": "Every Claude Code, Codex and Cursor agent session on your machine in one tree, grouped by project. See which are working, finished or waiting on you, and click to jump to any of them.",
+  "version": "0.42.3",
   "icon": "media/icon.png",
   "publisher": "len5ky",
   "license": "SEE LICENSE IN LICENSE",

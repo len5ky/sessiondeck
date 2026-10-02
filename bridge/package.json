@@ -1,8 +1,8 @@
 {
   "name": "sessiondeck-bridge",
   "displayName": "SessionDeck Bridge",
-  "description": "Invisible companion that aggregates SessionDeck host snapshots on the local desktop so one panel can show every open host. No UI, no network, no configuration.",
-  "version": "0.42.2",
+  "description": "Local desktop companion for SessionDeck. Collects session snapshots from your remote windows (WSL, SSH, containers) so one tree shows every host. No UI or settings, and no network calls.",
+  "version": "0.42.3",
   "publisher": "len5ky",
   "license": "MIT",
   "repository": {

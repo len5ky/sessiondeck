@@ -5,6 +5,15 @@ packages share one version number.
 
 ## [Unreleased]
 
+## [0.42.3] - 2026-10-02
+
+### Fixed
+- Instant updates and approval alerts no longer stop seven days after installing
+  hooks when Cursor monitoring is off.
+
+### Changed
+- Rewrote the README and listing description.
+
 ## [0.42.2] - 2026-10-02
 
 ### Fixed

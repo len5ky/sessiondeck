@@ -16,7 +16,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { ConfigHome } from "./homes";
@@ -29,6 +29,9 @@ export const CURSOR_SPOOL = join(STATE_DIR, "cursor-events.jsonl");
 export const CURSOR_PROBE = join(STATE_DIR, "cursor-hook.sh");
 export const CURSOR_HOOKS_JSON = join(homedir(), ".cursor", "hooks.json");
 const LEASE_FILE = join(STATE_DIR, "monitor.lease");
+/** How often the extension renews the lease while a hook-fed monitor is in play.
+ *  Well inside the probe scripts' 7-day expiry, so an open editor never lets it lapse. */
+export const LEASE_RENEW_MS = 24 * 60 * 60_000;
 const settingsPath = (home: ConfigHome): string => join(home.dir, "settings.json");
 /** Marker used to find/remove our entries in settings.json idempotently. */
 const MARKER = "claude-overview";
@@ -105,12 +108,37 @@ function contentHash(raw: string | null): string {
   return createHash("sha256").update(raw ?? "<absent>").digest("hex");
 }
 
-export function renewLease(): void {
-  mkdirSync(STATE_DIR, { recursive: true });
+export function renewLease(leaseFile: string = LEASE_FILE): void {
+  mkdirSync(dirname(leaseFile), { recursive: true });
   // Seconds — the probe scripts compare against `date +%s`. Writing ms here would
   // read as ~1.7e12s in the future and trip the future-date guard, suppressing
   // EVERY event write (Cursor and Claude). Keep the unit in lockstep with the scripts.
-  writeFileSync(LEASE_FILE, `${Math.floor(Date.now() / 1000)}\n`);
+  writeFileSync(leaseFile, `${Math.floor(Date.now() / 1000)}\n`);
+}
+
+/** Renew the lease when it is due and a hook-fed monitor is in play. Both hook.sh
+ *  (Claude hooks) and the Cursor probe drop every event once the lease is 7 days old,
+ *  so `inPlay` must cover either integration, not Cursor alone. Pass lastRenew = 0
+ *  at activation so a user returning after a week recovers at once. Fail-soft: a
+ *  failed write still advances the clock (retried next interval). Returns the new
+ *  last-check time, unchanged when nothing was due. */
+export function renewLeaseIfDue(
+  lastRenew: number,
+  now: number,
+  inPlay: () => boolean,
+  renew: () => void = renewLease
+): number {
+  if (now - lastRenew <= LEASE_RENEW_MS) return lastRenew;
+  // Due: the probe runs at most once per interval either way (hooksInstalled reads
+  // every settings.json, too costly for the 3s tick). Nothing installed is fine to
+  // skip: installHooks and enableCursorMonitoring renew the lease themselves.
+  if (!inPlay()) return now;
+  try {
+    renew();
+  } catch {
+    /* monitoring remains fail-soft */
+  }
+  return now;
 }
 
 export function cursorMonitoringInstalled(): boolean {
@@ -258,6 +286,21 @@ export function hooksInstalled(homes: ConfigHome[]): boolean {
   } catch {
     return false;
   }
+}
+
+/** True when at least one home's settings.json carries our hook entries. The lease
+ *  decision needs ANY-home semantics: every installed home shares the one lease, so a
+ *  single home without hooks (or with an unparsable settings.json) must not stop the
+ *  renewal for the others. hooksInstalled() keeps its EVERY-home meaning for the
+ *  "install hooks" prompts. */
+export function hooksInstalledInAnyHome(homes: ConfigHome[]): boolean {
+  return homes.some((h) => {
+    try {
+      return JSON.stringify(readSettings(settingsPath(h)).hooks ?? {}).includes(MARKER);
+    } catch {
+      return false;
+    }
+  });
 }
 
 /** Throws with a readable message (naming the offending path) on unparsable
