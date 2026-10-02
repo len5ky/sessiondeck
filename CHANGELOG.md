@@ -5,6 +5,18 @@ packages share one version number.
 
 ## [Unreleased]
 
+## [0.42.1] - 2026-10-02
+
+### Fixed
+- Images on the Marketplace listing pages render again. They resolve against the
+  public source repository, which now exists at github.com/len5ky/sessiondeck.
+
+## [0.42.0] - 2026-10-02
+
+### Added
+- First public release on the Visual Studio Marketplace and Open VSX, under the
+  publisher `len5ky`. Until now SessionDeck installed only from local builds.
+
 ### Changed
 - The extension package now ships only the files it runs: 44 files and about
   360 KB, down from 738 files and 3.1 MB. Earlier packages included repository

@@ -9,6 +9,9 @@ demo/
 .env.*
 !.env.example
 
+# portal: real env files never committed (only the sample)
+portal/env*.sh
+!portal/env.sample.sh
 # packaged VSIXes (scripts/release.sh, bun run package)
 dist-vsix/
 # copied from the root CHANGELOG.md at bridge package time (bridge/package.json)

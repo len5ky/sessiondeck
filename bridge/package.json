@@ -2,7 +2,7 @@
   "name": "sessiondeck-bridge",
   "displayName": "SessionDeck Bridge",
   "description": "Invisible companion that aggregates SessionDeck host snapshots on the local desktop so one panel can show every open host. No UI, no network, no configuration.",
-  "version": "0.41.1",
+  "version": "0.42.1",
   "publisher": "len5ky",
   "license": "MIT",
   "repository": {
@@ -31,5 +31,9 @@
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
     "typescript": "^5.5.0"
-  }
+  },
+  "bugs": {
+    "url": "https://github.com/len5ky/sessiondeck/issues"
+  },
+  "homepage": "https://github.com/len5ky/sessiondeck#readme"
 }
