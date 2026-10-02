@@ -147,7 +147,7 @@ export function trialDaysLeft(s: LicenseState): number | undefined {
 // windows can't double-show).
 
 /** Which one-time trial toast (if any) is due right now. */
-export type TrialToastKind = "welcome" | "trial-ended";
+export type TrialToastKind = "welcome" | "trial-ended" | "trial-ended-elsewhere";
 
 /** Inputs to the trial-toast decision. The `*Shown`/`*Pending` fields are the
  *  persisted latches; `notificationsOn` mirrors the notifications setting. */
@@ -161,6 +161,26 @@ export interface TrialToastInput {
    *  TRIAL_MS). Gates the trial-ended pending latch so a pre-reload default-"free"
    *  (or a machine that never actually ran a trial) can't spuriously arm it. */
   trialElapsed: boolean;
+  /** False until the trial origin is final for this window: the desktop
+   *  companion has reported its trial start (or is known to be absent). Until
+   *  then the welcome waits, so a reinstall or an upgrade in a remote window is
+   *  never told "free for 3 days" by a trial start stamped seconds ago.
+   *  Undefined = settled (callers that don't track it). */
+  originSettled?: boolean;
+  /** False when this install never actually watched the trial run: the trial it
+   *  showed was a placeholder that the companion later moved into the past (see
+   *  trialWasObserved). Then "Trial ended" is old news and is latched silently.
+   *  Undefined = observed. */
+  trialObserved?: boolean;
+  /** True once the welcome toast was actually DISPLAYED on this install (not
+   *  just latched for a returning user). If the trial origin later moves into
+   *  the past (Settings Sync or the companion bring an older start from another
+   *  machine), that user was told "free for 3 days" and must hear why it ended. */
+  welcomeDisplayed?: boolean;
+  /** True when the tier is free because a monthly key lapsed. The key-expired
+   *  notice covers that moment, so "Trial ended" (wrong for a paying user) is
+   *  latched as shown instead of displayed. */
+  keyExpired?: boolean;
 }
 
 /** What to show now and which latches to persist. Absent latch flags mean "leave
@@ -182,21 +202,52 @@ export function decideTrialToast(i: TrialToastInput): TrialToastDecision {
   // the pending latch once. This is what lets an off-through-trial user still get the
   // note when they later turn notifications on. `trialElapsed` is the spurious-fire
   // guard (a default/pre-reload "free" with no elapsed trial won't arm it).
-  const armPending =
-    !i.trialEndedShown && !i.trialEndedPending && i.state === "free" && i.trialElapsed;
+  const freeAfterTrial = !i.trialEndedShown && !i.trialEndedPending && i.state === "free" && i.trialElapsed;
+  if (freeAfterTrial && i.trialObserved === false) {
+    // The trial ended before this install ever saw it run (an upgrade or a fresh
+    // remote whose real trial origin arrived late). Silent for an upgrader; but if
+    // this install DISPLAYED the welcome, say why the trial is over after all.
+    if (i.welcomeDisplayed === true) {
+      if (!i.notificationsOn) {
+        decision.setTrialEndedPending = true; // say it once notifications are on
+        return decision;
+      }
+      decision.toast = "trial-ended-elsewhere";
+    }
+    decision.setTrialEndedShown = true;
+    return decision;
+  }
+  if (
+    i.trialObserved === false &&
+    i.welcomeDisplayed === true &&
+    i.trialEndedPending &&
+    !i.trialEndedShown &&
+    i.notificationsOn &&
+    i.state === "free"
+  ) {
+    decision.toast = "trial-ended-elsewhere";
+    decision.setTrialEndedShown = true;
+    return decision;
+  }
+  const armPending = freeAfterTrial;
   if (armPending) decision.setTrialEndedPending = true;
   const pending = i.trialEndedPending || armPending;
 
   if (!i.notificationsOn) return decision; // nothing shown; welcome stays un-latched
 
-  // Welcome — courtesy: only while still in the trial, only with notifications on.
-  if (!i.welcomeShown && i.state.startsWith("trial:")) {
+  // Welcome — courtesy: only while still in the trial, only with notifications on,
+  // and only once the trial origin is final.
+  if (!i.welcomeShown && i.state.startsWith("trial:") && i.originSettled !== false) {
     decision.toast = "welcome";
     decision.setWelcomeShown = true;
     return decision;
   }
 
   // Trial-ended — fires once at the first notifications-on refresh after arming.
+  if (pending && !i.trialEndedShown && i.keyExpired === true) {
+    decision.setTrialEndedShown = true; // the key-expired notice speaks instead
+    return decision;
+  }
   if (pending && !i.trialEndedShown) {
     decision.toast = "trial-ended";
     decision.setTrialEndedShown = true;
@@ -206,20 +257,140 @@ export function decideTrialToast(i: TrialToastInput): TrialToastDecision {
   return decision;
 }
 
+/** Did this install watch the trial actually run? `trialSeenAt` is when it first
+ *  saw a trial state with a settled origin; if the (possibly later corrected)
+ *  trial window had already closed by then, the trial it saw was not real. */
+export function trialWasObserved(trialSeenAt: number | undefined, trialStart: number | undefined): boolean {
+  if (trialSeenAt === undefined || trialStart === undefined) return false;
+  return trialStart + TRIAL_MS > trialSeenAt;
+}
+
+/** A user who ran the extension before, under either name: their old-name
+ *  memento or settings exist, or the shared state folder (host id, hook spool)
+ *  was already on this host before this activation. Such a user never gets the
+ *  first-run "free for 3 days" welcome. */
+export function isReturningInstall(signals: {
+  legacyMemento: boolean;
+  legacySettings: boolean;
+  stateDirExisted: boolean;
+}): boolean {
+  return signals.legacyMemento || signals.legacySettings || signals.stateDirExisted;
+}
+
+// ---- Monthly key lapse notice (pure decision seam) ----------------------------
+// A monthly key licenses through the last day of its month; after that the state
+// silently falls to trial/free. Tell the user ONCE per expired key (latched on the
+// key's yyyy-mm, so the next lapsed renewal is announced again), with the next step.
+
+// ---- Enter License Key copy (pure, so the exact wording is tested) -----------
+
+export const ENTER_KEY_PROMPT =
+  "Paste the key from your purchase email (CMC-YYYYMM-XXXX-XXXX-XXXX). It is checked on this machine and never sent anywhere. Leave the box empty to remove a saved key.";
+
+const RESEND_HINT = "sessiondeck.dev can resend it";
+
+/** What is wrong with a typed key, in the user's terms, with what to do next;
+ *  undefined when the key is usable (or empty, which clears it). */
+export function licenseKeyProblem(raw: string, nowMs: number): string | undefined {
+  const text = (raw ?? "").trim();
+  if (text === "") return undefined;
+  if (!KEY_SHAPE.test(text.toUpperCase())) {
+    return `That doesn't look like a SessionDeck key. Keys look like CMC-YYYYMM-XXXX-XXXX-XXXX. Paste it straight from your purchase email; if you can't find the email, ${RESEND_HINT}.`;
+  }
+  const parsed = parseLicenseKey(text);
+  if (!parsed.valid) {
+    return `This key has a typo: the digits don't add up. Paste it straight from your purchase email rather than typing it; if you can't find the email, ${RESEND_HINT}.`;
+  }
+  if (!parsed.lifetime && nowMs >= expiryEndMs(parsed.expiry)) {
+    return `This monthly key covered you through ${expiryLabel(parsed.expiry)} and has expired. Paste the newer key from your latest renewal email; if you can't find it, ${RESEND_HINT}.`;
+  }
+  return undefined;
+}
+
+/** The "yyyy-mm" a VALID monthly key ran through, when that month has ended;
+ *  undefined for no key, an invalid key, a lifetime key, or a current one. */
+export function expiredMonthlyKey(key: string, nowMs: number): string | undefined {
+  const parsed = parseLicenseKey(key);
+  if (!parsed.valid || parsed.lifetime) return undefined;
+  return nowMs >= expiryEndMs(parsed.expiry) ? expiryLabel(parsed.expiry) : undefined;
+}
+
+export interface KeyExpiredInput {
+  key: string;
+  nowMs: number;
+  state: LicenseState;
+  notificationsOn: boolean;
+  /** The yyyy-mm already announced (persisted latch), if any. */
+  notifiedFor: string | undefined;
+}
+
+/** Show the lapse notice now? Only once the tier has actually dropped to free (a
+ *  running trial still covers everything), only with notifications on (it stays
+ *  due until they are), and only once per expired month. */
+export function decideKeyExpiredNotice(i: KeyExpiredInput): { show: false } | { show: true; through: string } {
+  const through = expiredMonthlyKey(i.key, i.nowMs);
+  if (through === undefined || i.state !== "free") return { show: false };
+  if (i.notifiedFor === through || !i.notificationsOn) return { show: false };
+  return { show: true, through };
+}
+
+/** The lapse notice text: what happened, what still works, what to do next. */
+export function keyExpiredMessage(through: string): string {
+  return (
+    `Your SessionDeck monthly key covered you through ${through} and has expired, so the free tier is on: ` +
+    `3 sessions stay fully covered. If your subscription renewed, paste the new key from your renewal email ` +
+    `(sessiondeck.dev can resend it). Otherwise you can buy a new one there.`
+  );
+}
+
+// ---- Trial copy (exact user-facing text, tested) -----------------------------
+
+export const WELCOME_MESSAGE =
+  "SessionDeck: full features are free for 3 days; a free tier stays after — no account needed.";
+export const TRIAL_ENDED_MESSAGE =
+  "Trial ended — free tier active: your 3 most active sessions stay covered in full.";
+export const TRIAL_ENDED_ELSEWHERE_MESSAGE =
+  "Your SessionDeck trial started earlier on another of your machines and has now ended, so the free tier is on: your 3 most active sessions stay covered in full.";
+
+/** Status-bar license item: shown on the last trial day or when the free tier is
+ *  over its cap; hidden otherwise (including every licensed state). */
+export function licenseStatusItem(
+  s: LicenseState,
+  overLimit: boolean
+): { text: string; tooltip: string } | undefined {
+  const days = trialDaysLeft(s);
+  if (days !== undefined && days <= 1) {
+    return {
+      text: "$(key) Trial ends today",
+      tooltip: "Your free evaluation ends today — enter a license key to keep full supervision",
+    };
+  }
+  if (days === undefined && !isLicensed(s) && overLimit) {
+    return {
+      text: "$(key) Free tier",
+      tooltip: "Free tier covers 3 sessions; you have more, so the extras are locked. Click for options.",
+    };
+  }
+  return undefined;
+}
+
 /** One honest human line for the Setup Doctor / debug report — NEVER the key. */
 export function licenseSummary(
   s: LicenseState,
   overLimit: boolean,
   covered: number,
-  total: number
+  total: number,
+  /** yyyy-mm a saved monthly key ran through, when it has expired. */
+  keyExpiredThrough?: string
 ): string {
   if (s === "licensed-lifetime") return "licensed (lifetime)";
   if (s.startsWith("licensed-until:")) return `licensed through ${s.slice("licensed-until:".length)}`;
+  const expired = keyExpiredThrough !== undefined ? ` · monthly key expired after ${keyExpiredThrough}` : "";
   const days = trialDaysLeft(s);
-  if (days !== undefined) return `free evaluation — ${days} day(s) left (everything unlocked)`;
-  return overLimit
+  if (days !== undefined) return `free evaluation — ${days} day(s) left (everything unlocked)${expired}`;
+  return (overLimit
     ? `free tier, over limit — supervising ${covered} of ${total} session(s) (subagents excluded)`
-    : "free tier, within limits";
+    : "free tier, within limits") + expired;
 }
 
 /** Redact anything that looks like a license key from arbitrary text — a real

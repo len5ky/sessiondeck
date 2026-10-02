@@ -5,6 +5,73 @@ packages share one version number.
 
 ## [Unreleased]
 
+## [0.42.4] - 2026-10-02
+
+### Added
+- When a monthly license key runs out, SessionDeck tells you once that the free
+  tier is now on and how to get back: paste the new key from your renewal email,
+  or have sessiondeck.dev resend it. Before, the switch happened silently.
+
+### Changed
+- Installing SessionDeck from the Visual Studio Marketplace or Open VSX now
+  installs the SessionDeck Bridge companion on your desktop too, so the
+  cross-host view works without a second install.
+- When the bridge is missing, Diagnostics and the Control Panel tell you to
+  install "SessionDeck Bridge" from the Extensions view instead of pointing at a
+  `.vsix` file.
+- Enter License Key explains what is wrong with a key in plain terms: a typo, a
+  key that has expired (and which month it covered), or text that isn't a key,
+  each with what to do next. The prompt now says how to remove a saved key.
+- Right-clicking a locked "Not available in free version" row offers Enter
+  License Key and Buy License.
+- The Control Panel License row and Diagnostics say when your saved monthly key
+  has expired.
+
+### Removed
+- The "Debug License (temporary)" command is gone from installed builds. It
+  could reset the trial and was only ever meant for development.
+
+### Fixed
+- If your trial turns out to have started earlier on another of your machines
+  (Settings Sync or the desktop companion bring the older date), SessionDeck
+  now says so when it ends, instead of switching to the free tier silently
+  after promising 3 days.
+- With hooks in some Claude config homes but not all, the Control Panel,
+  Diagnostics and the tree note say "in 2 of 3 config homes" instead of "not
+  installed".
+- Upgrading from the extension's former name in a remote window no longer shows
+  "full features are free for 3 days" followed minutes later by "Trial ended".
+  Returning users skip the first-run welcome, and a new user's welcome waits
+  until the desktop companion has confirmed when the trial started.
+- With the extension's pre-rename version still installed, SessionDeck no longer
+  reports your hooks as out of date and rewrites the hook script on every start.
+  It now warns once per window that the old copy is installed and should be
+  uninstalled.
+- Collapse All works in the list view after you have switched to Column View and
+  back. It used to collapse the hidden column table instead.
+- Sort: Name orders projects, local and remote, by the folder name the row
+  shows. It used to sort by the full path, so worktrees kept elsewhere landed out
+  of order.
+- Show Hidden Sessions says how long ago you hid each session. It used to show
+  the session's last activity, so a session hidden a moment ago read "hidden 2h
+  ago".
+- Column View is readable in a normal-width sidebar: below 300px it drops the
+  Status column (the row icon still shows status) and indents less, and project
+  names are no longer upper-cased.
+- The Layout setting describes what you will see instead of how it is built.
+- The license terms now say where to ask for a refund: email
+  support@sessiondeck.dev or use sessiondeck.dev/#refund.
+- The SessionDeck Bridge listing links to the public source repository instead
+  of a page that does not exist, and describes all eight of its commands.
+- The SessionDeck Bridge shows the SessionDeck icon on the Marketplace and
+  Open VSX instead of a blank placeholder.
+- "What's included" now says what the free tier really does: your 3 covered
+  sessions keep alerts, the badge, keyboard triage and the focus-return digest.
+  It used to list those as license-only.
+- Where SessionDeck shows its state folder (`~/.local/state/claude-overview`),
+  it now says that `claude-overview` is its former name, kept so existing
+  installs carry over. The hook scripts on disk now say SessionDeck.
+
 ## [0.42.3] - 2026-10-02
 
 ### Fixed

@@ -2,9 +2,10 @@
   "name": "sessiondeck-bridge",
   "displayName": "SessionDeck Bridge",
   "description": "Local desktop companion for SessionDeck. Collects session snapshots from your remote windows (WSL, SSH, containers) so one tree shows every host. No UI or settings, and no network calls.",
-  "version": "0.42.3",
+  "version": "0.42.4",
   "publisher": "len5ky",
   "license": "MIT",
+  "icon": "icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/len5ky/sessiondeck"
@@ -25,7 +26,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "bun build ./src/extension.ts --target=node --format=cjs --external vscode --outfile out/extension.js",
-    "package": "bun run build && cp ../CHANGELOG.md CHANGELOG.md && mkdir -p ../dist-vsix && bunx @vscode/vsce package --no-dependencies --allow-missing-repository --out ../dist-vsix/"
+    "package": "bun run build && cp ../CHANGELOG.md CHANGELOG.md && cp ../media/icon.png icon.png && mkdir -p ../dist-vsix && bunx @vscode/vsce package --no-dependencies --allow-missing-repository --out ../dist-vsix/"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

@@ -341,6 +341,24 @@ export function externalModelFromLabel(label: string): string | undefined {
 
 export type Layout = "list" | "columns";
 
+/** Sort: Name order for project rows. Rows show the folder's last path segment, so
+ *  that is what sorts (case-insensitively), with the full path only as a tiebreak.
+ *  Sorting on the full cwd put worktrees in another parent folder out of visible
+ *  order. Handles `/` and `\\` separators (remote hosts may be Windows). */
+export function compareProjectNames(aCwd: string, bCwd: string): number {
+  const name = (cwd: string): string => cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? cwd;
+  const byName = name(aCwd).localeCompare(name(bCwd), undefined, { sensitivity: "base" });
+  return byName !== 0 ? byName : aCwd.localeCompare(bCwd);
+}
+
+/** Which surface Collapse All / Expand All act on. Decided by the layout setting
+ *  (which also decides which view is shown), never by a webview's `visible` flag:
+ *  after a columns → list switch the hidden table can still report visible, and the
+ *  command then collapsed the invisible table while the list tree stayed open. */
+export function collapseTarget(layout: Layout): "table" | "tree" {
+  return layout === "columns" ? "table" : "tree";
+}
+
 /** Placeholder for an empty column cell, so every row shows the same number of
  *  slots in the same order and the eye can still track a column even without pixel
  *  alignment. */
@@ -1580,6 +1598,15 @@ export interface HideRecord {
   mtime: number;
   /** Wall-clock ms when the session was hidden (for the "Show Hidden" age hint). */
   hideAt: number;
+}
+
+/** Show Hidden picker description: how long ago the row was HIDDEN (from the
+ *  record's hideAt), never the session's last-activity age, which said "hidden
+ *  2h ago" for a session hidden seconds earlier. A record without a usable
+ *  hideAt just says "hidden". */
+export function hiddenDescription(rec: Partial<HideRecord>, nowMs: number): string {
+  if (typeof rec.hideAt !== "number" || !Number.isFinite(rec.hideAt)) return "hidden";
+  return `hidden ${fmtAge(Math.max(0, (nowMs - rec.hideAt) / 1000))} ago`;
 }
 
 /** Stable partition that floats pinned items above the rest WITHOUT disturbing

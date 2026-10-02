@@ -104,6 +104,11 @@ export class BridgeClient {
     if (opts.enabled?.() ?? true) this.startProbe();
   }
 
+  /** True once the initial hello() probe has finished, found or not. */
+  get probeSettled(): boolean {
+    return this.probeFinished;
+  }
+
   /** True while the companion is answering; false = degraded (single-host). */
   get available(): boolean {
     return this._available;

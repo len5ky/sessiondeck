@@ -13,13 +13,16 @@ import {
   TRIAL_END_PENDING_KEY,
   TRIAL_END_KEY,
   buildLicenseStateMarkdown,
+  licenseDebugEnabled,
+  DEBUG_MERGE_NOTE,
   type LicenseStateReport,
 } from "./licenseStateReport";
 
 // TEMPORARY DEBUG command for exercising the subscription/trial flow.
 // Remove by deleting this file AND ./licenseStateReport.ts (+ its test), the
-// registerLicenseDebugCommand(...) subscription in src/extension.ts, and the
-// sessionDeck.debugLicense command contribution in package.json.
+// registerLicenseDebugCommand(...) subscription in src/extension.ts. It is
+// registered only outside production (see licenseDebugEnabled) and is not
+// contributed in package.json.
 
 // A dedicated virtual-doc scheme so "Show current license state" renders as a full,
 // never-truncated markdown document (the #33 Session-Properties / #44 what's-included
@@ -38,8 +41,14 @@ export function registerLicenseDebugCommand(deps: {
   provider: SessionsProvider;
   refresh: () => void;
   refreshPanel: () => void;
+  /** Stop merging the desktop companion's (older) trial start in this window. */
+  suspendTrialMerge: () => void;
 }): vscode.Disposable {
+  // An installed build must never be able to reset the trial or fake days used.
+  if (!licenseDebugEnabled(deps.context.extensionMode)) return new vscode.Disposable(() => undefined);
+
   const refreshLicenseSurfaces = (): void => {
+    stateEmitter.fire(DEBUG_LICENSE_URI); // an open state report re-renders too
     deps.provider.forceReload();
     deps.refreshPanel();
     deps.refresh();
@@ -51,16 +60,18 @@ export function registerLicenseDebugCommand(deps: {
     await deps.context.globalState.update(TRIAL_END_PENDING_KEY, undefined);
     await deps.context.globalState.update(TRIAL_END_KEY, undefined);
     await deps.context.globalState.update(REMINDER_KEY, undefined);
+    for (const key of ["trialSeenAt", "trialWelcomeDisplayed", "licenseKeyExpiredNotified"]) {
+      await deps.context.globalState.update(key, undefined);
+    }
   };
 
-  // The rendered document body, refreshed on each "show state" invocation.
-  let stateMarkdown = "_Run “Show current license state” to populate this report._";
+  // Rendered live on every read, so a reopened or restored preview is never stale.
   const stateEmitter = new vscode.EventEmitter<vscode.Uri>();
   deps.context.subscriptions.push(
     stateEmitter,
     vscode.workspace.registerTextDocumentContentProvider(DEBUG_LICENSE_SCHEME, {
       onDidChange: stateEmitter.event,
-      provideTextDocumentContent: () => stateMarkdown,
+      provideTextDocumentContent: () => buildLicenseStateMarkdown(gatherReport()),
     })
   );
 
@@ -121,11 +132,10 @@ export function registerLicenseDebugCommand(deps: {
       });
       if (raw === undefined || raw.trim() === "") return;
       const daysUsed = Number(raw.trim());
+      deps.suspendTrialMerge();
       await deps.context.globalState.update(TRIAL_START_KEY, Date.now() - daysUsed * DAY_MS);
       refreshLicenseSurfaces();
-      void vscode.window.showInformationMessage(
-        `SessionDeck DEBUG: trial start back-dated to ${daysUsed} day(s) used.`
-      );
+      void vscode.window.showInformationMessage(`SessionDeck DEBUG: ${DEBUG_MERGE_NOTE(`trial start back-dated to ${daysUsed} day(s) used`)}`);
       return;
     }
 
@@ -133,15 +143,15 @@ export function registerLicenseDebugCommand(deps: {
       await vscode.workspace
         .getConfiguration("sessionDeck")
         .update("licenseKey", "", vscode.ConfigurationTarget.Global);
+      deps.suspendTrialMerge();
       await clearGlobalState();
       refreshLicenseSurfaces();
-      void vscode.window.showInformationMessage("SessionDeck DEBUG: license reset; a fresh trial has begun.");
+      void vscode.window.showInformationMessage(`SessionDeck DEBUG: ${DEBUG_MERGE_NOTE("license reset; a fresh trial has begun")}`);
       return;
     }
 
     // Show state — render the full computed state as a never-truncated markdown
     // document (Cursor clips showInformationMessage to a few words).
-    stateMarkdown = buildLicenseStateMarkdown(gatherReport());
     stateEmitter.fire(DEBUG_LICENSE_URI);
     await vscode.commands.executeCommand("markdown.showPreview", DEBUG_LICENSE_URI);
   });

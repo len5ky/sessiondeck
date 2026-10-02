@@ -16,3 +16,5 @@ portal/env*.sh
 dist-vsix/
 # copied from the root CHANGELOG.md at bridge package time (bridge/package.json)
 bridge/CHANGELOG.md
+# copied from media/icon.png at bridge package time (bridge/package.json)
+bridge/icon.png

@@ -8,6 +8,7 @@
 
 import { FormatHealthReport, HarnessReport, HooksReport } from "./canary";
 import { LicenseState, licenseSummary, redactLicenseKeys } from "./license";
+import { BRIDGE_INSTALL_HINT, HOST_ID_FIX_HINT, hooksPartial } from "./controlPanel";
 
 // ============================================================================
 // Refresh tick watchdog — a vscode-free ring buffer of the last N refresh-tick
@@ -319,6 +320,11 @@ export interface DoctorProbes {
   licenseOverLimit: boolean;
   licenseCovered: number;
   licenseTotal: number;
+  /** Config homes with our hooks / all config homes (partial-install wording). */
+  hooksHomesInstalled?: number;
+  hooksHomesTotal?: number;
+  /** yyyy-mm a saved monthly key ran through, when it has expired. */
+  licenseKeyExpiredThrough?: string;
   // 14 — refresh tick watchdog (ring-buffer of per-phase tick timings + latch)
   watchdog: WatchdogSummary;
 }
@@ -358,11 +364,22 @@ function hooksCheck(p: DoctorProbes): DoctorCheck {
       detail: "POSIX-shell hooks are unsupported on native Windows (WSL is fine); the 3s poll still covers status",
     };
   }
+  if (!p.hooksInstalled && hooksPartial(p.hooksHomesInstalled, p.hooksHomesTotal)) {
+    return {
+      mark: "problem",
+      title: "Hooks",
+      detail: `installed in ${p.hooksHomesInstalled} of ${p.hooksHomesTotal} config homes — sessions in the others get no instant updates or approval alerts`,
+      fix: `run '${INSTALL_HOOKS_CMD}' to add them to every home`,
+    };
+  }
   if (!p.hooksInstalled) {
     return {
       mark: "problem",
       title: "Hooks",
-      detail: "not installed in every config home — no instant updates or approval alerts",
+      detail:
+        p.hooksHomesInstalled === 0
+          ? "not installed in any config home — no instant updates or approval alerts"
+          : "not installed in every config home — no instant updates or approval alerts",
       fix: `run '${INSTALL_HOOKS_CMD}'`,
     };
   }
@@ -424,7 +441,7 @@ function bridgeCheck(p: DoctorProbes): DoctorCheck {
       mark: "problem",
       title: "Bridge companion",
       detail: "not answering — cross-host has degraded to single-host",
-      fix: "install the sessiondeck-bridge companion vsix on your local (desktop) side (see README → Cross-host)",
+      fix: BRIDGE_INSTALL_HINT,
     };
   }
   const hosts =
@@ -466,7 +483,7 @@ function hostIdCheck(p: DoctorProbes): DoctorCheck {
       mark: "problem",
       title: "Host identity",
       detail: `could not load — cross-host disabled${p.hostError !== undefined ? ` (${p.hostError})` : ""}`,
-      fix: "ensure ~/.local/state/claude-overview/host.json is readable and writable",
+      fix: HOST_ID_FIX_HINT,
     };
   }
   const named = p.hostLabel !== undefined && p.hostLabel !== "";
@@ -487,7 +504,7 @@ function titlesCheck(p: DoctorProbes): DoctorCheck {
     detail: `via ${via} — none extracted yet; rows fall back to project labels`,
     fix:
       p.titlePath === "bridge"
-        ? "needs the local bridge companion; check it is installed"
+        ? `needs the desktop bridge companion: ${BRIDGE_INSTALL_HINT}`
         : "open a Claude tab so the editor serializes its title",
   };
 }
@@ -654,7 +671,7 @@ function hooksCanaryCheck(p: DoctorProbes): DoctorCheck {
  *  scrubber redacts any key that slips into free text as a backstop). A free fleet
  *  over the caps is a note (–); everything else is informational/ok. */
 function licenseCheck(p: DoctorProbes): DoctorCheck {
-  const detail = licenseSummary(p.licenseState, p.licenseOverLimit, p.licenseCovered, p.licenseTotal);
+  const detail = licenseSummary(p.licenseState, p.licenseOverLimit, p.licenseCovered, p.licenseTotal, p.licenseKeyExpiredThrough);
   if (p.licenseState === "free" && p.licenseOverLimit) {
     return {
       mark: "info",

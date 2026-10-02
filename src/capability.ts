@@ -33,6 +33,8 @@ export interface CapabilityProbes {
   filterAll: boolean;
   /** hooksInstalled(homes): true only when our hooks are present in EVERY home. */
   hooksInstalled: boolean;
+  /** True when hooks are in some config homes but not all. */
+  hooksPartial?: boolean;
   /** hookScriptStale(): the installed hook script body is out of date. */
   hookScriptStale: boolean;
   /** False on native win32 (POSIX-shell hooks are never offered there). */
@@ -110,7 +112,9 @@ export function selectCapabilityNote(p: CapabilityProbes): CapabilityNote | unde
   if (p.platformSupportsHooks && !p.hooksInstalled) {
     return {
       kind: "install-hooks",
-      message: "Approval alerts off — Install Hooks",
+      message: p.hooksPartial === true
+        ? "Approval alerts off in some config homes — Install Hooks"
+        : "Approval alerts off — Install Hooks",
       command: "sessionDeck.installHooks",
     };
   }

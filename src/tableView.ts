@@ -68,6 +68,11 @@ export class TableViewProvider implements vscode.WebviewViewProvider {
         this.onUnlock();
       }
     });
+    // The view is torn down when the layout switches back to list; drop the stale
+    // reference so isVisible() can't report a view that no longer exists.
+    view.onDidDispose(() => {
+      if (this.view === view) this.view = undefined;
+    });
     view.onDidChangeVisibility(() => {
       if (view.visible) {
         this.onVisible();
@@ -189,7 +194,9 @@ function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   @keyframes tv-brand-spin { 100% { transform: rotate(360deg); } }
 
   .label { flex: 1 1 auto; min-width: 24px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .section-label { flex: 0 1 auto; text-transform: uppercase; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; }
+  /* Project / host names keep their real case: upper-casing made them wider and
+     harder to read, so a normal sidebar clipped them ("INFRASTRUCTU..."). */
+  .section-label { flex: 0 1 auto; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* Section-header (project/host) summary counts: a dim, flexible trailer that gets
      the row's spare width rather than being squeezed into a data column. */
   .section-desc { flex: 0 1 auto; margin-left: auto; padding-left: 10px; padding-right: 2px; color: var(--vscode-descriptionForeground); font-size: 0.9em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -227,6 +234,16 @@ function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
      only once the sidebar is wide enough to hold them without overflow. */
   .foldcols { display: inline; }
   .cell-model, .cell-tokens, .head .cell-model, .head .cell-tokens { display: none; }
+  /* Below 300px (a normal sidebar is ~210-260px) the STATUS column alone took a
+     third of the row and left titles at two or three letters. There, drop it (the
+     row icon already carries status, as in the list view) and tighten the indent
+     so the title gets the width. */
+  .cell-status, .head .cell-status { display: none; }
+  .group { margin-left: 10px; }
+  @container tree (min-width: 300px) {
+    .cell-status, .head .cell-status { display: block; }
+    .group { margin-left: 16px; }
+  }
   @container tree (min-width: 400px) {
     .cell-model, .cell-tokens, .head .cell-model, .head .cell-tokens { display: block; }
     .foldcols { display: none; }

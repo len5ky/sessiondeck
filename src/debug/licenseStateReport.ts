@@ -17,6 +17,27 @@ export const WELCOME_KEY = "trialWelcomeShown";
 export const TRIAL_END_PENDING_KEY = "trialEndedPending";
 export const TRIAL_END_KEY = "trialEndedShown";
 
+/** vscode.ExtensionMode.Production. The enum's numeric value is part of the VS
+ *  Code API (Production = 1, Development = 2, Test = 3); mirrored here so the
+ *  gate stays vscode-free and unit-testable. */
+export const EXTENSION_MODE_PRODUCTION = 1;
+
+/** Debug toast text. The change holds in THIS window only: the companion keeps
+ *  its own older trial start, other windows still merge it, and a reload here
+ *  merges it again. Saying so keeps the debug command honest (GUI finding F-12). */
+export function DEBUG_MERGE_NOTE(what: string): string {
+  return `${what} in this window. The desktop companion's trial start is ignored here until you reload; other open windows still use it.`;
+}
+
+/** The license debug command can reset the trial and fake days used, so it exists
+ *  only in an Extension Development Host or a test run, never in an installed
+ *  build. It is also not contributed in package.json, so it never shows in the
+ *  Command Palette or on the store listing; in a dev host, run it from a
+ *  keybinding or `executeCommand("sessionDeck.debugLicense")`. */
+export function licenseDebugEnabled(extensionMode: number): boolean {
+  return extensionMode !== EXTENSION_MODE_PRODUCTION;
+}
+
 /** Everything the license-state report renders. Pure input so the builder is a
  *  deterministic string function (no clock, no VS Code API). */
 export interface LicenseStateReport {

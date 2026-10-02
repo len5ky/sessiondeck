@@ -2,7 +2,7 @@
   "name": "sessiondeck",
   "displayName": "SessionDeck",
   "description": "Every Claude Code, Codex and Cursor agent session on your machine in one tree, grouped by project. See which are working, finished or waiting on you, and click to jump to any of them.",
-  "version": "0.42.3",
+  "version": "0.42.4",
   "icon": "media/icon.png",
   "publisher": "len5ky",
   "license": "SEE LICENSE IN LICENSE",
@@ -14,6 +14,9 @@
     "url": "https://github.com/len5ky/sessiondeck/issues"
   },
   "homepage": "https://github.com/len5ky/sessiondeck#readme",
+  "extensionPack": [
+    "len5ky.sessiondeck-bridge"
+  ],
   "keywords": [
     "claude-code",
     "claude",
@@ -92,11 +95,6 @@
       {
         "command": "sessionDeck.copyDebugReport",
         "title": "Copy Debug Report",
-        "category": "SessionDeck"
-      },
-      {
-        "command": "sessionDeck.debugLicense",
-        "title": "Debug License (temporary)",
         "category": "SessionDeck"
       },
       {
@@ -379,11 +377,11 @@
             "columns"
           ],
           "enumDescriptions": [
-            "Inline flow — each session's age, status and metrics run together in the row description (the default).",
-            "Aligned columns — render time, status, model and tokens as strictly-ordered, consistently-delimited fields so they line up down the list (a real grid with headers in the floating panel; ordered slots in the sidebar tree, where a proportional font can't pixel-align)."
+            "Each session's age, status and metrics follow its title as one line of text (the default).",
+            "Time, status, model and tokens in aligned columns with headers. In a narrow sidebar the extra columns fold away so titles stay readable."
           ],
           "default": "list",
-          "description": "Layout for the session rows in the sessions tree and the floating panel. \"columns\" lines up time · status · model · tokens as aligned fields (a true CSS grid with headers in the panel); \"list\" is the inline description flow. Toggle from the view toolbar."
+          "description": "How session rows show their details, in the sidebar and the floating window. \"list\" puts them after the title as text; \"columns\" lines them up under column headers. You can also switch from the view toolbar."
         },
         "sessionDeck.inboxLane": {
           "type": "boolean",
@@ -671,6 +669,16 @@
         }
       ],
       "view/item/context": [
+        {
+          "command": "sessionDeck.enterLicenseKey",
+          "when": "view == sessionDeck.sessions && viewItem == lockedSession",
+          "group": "1_license@1"
+        },
+        {
+          "command": "sessionDeck.buyLicense",
+          "when": "view == sessionDeck.sessions && viewItem == lockedSession",
+          "group": "1_license@2"
+        },
         {
           "command": "sessionDeck.pinProject",
           "when": "view == sessionDeck.sessions && viewItem == project-unpinned",

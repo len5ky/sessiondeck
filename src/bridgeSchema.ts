@@ -52,15 +52,46 @@ export interface SettingsMigrationPort {
 
 /** Copy explicitly-set legacy values once per setting. Any explicit new value at
  * either supported scope wins, so migration never overwrites a user's choice. */
-export async function migrateLegacySettings(config: SettingsMigrationPort): Promise<void> {
+/** Copy old-name settings to their new keys. Returns true when ANY old-name
+ *  setting is set (whether or not it still needed copying): a sign this user ran
+ *  the extension under its former name, which the trial welcome needs to know. */
+export async function migrateLegacySettings(config: SettingsMigrationPort): Promise<boolean> {
+  let foundLegacy = false;
   for (const [oldKey, newKey] of SETTING_MIGRATIONS) {
     const oldValue = config.inspect(oldKey);
     if (oldValue === undefined) continue;
+    if (oldValue.globalValue === undefined && oldValue.workspaceValue === undefined) continue;
+    foundLegacy = true;
     const newValue = config.inspect(newKey);
     if (newValue?.globalValue !== undefined || newValue?.workspaceValue !== undefined) continue;
     if (oldValue.globalValue !== undefined) await config.update(newKey, oldValue.globalValue, "global");
     if (oldValue.workspaceValue !== undefined) await config.update(newKey, oldValue.workspaceValue, "workspace");
   }
+  return foundLegacy;
+}
+
+/** Extension ids SessionDeck shipped under before the rename (publisher
+ *  `lensky`): the `claude-overview` ids of its former names, and a short-lived
+ *  `sessiondeck` under the old publisher. Still installed next to SessionDeck, they show every
+ *  session twice and write the same hook script. */
+export const LEGACY_EXTENSION_IDS: readonly string[] = [
+  "lensky.claude-overview",
+  "lensky.claude-overview-bridge",
+  "lensky.sessiondeck",
+  "lensky.sessiondeck-bridge",
+];
+
+/** Which legacy ids are installed, given an installed-check. */
+export function installedLegacyExtensions(isInstalled: (id: string) => boolean): string[] {
+  return LEGACY_EXTENSION_IDS.filter((id) => isInstalled(id));
+}
+
+/** The one warning shown while an old copy is installed. */
+export function legacyExtensionMessage(ids: readonly string[]): string {
+  return (
+    `An older copy of this extension is still installed (${ids.join(", ")}), from before it was renamed SessionDeck. ` +
+    `Uninstall it and reload the window: while both are installed every session shows twice and both rewrite the same hook script.`
+  );
 }
 
 export interface MementoMigrationPort {

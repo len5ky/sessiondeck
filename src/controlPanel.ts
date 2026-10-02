@@ -17,6 +17,22 @@
 
 import { LicenseState, licenseSummary } from "./license";
 
+/** Hooks are in some config homes but not all. */
+export function hooksPartial(installed: number | undefined, total: number | undefined): boolean {
+  return installed !== undefined && total !== undefined && installed > 0 && installed < total;
+}
+
+/** Fix hint for an unreadable host identity. The state folder keeps the
+ *  extension's pre-rename name so upgraders keep their host id and hooks; say so,
+ *  or the path reads like a leftover from some other tool. */
+export const HOST_ID_FIX_HINT =
+  "ensure ~/.local/state/claude-overview/host.json is readable and writable (the folder keeps SessionDeck's former name, claude-overview, so existing installs carry over)";
+
+/** What a user can do when the desktop companion is missing. Shared by the
+ *  Control Panel and Diagnostics so both give the same, store-first advice. */
+export const BRIDGE_INSTALL_HINT =
+  'install "SessionDeck Bridge" (len5ky.sessiondeck-bridge) from the Extensions view; it runs on your desktop, not in the remote. It normally arrives with SessionDeck from the Marketplace or Open VSX. If you installed SessionDeck from a .vsix, install the bridge .vsix the same way. Then reload the window';
+
 /** Row semantics, driving the icon colour extension.ts paints:
  *  ok = healthy (green), problem = broken/actionable (error), info = degraded/off
  *  (muted), action = a prominent clickable action (normal foreground). */
@@ -66,6 +82,11 @@ export interface ControlPanelInput {
   licenseOverLimit: boolean;
   licenseCovered: number;
   licenseTotal: number;
+  /** Config homes with our hooks / all config homes (partial-install wording). */
+  hooksHomesInstalled?: number;
+  hooksHomesTotal?: number;
+  /** yyyy-mm a saved monthly key ran through, when it has expired. */
+  licenseKeyExpiredThrough?: string;
 }
 
 /** The full, never-truncated "What's included" feature list, as markdown. This is
@@ -88,17 +109,14 @@ export const WHATS_INCLUDED_MD = [
   "- Every Claude Code, Codex and Cursor session on the host, grouped by project",
   "- Live status, subagent/child activity, unread and last-message previews",
   "- Click-to-navigate, session properties, diagnostics, offline by design",
+  "- Approval / needs-you **alerts**, the activity-bar **badge**, keyboard",
+  "  **triage** and the focus-return **digest**",
   "",
   "Any sessions beyond the 3 (working ones kept first) show as",
-  "**Not available in free version** — no details, children or controls — until you",
-  "add a license.",
+  "**Not available in free version** — no details, children, controls or alerts —",
+  "until you add a license.",
   "",
-  "**What a license unlocks (your whole fleet):**",
-  "",
-  "- Approval / needs-you **alerts** on every session",
-  "- The activity-bar **badge**",
-  "- Keyboard **triage** of blocked sessions",
-  "- The focus-return **digest**",
+  "**What a license unlocks:** all of the above for every session, with no cap.",
   "",
   "**A license is per person, not per machine** — monthly or lifetime. Validation is",
   "a local check on an offline key: no phone-home, no telemetry, no network call",
@@ -122,6 +140,19 @@ function hooksClaudeRow(p: ControlPanelInput): ControlRow {
       label: "Hooks (Claude): n/a on native Windows",
       mark: "info",
       tooltip: tip("Hooks (Claude)", "POSIX-shell hooks are unsupported on native Windows (WSL is fine); the 3s poll still covers status."),
+    };
+  }
+  if (!p.hooksInstalled && hooksPartial(p.hooksHomesInstalled, p.hooksHomesTotal)) {
+    return {
+      ...base,
+      label: `Hooks (Claude): in ${p.hooksHomesInstalled} of ${p.hooksHomesTotal} config homes`,
+      mark: "problem",
+      tooltip: tip(
+        "Hooks (Claude)",
+        `Installed in ${p.hooksHomesInstalled} of ${p.hooksHomesTotal} config homes. Sessions in the others get no instant updates or approval alerts.`,
+        "run SessionDeck: Install Hooks to add them to every home"
+      ),
+      command: "sessionDeck.installHooks",
     };
   }
   if (!p.hooksInstalled) {
@@ -214,7 +245,7 @@ function bridgeRow(p: ControlPanelInput): ControlRow {
       ...base,
       label: "Host bridge: host identity unavailable",
       mark: "problem",
-      tooltip: tip("Host bridge companion", "Cross-host is on, but this host's identity could not load — remote-host enumeration and focus relay are disabled.", "ensure ~/.local/state/claude-overview/host.json is readable and writable, then reload"),
+      tooltip: tip("Host bridge companion", "Cross-host is on, but this host's identity could not load — remote-host enumeration and focus relay are disabled.", `${HOST_ID_FIX_HINT}, then reload`),
       command: "sessionDeck.doctor",
     };
   }
@@ -223,7 +254,7 @@ function bridgeRow(p: ControlPanelInput): ControlRow {
       ...base,
       label: "Host bridge: not answering",
       mark: "problem",
-      tooltip: tip("Host bridge companion", "The companion isn't answering — cross-host has degraded to single-host.", "install the sessiondeck-bridge companion on your desktop side (README → Cross-host)"),
+      tooltip: tip("Host bridge companion", "The companion isn't answering — cross-host has degraded to single-host.", BRIDGE_INSTALL_HINT),
     };
   }
   const ver = p.bridgeCompanionVersion !== undefined ? ` v${p.bridgeCompanionVersion}` : "";
@@ -241,7 +272,7 @@ function bridgeRow(p: ControlPanelInput): ControlRow {
 }
 
 function licenseRow(p: ControlPanelInput): ControlRow {
-  const summary = licenseSummary(p.licenseState, p.licenseOverLimit, p.licenseCovered, p.licenseTotal);
+  const summary = licenseSummary(p.licenseState, p.licenseOverLimit, p.licenseCovered, p.licenseTotal, p.licenseKeyExpiredThrough);
   const overLimit = p.licenseState === "free" && p.licenseOverLimit;
   // The License row carries the full What's-included list in its hover — the rich,
   // never-truncated surface that replaces the old truncated notification. Clicking

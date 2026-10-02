@@ -42,9 +42,10 @@ const HOOK_EVENTS: Record<string, string> = {
 };
 
 const SCRIPT_BODY = `#!/bin/sh
-# ${MARKER} hook forwarder — appends Claude Code hook events to a spool file
+# SessionDeck hook forwarder — appends Claude Code hook events to a spool file
 # watched by SessionDeck. Safe to delete; reinstall via the
-# "SessionDeck: Install Hooks" command.
+# "SessionDeck: Install Hooks" command. The ${MARKER} folder name is
+# SessionDeck's former name, kept so existing installs keep working.
 payload=$(cat)
 lease="${LEASE_FILE}"
 now=$(date +%s)
@@ -70,8 +71,9 @@ export const CURSOR_HOOK_EVENTS = [
 export const CURSOR_HOOK_ALLOWLIST: ReadonlySet<string> = new Set(CURSOR_HOOK_EVENTS);
 
 const CURSOR_SCRIPT_BODY = `#!/bin/sh
-# claude-overview Cursor hook probe — logging only. Registered per Cursor lifecycle
-# event by ~/.cursor/hooks.json. Safe to delete; reinstall via SessionDeck.
+# SessionDeck Cursor hook probe — logging only. Registered per Cursor lifecycle
+# event by ~/.cursor/hooks.json. Safe to delete; reinstall via SessionDeck. The
+# claude-overview folder name is SessionDeck's former name, kept for upgrades.
 payload=$(cat)
 lease="${LEASE_FILE}"
 now=$(date +%s)
@@ -288,6 +290,22 @@ export function hooksInstalled(homes: ConfigHome[]): boolean {
   }
 }
 
+/** How many config homes carry our hook entries (0 when the forwarder script is
+ *  missing, since no home can deliver events without it). Lets the status line
+ *  tell "installed in 2 of 3 homes" apart from "not installed". */
+export function hooksCoverage(homes: ConfigHome[]): { installed: number; total: number } {
+  if (!existsSync(HOOK_SCRIPT)) return { installed: 0, total: homes.length };
+  let installed = 0;
+  for (const h of homes) {
+    try {
+      if (JSON.stringify(readSettings(settingsPath(h)).hooks ?? {}).includes(MARKER)) installed++;
+    } catch {
+      // unreadable settings.json counts as not installed
+    }
+  }
+  return { installed, total: homes.length };
+}
+
 /** True when at least one home's settings.json carries our hook entries. The lease
  *  decision needs ANY-home semantics: every installed home shares the one lease, so a
  *  single home without hooks (or with an unparsable settings.json) must not stop the
@@ -324,10 +342,28 @@ export function removeHooks(homes: ConfigHome[]): void {
  *  the script is absent (nothing to refresh) or already up to date. */
 export function hookScriptStale(): boolean {
   try {
-    return existsSync(HOOK_SCRIPT) && readFileSync(HOOK_SCRIPT, "utf8") !== SCRIPT_BODY;
+    return existsSync(HOOK_SCRIPT) && !sameHookScript(readFileSync(HOOK_SCRIPT, "utf8"), SCRIPT_BODY);
   } catch {
     return false;
   }
+}
+
+/** Compare two hook scripts by what they DO: comment lines (other than the
+ *  shebang) are ignored. The pre-rename extension writes the same forwarder with
+ *  its own header comment; while both are installed they must not keep calling
+ *  each other's copy "outdated" and rewriting it. */
+export function sameHookScript(a: string, b: string): boolean {
+  const code = (text: string): string =>
+    text
+      .split("\n")
+      .filter((line, i) => i === 0 || !line.trimStart().startsWith("#"))
+      .join("\n");
+  return code(a) === code(b);
+}
+
+/** The current forwarder body (for tests and the README's shell copy). */
+export function hookScriptBody(): string {
+  return SCRIPT_BODY;
 }
 
 /** The script body evolves across extension versions (e.g. the bridge field);

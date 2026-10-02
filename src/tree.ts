@@ -31,6 +31,8 @@ import {
   statusKind,
   fleetHeatScore,
   projectExpanded,
+  compareProjectNames,
+  hiddenDescription,
   localNeedsYou,
   remoteNeedsYou,
   compactProjectDescription,
@@ -457,7 +459,7 @@ const SEEN_SEP = "∥";
  *  lives in-memory, not on disk — so it needs its own content provider). */
 /** Sentinel cwd for the synthetic orphan-bucket PanelProject — never a real path, so
  *  it is never pinned, never a worktree, and never collides with a project cwd. */
-const ORPHAN_BUCKET_CWD = " orphaned-runs";
+const ORPHAN_BUCKET_CWD = "\0orphaned-runs";
 const REMOTE_PREVIEW_SCHEME = "sessiondeck-remote";
 const REMOTE_LAST_MSG_CMD = "sessionDeck.showRemoteLastMessage";
 /** Live remote rows focus the session on its own host (owner-approved cross-host
@@ -1015,18 +1017,19 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     this.reload();
   }
 
-  /** Currently-hidden rows for the Show-Hidden picker: real title + age when the
-   *  session is still present this reload, else a key-derived label + age since it
-   *  was hidden (a vanished-but-not-yet-pruned row). Sorted by label. */
-  hiddenList(): { key: string; label: string; ageSec: number }[] {
+  /** Currently-hidden rows for the Show-Hidden picker: real title when the session
+   *  is still present this reload, else a key-derived label, plus how long ago it
+   *  was hidden. Sorted by label. */
+  hiddenList(): { key: string; label: string; description: string }[] {
     const records = this.hiddenMap();
+    const now = Date.now();
     return Object.entries(records)
       .map(([key, rec]) => {
         const present = this.hiddenPresent.get(key);
         return {
           key,
           label: present?.title ?? hiddenKeyLabel(key),
-          ageSec: present?.ageSec ?? Math.max(0, (Date.now() - rec.hideAt) / 1000),
+          description: hiddenDescription(rec, now),
         };
       })
       .sort((a, b) => a.label.localeCompare(b.label));
@@ -1473,7 +1476,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     projects = foldedProjects;
 
     if (this.sortMode === "name") {
-      projects.sort((a, b) => a.cwd.localeCompare(b.cwd));
+      projects.sort((a, b) => compareProjectNames(a.cwd, b.cwd));
     } else {
       const newest = (p: ProjectNode): number =>
         Math.max(
@@ -1673,7 +1676,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
         })
         .sort((a, b) =>
           this.sortMode === "name"
-            ? a.cwd.localeCompare(b.cwd)
+            ? compareProjectNames(a.cwd, b.cwd)
             : Math.min(...a.sessions.map((s) => s.ageSec)) - Math.min(...b.sessions.map((s) => s.ageSec))
         );
       hostNodes.push(new HostNode(snap, stale, Math.round(sinceMs / 1000), rprojects));
@@ -3755,8 +3758,8 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
 
   /** The free-tier LOCKED placeholder tree item, shared by every session kind. It
    *  reveals NOTHING about the real session: fixed label + lock glyph, a distinct
-   *  contextValue ("lockedSession") that matches no menu contribution (zero context
-   *  menu), no children (collapsibleState None), and a single quiet "unlock" command
+   *  contextValue ("lockedSession") whose only context-menu items are Enter License
+   *  Key and Buy License (no session actions), no children (collapsibleState None), and a single quiet "unlock" command
    *  routing to the license menu — no jump/open. `uniqueId` seeds a stable DOM id
    *  (internal only; never rendered). */
   private lockedItem(uniqueId: string): vscode.TreeItem {

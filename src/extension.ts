@@ -6,9 +6,9 @@ import * as os from "node:os";
 import { ConfigHome, detectConfigHomes } from "./homes";
 import {
   EventTail,
-  EVENTS_FILE,
   hooksInstalled,
   hooksInstalledInAnyHome,
+  hooksCoverage,
   hookScriptStale,
   installHooks,
   isPermissionRequest,
@@ -39,6 +39,7 @@ import {
   composerPropertiesMarkdown,
   Density,
   Layout,
+  collapseTarget,
   decidePanelBuild,
   filterBadgeLabel,
   filterIsActive,
@@ -54,6 +55,8 @@ import { BridgeClient, buildSnapshot } from "./bridge";
 import {
   copyMissingMementoValues,
   hostDisplayLabel,
+  installedLegacyExtensions,
+  legacyExtensionMessage,
   migrateLegacySettings,
   parseLegacyMemento,
 } from "./bridgeSchema";
@@ -62,7 +65,25 @@ import { SessionAlerts } from "./alerts";
 import { FocusDigest, digestMessage } from "./digest";
 import { UnfocusedAlerts, UnfocusedAlertConfig, resolvePlatformTools } from "./osalert";
 import { formatHealth, driftHarness, hooksHealth, affectedSources, captureFixtureSlice, buildCaptureSummary, CaptureIdentity } from "./canary";
-import { BUY_URL, TRIAL_MS, decideTrialToast, isLicensed, mergeTrialStart, parseLicenseKey, trialDaysLeft } from "./license";
+import {
+  BUY_URL,
+  TRIAL_MS,
+  decideKeyExpiredNotice,
+  decideTrialToast,
+  expiredMonthlyKey,
+  isLicensed,
+  isReturningInstall,
+  keyExpiredMessage,
+  licenseStatusItem,
+  WELCOME_MESSAGE,
+  TRIAL_ENDED_MESSAGE,
+  TRIAL_ENDED_ELSEWHERE_MESSAGE,
+  licenseKeyProblem,
+  ENTER_KEY_PROMPT,
+  licenseState,
+  mergeTrialStart,
+  trialWasObserved,
+} from "./license";
 import { registerLicenseDebugCommand } from "./debug/licenseDebug";
 import { buildControlPanelRows, ControlRow, ControlPanelInput, ControlMark, WHATS_INCLUDED_MD } from "./controlPanel";
 
@@ -71,9 +92,11 @@ const PROPS_SCHEME = "sessiondeck-props";
 const LICENSE_SCHEME = "sessiondeck-license";
 const LEGACY_EXTENSION_ID = "lensky.claude-overview";
 
-async function migrateRenameState(context: vscode.ExtensionContext): Promise<void> {
+async function migrateRenameState(
+  context: vscode.ExtensionContext
+): Promise<{ legacyMemento: boolean; legacySettings: boolean }> {
   const rootConfig = vscode.workspace.getConfiguration();
-  await migrateLegacySettings({
+  const legacySettings = await migrateLegacySettings({
     inspect: (key) => {
       const value = rootConfig.inspect<unknown>(key);
       return value === undefined
@@ -94,6 +117,10 @@ async function migrateRenameState(context: vscode.ExtensionContext): Promise<voi
     `SELECT value FROM ItemTable WHERE key='${LEGACY_EXTENSION_ID}'`
   );
   const legacyMemento = parseLegacyMemento(rows?.[0]?.[0]);
+  // In a remote window this reads the remote host's state DB, which never holds
+  // the old memento (VS Code keeps extension mementos on the desktop side), so
+  // it finds nothing there. The trial origin still arrives via the desktop
+  // companion; the welcome logic below copes with it arriving late.
   if (legacyMemento !== undefined) {
     await copyMissingMementoValues(context.globalState, legacyMemento);
   }
@@ -108,6 +135,7 @@ async function migrateRenameState(context: vscode.ExtensionContext): Promise<voi
       errorOnExist: false,
     });
   }
+  return { legacyMemento: legacyMemento !== undefined, legacySettings };
 }
 
 /** Icon colour per Control Panel row mark (ThemeColor id). `action`/undefined keeps
@@ -155,10 +183,34 @@ class ControlPanelProvider implements vscode.TreeDataProvider<ControlRow> {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  const activatedAt = Date.now();
+  // Read before anything this activation creates it: the folder holds the host id
+  // and hook spool, so its presence means SessionDeck (or its former name) ran here.
+  const stateDirExisted = existsSync(STATE_DIR);
+  let legacy = { legacyMemento: false, legacySettings: false };
   try {
-    await migrateRenameState(context);
+    legacy = await migrateRenameState(context);
   } catch (err) {
     console.warn(`[sessiondeck] rename migration was incomplete: ${String(err)}`);
+  }
+  // An old-name copy still installed next to SessionDeck duplicates the tree and
+  // writes the same hook script. Say so once per window, with the way out.
+  const legacyInstalled = installedLegacyExtensions((id) => vscode.extensions.getExtension(id) !== undefined);
+  if (legacyInstalled.length > 0) {
+    void vscode.window
+      .showWarningMessage(legacyExtensionMessage(legacyInstalled), "Show in Extensions")
+      .then((choice) => {
+        if (choice === "Show in Extensions")
+          void vscode.commands.executeCommand("workbench.extensions.search", legacyInstalled[0]);
+      });
+  }
+  // A returning user has seen the product: no first-run "free for 3 days" welcome,
+  // even when (in a remote window) their old trial state hasn't reached us yet.
+  if (
+    context.globalState.get<boolean>("trialWelcomeShown") === undefined &&
+    isReturningInstall({ ...legacy, stateDirExisted })
+  ) {
+    await context.globalState.update("trialWelcomeShown", true);
   }
   let refreshFn: () => void = () => undefined;
   const getExtraDirs = (): string[] =>
@@ -168,10 +220,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Cached hooks capability state for the empty-state welcome (context key) and the
   // degraded-capability note. Recomputed at activation and whenever hooks are
   // installed/removed — never per 3s tick (that would re-read every settings.json).
-  let hooksProbe = { installed: false, stale: false };
+  let hooksProbe = { installed: false, stale: false, homesInstalled: 0, homesTotal: 0 };
   const syncHooksContext = (): void => {
     const homes = computeHomes();
-    hooksProbe = { installed: hooksInstalled(homes), stale: hookScriptStale() };
+    const coverage = hooksCoverage(homes);
+    hooksProbe = {
+      installed: hooksInstalled(homes),
+      stale: hookScriptStale(),
+      homesInstalled: coverage.installed,
+      homesTotal: coverage.total,
+    };
     void vscode.commands.executeCommand("setContext", "sessionDeck.hooksInstalled", hooksProbe.installed);
   };
   syncHooksContext();
@@ -315,6 +373,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // bridge liveness, config + the one-shot prompt guard) — no per-tick disk scan.
   provider.capabilityInput = () => ({
     hooksInstalled: hooksProbe.installed,
+    hooksPartial: hooksProbe.homesInstalled > 0 && hooksProbe.homesInstalled < hooksProbe.homesTotal,
     hookScriptStale: hooksProbe.stale,
     platformSupportsHooks: process.platform !== "win32",
     inCursor: /cursor/i.test(vscode.env.appName),
@@ -404,6 +463,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return {
       platformSupportsHooks: process.platform !== "win32",
       hooksInstalled: hooksProbe.installed,
+      hooksHomesInstalled: hooksProbe.homesInstalled,
+      hooksHomesTotal: hooksProbe.homesTotal,
       hookScriptStale: hooksProbe.stale,
       hookDriftSuspected: hooksHealth().driftSuspected,
       cursorMonitoringInstalled: cursorMonitoringInstalled(),
@@ -420,6 +481,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       licenseOverLimit: provider.freeTierOverLimit,
       licenseCovered: provider.licenseCovered,
       licenseTotal: provider.licenseTotal,
+      licenseKeyExpiredThrough: expiredMonthlyKey(provider.licenseKey(), Date.now()),
     };
   };
   const controlPanel = new ControlPanelProvider(controlPanelInput);
@@ -579,18 +641,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   keyItem.command = "sessionDeck.licenseMenu";
   context.subscriptions.push(keyItem);
   const updateKeyItem = (): void => {
-    const state = provider.currentLicenseState;
-    const days = trialDaysLeft(state);
-    const show = provider.freeTierOverLimit || (days !== undefined && days <= 1);
-    if (!show) {
+    const shown = licenseStatusItem(provider.currentLicenseState, provider.freeTierOverLimit);
+    if (shown === undefined) {
       keyItem.hide();
       return;
     }
-    keyItem.text = days !== undefined ? "$(key) Trial ends today" : "$(key) Free tier";
-    keyItem.tooltip =
-      days !== undefined
-        ? "Your free evaluation ends today — enter a license key to keep full supervision"
-        : "Free tier covers 3 sessions; you have more, so the extras are locked. Click for options.";
+    keyItem.text = shown.text;
+    keyItem.tooltip = shown.tooltip;
     keyItem.show();
   };
 
@@ -626,33 +683,53 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const WELCOME_KEY = "trialWelcomeShown";
   const TRIAL_END_PENDING_KEY = "trialEndedPending";
   const TRIAL_END_KEY = "trialEndedShown";
+  const TRIAL_SEEN_KEY = "trialSeenAt";
+  const WELCOME_DISPLAYED_KEY = "trialWelcomeDisplayed";
+  // The trial origin is final once the desktop companion has reported its trial
+  // start, or is known to be absent (cross-host off, probe gave up), or the probe
+  // window has passed anyway (a companion too old to have the license command).
+  const trialOriginSettled = (): boolean =>
+    !crossHostEnabled() ||
+    bridge.licenseCached !== undefined ||
+    (bridge.probeSettled && !bridge.available) ||
+    Date.now() - activatedAt > 60_000;
   const maybeTrialToast = (): void => {
     const trialStart = context.globalState.get<number>(TRIAL_START_KEY);
+    const now = Date.now();
+    // Recompute from globalState rather than the provider's last reload, so a
+    // trial origin the companion just moved earlier is already reflected.
+    const state = licenseState(provider.licenseKey(), now, trialStart ?? now);
+    const settled = trialOriginSettled();
+    if (settled && state.startsWith("trial:") && context.globalState.get<number>(TRIAL_SEEN_KEY) === undefined) {
+      void context.globalState.update(TRIAL_SEEN_KEY, now);
+    }
     const d = decideTrialToast({
-      state: provider.currentLicenseState,
+      state,
+      originSettled: settled,
+      trialObserved: trialWasObserved(context.globalState.get<number>(TRIAL_SEEN_KEY), trialStart),
+      welcomeDisplayed: context.globalState.get<boolean>(WELCOME_DISPLAYED_KEY) === true,
       notificationsOn: notificationsOn(),
       welcomeShown: context.globalState.get<boolean>(WELCOME_KEY) === true,
       trialEndedPending: context.globalState.get<boolean>(TRIAL_END_PENDING_KEY) === true,
       trialEndedShown: context.globalState.get<boolean>(TRIAL_END_KEY) === true,
       trialElapsed: trialStart !== undefined && Date.now() >= trialStart + TRIAL_MS,
+      keyExpired: expiredMonthlyKey(provider.licenseKey(), Date.now()) !== undefined,
     });
     // Persist latches BEFORE showing (pending is armed even with notifications off).
     if (d.setTrialEndedPending === true) void context.globalState.update(TRIAL_END_PENDING_KEY, true);
     if (d.setWelcomeShown === true) void context.globalState.update(WELCOME_KEY, true);
     if (d.setTrialEndedShown === true) void context.globalState.update(TRIAL_END_KEY, true);
     if (d.toast === "welcome") {
+      void context.globalState.update(WELCOME_DISPLAYED_KEY, true);
       void vscode.window
-        .showInformationMessage(
-          "SessionDeck: full features are free for 3 days; a free tier stays after — no account needed.",
-          "What's included"
-        )
+        .showInformationMessage(WELCOME_MESSAGE, "What's included")
         .then((choice) => {
           if (choice === "What's included") void vscode.commands.executeCommand("sessionDeck.whatsIncluded");
         });
-    } else if (d.toast === "trial-ended") {
+    } else if (d.toast === "trial-ended" || d.toast === "trial-ended-elsewhere") {
       void vscode.window
         .showInformationMessage(
-          "Trial ended — free tier active: your 3 most active sessions stay covered in full.",
+          d.toast === "trial-ended" ? TRIAL_ENDED_MESSAGE : TRIAL_ENDED_ELSEWHERE_MESSAGE,
           "Enter Key",
           "Buy"
         )
@@ -661,6 +738,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           else if (choice === "Buy") void vscode.commands.executeCommand("sessionDeck.buyLicense");
         });
     }
+  };
+
+  // Once per lapsed monthly key: the tier just dropped to free, so say so and name
+  // the next step. Latched on the key's yyyy-mm BEFORE showing (two racing windows
+  // can't both show); a later renewal that lapses gets its own notice.
+  const KEY_EXPIRED_KEY = "licenseKeyExpiredNotified";
+  const maybeKeyExpiredNotice = (): void => {
+    const d = decideKeyExpiredNotice({
+      key: provider.licenseKey(),
+      nowMs: Date.now(),
+      state: provider.currentLicenseState,
+      notificationsOn: notificationsOn(),
+      notifiedFor: context.globalState.get<string>(KEY_EXPIRED_KEY),
+    });
+    if (!d.show) return;
+    void context.globalState.update(KEY_EXPIRED_KEY, d.through);
+    // This notice already offers Enter Key; skip today's over-limit reminder.
+    void context.globalState.update(REMINDER_KEY, new Date().toISOString().slice(0, 10));
+    void vscode.window
+      .showInformationMessage(keyExpiredMessage(d.through), "Enter Key", "Open sessiondeck.dev")
+      .then((choice) => {
+        if (choice === "Enter Key") void vscode.commands.executeCommand("sessionDeck.enterLicenseKey");
+        else if (choice === "Open sessiondeck.dev") void vscode.commands.executeCommand("sessionDeck.buyLicense");
+      });
   };
 
   // ---- Dirty-set discovery (perf) -------------------------------------------
@@ -837,7 +938,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // reset it. This is what stops a trial restarting when the extension is reinstalled
   // into a fresh remote after the evaluation already began on this machine. When the
   // companion is absent/old (undefined license), the local value is untouched.
+  // Dev-only: the license debug command resets the trial in this window; without
+  // this the companion's older origin would be merged straight back next tick.
+  let trialMergeSuspended = false;
   const reconcileTrialStart = async (): Promise<void> => {
+    if (trialMergeSuspended) return;
     const bl = await bridge.license();
     if (bl === undefined) return;
     const local = context.globalState.get<number>(TRIAL_START_KEY);
@@ -996,6 +1101,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       updateChip();
       updateKeyItem();
       controlPanel.refresh();
+      maybeKeyExpiredNotice();
       maybeTrialToast();
       maybeRemindLicense();
       syncFilterIndicator();
@@ -1179,6 +1285,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       extraConfigDirs: getExtraDirs(),
       platformSupportsHooks: process.platform !== "win32",
       hooksInstalled: hooksInstalled(homes),
+      hooksHomesInstalled: hooksCoverage(homes).installed,
+      hooksHomesTotal: homes.length,
       hookScriptStale: hookScriptStale(),
       cursorMonitoringInstalled: cursorMonitoringInstalled(),
       cursorSpoolFreshSec: cursorSpoolFreshSec(),
@@ -1229,6 +1337,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       licenseOverLimit: provider.freeTierOverLimit,
       licenseCovered: provider.licenseCovered,
       licenseTotal: provider.licenseTotal,
+      licenseKeyExpiredThrough: expiredMonthlyKey(provider.licenseKey(), Date.now()),
       // Refresh tick watchdog: the ring-buffer summary (per-path percentiles, worst
       // tick phase breakdown, throw count + last error) as of now.
       watchdog: watchdog.summary(),
@@ -1523,7 +1632,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     type HiddenItem = vscode.QuickPickItem & { key?: string; all?: boolean };
     const items: HiddenItem[] = [
       { label: "$(eye) Unhide all", all: true, description: `${rows.length} hidden` },
-      ...rows.map((r): HiddenItem => ({ label: r.label, description: `hidden ${fmtAge(r.ageSec)} ago`, key: r.key })),
+      ...rows.map((r): HiddenItem => ({ label: r.label, description: r.description, key: r.key })),
     ];
     const pick = await vscode.window.showQuickPick(items, { title: "Hidden sessions — select to unhide" });
     if (pick === undefined) return;
@@ -1887,13 +1996,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // The columns TABLE view owns its own webview collapse state; the list view is
       // the sidebar tree. They are mutually exclusive (sessionDeck.columns gates
       // which one shows), so route to whichever is live.
-      if (tableView.isVisible()) tableView.setAllCollapsed(true);
+      if (collapseTarget(layoutOf()) === "table") tableView.setAllCollapsed(true);
       else provider.setAllCollapsed(true);
       void vscode.commands.executeCommand("setContext", "sessionDeck.collapsed", true);
     }),
 
     vscode.commands.registerCommand("sessionDeck.expandAll", () => {
-      if (tableView.isVisible()) tableView.setAllCollapsed(false);
+      if (collapseTarget(layoutOf()) === "table") tableView.setAllCollapsed(false);
       else provider.setAllCollapsed(false);
       void vscode.commands.executeCommand("setContext", "sessionDeck.collapsed", false);
     }),
@@ -1911,7 +2020,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         syncHooksContext();
         scheduleRefresh("hooks-installed");
         void vscode.window.showInformationMessage(
-          `SessionDeck hooks installed (events spool: ${EVENTS_FILE}). Sessions started from now on will push updates.`
+          "SessionDeck hooks installed. Sessions started from now on will push updates."
         );
       } catch (err) {
         void vscode.window.showErrorMessage(
@@ -1976,24 +2085,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const cfg = vscode.workspace.getConfiguration("sessionDeck");
       const value = await vscode.window.showInputBox({
         title: "Enter License Key",
-        prompt: "CMC-YYYYMM-XXXX-XXXX-XXXX — validated offline, never sent anywhere.",
+        prompt: ENTER_KEY_PROMPT,
         value: cfg.get<string>("licenseKey", ""),
         ignoreFocusOut: true,
-        validateInput: (raw) => {
-          if (raw.trim() === "") return undefined; // empty clears the key
-          const parsed = parseLicenseKey(raw);
-          if (!parsed.valid)
-            return "Not a valid key — expected CMC-YYYYMM-XXXX-XXXX-XXXX (the CMC prefix and 6-4-4-4 grouping are required).";
-          if (parsed.lifetime) return undefined; // valid lifetime key
-          const now = new Date();
-          const end = new Date(Math.floor(parsed.expiry / 100), parsed.expiry % 100, 1);
-          if (now.getTime() >= end.getTime()) {
-            const yyyy = Math.floor(parsed.expiry / 100);
-            const mm = String(parsed.expiry % 100).padStart(2, "0");
-            return `Valid key, but it expired ${yyyy}-${mm}.`;
-          }
-          return undefined;
-        },
+        validateInput: (raw) => licenseKeyProblem(raw, Date.now()),
       });
       if (value === undefined) return; // cancelled
       await cfg.update("licenseKey", value.trim(), vscode.ConfigurationTarget.Global);
@@ -2043,6 +2138,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     registerLicenseDebugCommand({
       context,
+      suspendTrialMerge: () => {
+        trialMergeSuspended = true;
+      },
       provider,
       refresh,
       refreshPanel: () => {

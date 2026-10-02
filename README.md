@@ -20,7 +20,7 @@ Or search **SessionDeck** in the Extensions view.
 
 **Cursor** (Open VSX): search **SessionDeck** in the Extensions panel, or run `cursor --install-extension len5ky.sessiondeck`. If Cursor can't find it, download `sessiondeck-<version>.vsix` from [GitHub Releases](https://github.com/len5ky/sessiondeck/releases) and run **Extensions: Install from VSIX...**.
 
-**Remote windows** (WSL, Remote-SSH, dev containers): SessionDeck runs on the workspace side, so it goes into the remote, next to your sessions. The optional bridge for seeing several hosts in one tree goes on your **local desktop** instead; see [Other hosts](#other-hosts-the-bridge).
+**Remote windows** (WSL, Remote-SSH, dev containers): SessionDeck runs on the workspace side, so it goes into the remote, next to your sessions. The optional bridge for seeing several hosts in one tree goes on your **local desktop** instead, and installing SessionDeck from the Extensions view puts it there for you; see [Other hosts](#other-hosts-the-bridge).
 
 ### Platform support
 
@@ -63,7 +63,7 @@ Clicking a row opens the session: its Claude tab, even in another editor window,
 
 SessionDeck reads files. Every few seconds it scans each Claude Code config home (`~/.claude`, `CLAUDE_CONFIG_DIR`, any you list in `sessionDeck.extraConfigDirs`, and on Linux any home a running `claude` process points at), reads the tail of each transcript, and checks the process in `/proc` to confirm it's still alive. The turn boundary comes from the transcript's `stop_reason`: `end_turn` means done, an interrupt marker means idle. So sessions started in a terminal, tmux or cron show up too.
 
-Hooks make it faster. **Install Hooks** adds Stop, Notification and UserPromptSubmit entries to `settings.json` in every config home (backed up, safe to run twice) plus a small forwarder script at `~/.local/state/claude-overview/hook.sh`. Each event appends a line to a spool file SessionDeck watches, so the row flips the moment a session finishes or hits a permission prompt. **Remove Hooks** takes them out.
+Hooks make it faster. **Install Hooks** adds Stop, Notification and UserPromptSubmit entries to `settings.json` in every config home (backed up, safe to run twice) plus a small forwarder script at `~/.local/state/claude-overview/hook.sh` (`claude-overview` is SessionDeck's former name; the folder keeps it so existing installs carry over). Each event appends a line to a spool file SessionDeck watches, so the row flips the moment a session finishes or hits a permission prompt. **Remove Hooks** takes them out.
 
 When a session blocks, you get a VS Code notification naming what it wants ("needs your permission to use Bash", or the question text) with an **Open** button. One notification per incident. Three or more blocks within 45 seconds collapse into one notice with a **Triage** button. Notifications live inside the editor window, which is exactly where you aren't when they fire, so two settings (both off by default) reach you when it's unfocused: `sessionDeck.unfocusedSound` and `sessionDeck.unfocusedOsNotification`. They fire at most once per 30 seconds.
 
@@ -79,9 +79,9 @@ None of these tools writes an approval or "waiting for you" state to disk. Their
 
 ![Cross-host: sessions from other machines](media/cross-host.gif)
 
-If you work in remote windows, each remote host can show up as its own section in your local tree. That needs a second, invisible extension, **SessionDeck Bridge** (`len5ky.sessiondeck-bridge`), installed on the local desktop side. It has no UI and no settings. It relays snapshots over VS Code's own command channel and serves tab titles to remote windows, which can't read local editor storage.
+If you work in remote windows, each remote host can show up as its own section in your local tree. That needs a second, invisible extension, **SessionDeck Bridge** (`len5ky.sessiondeck-bridge`), installed on the local desktop side. Installing SessionDeck from the Marketplace or Open VSX installs it there too. It has no UI and no settings. It relays snapshots over VS Code's own command channel and serves tab titles to remote windows, which can't read local editor storage.
 
-Skip it if everything runs in local windows on one machine. Without it, remote sessions also show `project-hash` names instead of tab titles.
+If everything runs in local windows on one machine you don't need it, and you can uninstall it. Without it, remote sessions also show `project-hash` names instead of tab titles.
 
 Remote rows are read-only. A live one focuses the session when clicked; a closed one stays dimmed with a "last seen" age and leaves the tree after 24 hours. VS Code and Cursor each see only their own hosts.
 
@@ -100,7 +100,8 @@ code --install-extension len5ky.sessiondeck
 #    https://github.com/len5ky/sessiondeck/releases, then
 #    code --install-extension ./sessiondeck-<version>.vsix
 
-# 2. Optional, cross-host view only: bridge on the LOCAL desktop
+# 2. Optional, cross-host view only: bridge on the LOCAL desktop.
+#    Installing step 1 from the Extensions view brings it along; from a shell, run this on the desktop.
 code --install-extension len5ky.sessiondeck-bridge
 ```
 
@@ -112,9 +113,10 @@ STATE="$HOME/.local/state/claude-overview"
 mkdir -p "$STATE"
 cat > "$STATE/hook.sh" <<'EOF'
 #!/bin/sh
-# claude-overview hook forwarder: appends Claude Code hook events to a spool file
+# SessionDeck hook forwarder: appends Claude Code hook events to a spool file
 # watched by SessionDeck. Safe to delete; reinstall via the
-# "SessionDeck: Install Hooks" command.
+# "SessionDeck: Install Hooks" command. The claude-overview folder name is
+# SessionDeck's former name, kept so existing installs keep working.
 payload=$(cat)
 lease="__STATE__/monitor.lease"
 now=$(date +%s)
