@@ -5,6 +5,12 @@ packages share one version number.
 
 ## [Unreleased]
 
+## [0.42.2] - 2026-10-02
+
+### Fixed
+- The last broken image on the Marketplace listing (a CI badge pointing at a
+  private workflow) is gone.
+
 ## [0.42.1] - 2026-10-02
 
 ### Fixed

@@ -2,7 +2,7 @@
   "name": "sessiondeck",
   "displayName": "SessionDeck",
   "description": "One panel for every Claude Code, Codex and Cursor session on this host: grouped by project, live status, subagent activity, unread and approval alerts, click-to-navigate.",
-  "version": "0.42.1",
+  "version": "0.42.2",
   "icon": "media/icon.png",
   "publisher": "len5ky",
   "license": "SEE LICENSE IN LICENSE",
