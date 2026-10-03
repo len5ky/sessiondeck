@@ -20,6 +20,9 @@ import {
   validateAction,
   validateBridgeLicense,
   validateCursorSessions,
+  validateLegacyState,
+  helloRev,
+  type LegacyStateDoc,
 } from "./bridgeSchema";
 import { HostIdentity } from "./hostid";
 import { PanelChild, PanelModel, publishableTitle, publishableAttention } from "./format";
@@ -31,6 +34,8 @@ const POST_ACTION = "sessionDeckBridge.postAction";
 const TAKE_ACTIONS = "sessionDeckBridge.takeActions";
 const CURSOR_SESSIONS = "sessionDeckBridge.cursorSessions";
 const LICENSE = "sessionDeckBridge.license";
+const LEGACY_STATE = "sessionDeckBridge.legacyState"; // command rev 2
+const CLAIM_ONCE = "sessionDeckBridge.claimOnce"; // command rev 2
 
 const HEARTBEAT_MS = 15000; // republish an unchanged snapshot at least this often
 const MIN_INTERVAL_MS = 3000; // never publish twice within this window, ever
@@ -77,6 +82,8 @@ function isStored(x: unknown): x is StoredHostSnapshot {
 export class BridgeClient {
   private _available = false;
   private probeFinished = false;
+  private probeStarted = false;
+  private settleWaiters: (() => void)[] = [];
   private disposed = false;
   private probeTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -87,6 +94,8 @@ export class BridgeClient {
   /** Companion version from the last successful hello(), and whether it minor-skews
    *  from ours — surfaced read-only by the Setup Doctor (console-only otherwise). */
   private _companionVersion: string | undefined;
+  /** The companion's command-set revision (helloRev; 1 = 0.42.4 and older). */
+  private _rev = 1;
   private _versionSkew = false;
   private companionInstanceId: string | undefined;
   private enumSinceGen = "";
@@ -101,7 +110,10 @@ export class BridgeClient {
 
   constructor(private readonly opts: BridgeClientOptions) {
     // Skip all probe work when cross-host is disabled — no hello backoff loop runs.
-    if (opts.enabled?.() ?? true) this.startProbe();
+    if (opts.enabled?.() ?? true) {
+      this.probeStarted = true;
+      this.startProbe();
+    }
   }
 
   /** True once the initial hello() probe has finished, found or not. */
@@ -128,14 +140,22 @@ export class BridgeClient {
   get cursorEnumGen(): string { return this.enumSinceGen; }
   get cursorEnumSessions(): readonly CursorEnumSessionWire[] { return this.enumCache; }
 
+  private releaseSettleWaiters(): void {
+    const ws = this.settleWaiters;
+    this.settleWaiters = [];
+    for (const w of ws) w();
+  }
+
   dispose(): void {
     this.disposed = true;
+    this.releaseSettleWaiters();
     if (this.probeTimer !== undefined) clearTimeout(this.probeTimer);
   }
 
   // ---- availability probe ---------------------------------------------------
 
-  /** Retry hello() with 1s,2s,4s… backoff, capped at a 60s total window. On the
+  /** Retry hello() with 1s,2s,4s… backoff inside a 60s budget (attempts at 0, 1,
+   *  3, 7, 15 and 31 s, so with no answer it settles at about 31 s). On the
    *  first success we flip available; if the window elapses with no answer we
    *  settle degraded and fire the one-time install-prompt callback. */
   private startProbe(): void {
@@ -164,6 +184,7 @@ export class BridgeClient {
   private settleProbe(found: boolean): void {
     if (this.probeFinished) return;
     this.probeFinished = true;
+    this.releaseSettleWaiters();
     if (!found && !this.disposed) this.opts.onInitialProbeFailed?.();
   }
 
@@ -174,6 +195,7 @@ export class BridgeClient {
       if (isObject(res) && res.v === 1 && typeof res.version === "string") {
         this._available = true;
         this._companionVersion = res.version;
+        this._rev = helloRev(res);
         this.companionInstanceId = typeof res.instanceId === "string" ? res.instanceId : undefined;
         this.checkSkew(res.version);
         return true;
@@ -308,6 +330,74 @@ export class BridgeClient {
       return this._license;
     } catch {
       return this._license; // old companion (no license command) or transient
+    }
+  }
+
+  // ---- command rev 2: former-extension state + once-per-machine claims -------
+
+  /** The companion's command-set revision; 1 until a hello reports more. */
+  get commandRev(): number {
+    return this._rev;
+  }
+
+  /** The former extension's pins/filter/sort as the desktop holds them. Undefined
+   *  when it can't be asked: companion absent, or older than rev 2 (an old
+   *  companion is never sent the command), or an invalid answer. */
+  async legacyState(): Promise<LegacyStateDoc | undefined> {
+    if (!this._available || this._rev < 2) return undefined;
+    try {
+      return validateLegacyState(await vscode.commands.executeCommand(LEGACY_STATE)) ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** True once this window's client is disposed (the window is closing). */
+  get isDisposed(): boolean {
+    return this.disposed;
+  }
+
+  /** claimOnce, but first wait for the initial hello probe to finish (it gives up
+   *  by itself about 31 s after activation when no hello answers: retries at 0, 1,
+   *  3, 7, 15 and 31 s, then the next delay would pass PROBE_BUDGET_MS), so a
+   *  window that has not heard from its companion yet does not fall back to a
+   *  host-local claim while the companion is still about to answer. Returns at
+   *  once when the probe never started (cross-host off) or has already finished.
+   *  "disposed" when the window closed first: the caller must then do nothing. */
+  async claimOnceWhenSettled(name: string): Promise<boolean | undefined | "disposed"> {
+    if (this.probeStarted && !this.probeFinished && !this.disposed) {
+      await new Promise<void>((resolve) => this.settleWaiters.push(resolve));
+    }
+    if (this.disposed) return "disposed";
+    return this.claimOnce(name);
+  }
+
+  /** The once-per-machine claim for a one-time notice: through the companion when
+   *  it answers, otherwise `local` (a claim in this extension host's own storage;
+   *  undefined there means it couldn't claim, which counts as a win so the notice
+   *  shows rather than being dropped). "disposed" when the window closed at any
+   *  point before the claim: nothing was claimed and nothing must be shown. */
+  async claimOnceOrLocal(
+    name: string,
+    local: (name: string) => Promise<boolean | undefined>
+  ): Promise<boolean | "disposed"> {
+    const viaBridge = await this.claimOnceWhenSettled(name);
+    if (viaBridge === "disposed") return "disposed";
+    if (viaBridge !== undefined) return viaBridge;
+    if (this.disposed) return "disposed"; // closed while the companion was asked
+    return (await local(name)) !== false;
+  }
+
+  /** Claim `name` once across every window on this desktop. true = this caller
+   *  won; false = another window already claimed it; undefined = no answer (absent
+   *  or pre-rev-2 companion, or a failure), and the caller falls back. */
+  async claimOnce(name: string): Promise<boolean | undefined> {
+    if (!this._available || this._rev < 2) return undefined;
+    try {
+      const res: unknown = await vscode.commands.executeCommand(CLAIM_ONCE, name);
+      return isObject(res) && typeof res.claimed === "boolean" ? res.claimed : undefined;
+    } catch {
+      return undefined;
     }
   }
 

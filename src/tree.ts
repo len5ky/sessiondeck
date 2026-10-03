@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import { existsSync } from "node:fs";
-import { basename } from "node:path";
 import {
   SessionRow,
   snapshot,
@@ -32,6 +31,8 @@ import {
   fleetHeatScore,
   projectExpanded,
   compareProjectNames,
+  projectDisplayName,
+  RootFetchSignal,
   hiddenDescription,
   localNeedsYou,
   remoteNeedsYou,
@@ -109,6 +110,8 @@ import {
   BridgeSession,
   BridgeChild,
   hostDisplayLabel,
+  SORT_MODES,
+  FILTER_MODES,
 } from "./bridgeSchema";
 import { AlertRow, RemoteAlertRow } from "./alerts";
 import { ReasonStore } from "./reasons";
@@ -415,8 +418,9 @@ type Node =
   | LicenseNoteNode
   | CollisionNoteNode;
 
-export type SortMode = "activity" | "name" | "heat";
-export type FilterMode = "all" | "1h" | "24h" | "attention";
+// The lists live in bridgeSchema so the remote legacy-state import accepts every mode.
+export type SortMode = (typeof SORT_MODES)[number];
+export type FilterMode = (typeof FILTER_MODES)[number];
 
 export const FILTER_LABELS: Record<FilterMode, string> = {
   all: "All sessions",
@@ -851,6 +855,10 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     this.signature = "";
     this.reload();
   }
+
+  /** Signals each root fetch, so a toast about a state change can wait until the
+   *  tree shows it (see RootFetchSignal). */
+  readonly rootFetch = new RootFetchSignal();
 
   forceReload(): void {
     this.signature = "";
@@ -2380,7 +2388,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
         const sid = s.row.meta.sessionId;
         rows.push({
           sessionId: sid,
-          label: this.titleWithFallback(s.row, s.row.meta.name ?? basename(s.row.meta.cwd)),
+          label: this.titleWithFallback(s.row, s.row.meta.name ?? projectDisplayName(s.row.meta.cwd)),
           attention: s.attention,
           attentionTs: this.attentionMap.get(sid),
           reason: s.reason,
@@ -2481,11 +2489,11 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       // these under their main repo; the panel/table stays flat for now.
       const wt = worktreeInfo(p.cwd);
       return {
-        name: basename(p.cwd),
+        name: projectDisplayName(p.cwd),
         cwd: p.cwd,
         description,
         branch: wt?.branch,
-        worktreeOf: wt !== undefined ? basename(wt.mainRoot) : undefined,
+        worktreeOf: wt !== undefined ? projectDisplayName(wt.mainRoot) : undefined,
         needsYou,
         pinned: this.isPinned(p.cwd),
         sessions: p.sessions.map((node) => this.panelSession(node, colorFor, activityTree)),
@@ -2631,7 +2639,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
         description = parts.join(" · ");
       }
       return {
-        name: basename(p.cwd),
+        name: projectDisplayName(p.cwd),
         cwd: p.cwd,
         description,
         needsYou,
@@ -3057,6 +3065,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     // same array of ProjectNodes as before (single-host view is unchanged). The
     // degraded-capability note, when present, is the very last leaf.
     if (element === undefined) {
+      this.rootFetch.fetched();
       // Root of a full render: start a fresh TreeItem-id uniqueness scope so the
       // duplicate-id backstop is bounded to this render (see uniqueItemId).
       this.beginItemIdScope();
@@ -3405,7 +3414,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     const needsYou = this.remoteProjectNeedsYou(node);
     const expanded = projectExpanded(this.density(), this.collapseOverride, needsYou);
     const item = new vscode.TreeItem(
-      basename(node.cwd),
+      projectDisplayName(node.cwd),
       expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed
     );
     item.id = `remote-project:${node.hostId}:${node.cwd}#g${this.generation}${this.densitySuffix(expanded)}`;
@@ -3549,14 +3558,14 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     // A synthetic main-repo parent has no sessions of its own — it exists only to host
     // worktree children, so it renders as a plain, always-expanded group ("N worktrees").
     if (node.synthetic) {
-      const item = new vscode.TreeItem(basename(node.cwd), vscode.TreeItemCollapsibleState.Expanded);
+      const item = new vscode.TreeItem(projectDisplayName(node.cwd), vscode.TreeItemCollapsibleState.Expanded);
       item.id = `${node.cwd}#g${this.generation}#wtparent`;
       item.contextValue = "project-worktree-parent";
       item.description = plural(node.worktrees.length, "worktree");
       item.iconPath = new vscode.ThemeIcon("repo");
       const md = new vscode.MarkdownString(undefined, true);
       md.appendMarkdown(`$(repo) **`);
-      this.mdText(md, basename(node.cwd));
+      this.mdText(md, projectDisplayName(node.cwd));
       md.appendMarkdown(`** — main repo · ${plural(node.worktrees.length, "worktree")}\n\n---\n\n$(folder) `);
       this.mdText(md, node.cwd);
       item.tooltip = md;
@@ -3571,7 +3580,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       needsYou + node.worktrees.reduce((n, w) => n + this.projectNeedsYou(w), 0);
     const expanded = projectExpanded(this.density(), this.collapseOverride, expandNeedsYou);
     const item = new vscode.TreeItem(
-      basename(node.cwd),
+      projectDisplayName(node.cwd),
       expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed
     );
     // The density suffix rides the auto-expand decision so a project that comes to
@@ -3636,7 +3645,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     md.supportHtml = true;
     // ── Header: project name + a compact roll-up (N sessions · W working · U unread).
     md.appendMarkdown(`$(folder-active) **`);
-    this.mdText(md, basename(node.cwd));
+    this.mdText(md, projectDisplayName(node.cwd));
     md.appendMarkdown(
       `** — ${plural(node.sessions.length + node.cursors.length + node.codexes.length, "session")}`
     );

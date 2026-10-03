@@ -9,14 +9,21 @@ import { cp, mkdir, readdir, readFile, writeFile, rename, rm, stat } from "node:
 // truth, verified vscode-free / dependency-free. Keep it that way: these files
 // are also compiled into the main extension, so never add a vscode import to them.
 import {
+  LEGACY_BRIDGE_EXTENSION_ID,
+  LEGACY_MEMENTOS_SQL,
+  bridgeHello,
+  legacyMementosFromRows,
+  claimOnceFile,
   copyMissingMementoValues,
+  legacyStateFromRead,
   migrateLegacySettings,
-  parseLegacyMemento,
+  mementoTrialStart,
+  seedTrialStart,
   validateSnapshot,
   validateAction,
   HOST_ID_RE,
 } from "../../src/bridgeSchema";
-import type { StoredHostSnapshot, FocusAction, BridgeLicense, CursorEnumSessionWire, CursorSessionsResult } from "../../src/bridgeSchema";
+import type { LegacyStateDoc, StoredHostSnapshot, FocusAction, BridgeLicense, CursorEnumSessionWire, CursorSessionsResult } from "../../src/bridgeSchema";
 import { extractPanelTitles, readComposerEnumeration } from "../../src/titleExtract";
 import { sqliteSelect } from "../../src/sqliteRead";
 
@@ -38,9 +45,36 @@ type TitlesResult = { ok: true; titles: Record<string, string> } | { ok: false; 
 type PostResult = { ok: true } | { ok: false; error: string };
 type TakeResult = { ok: true; actions: FocusAction[] } | { ok: false; error: string };
 
-const LEGACY_EXTENSION_ID = "lensky.claude-overview-bridge";
+const LICENSE_TRIAL_KEY = "licenseTrialStart";
 
-async function migrateRenameState(context: vscode.ExtensionContext): Promise<void> {
+type LegacyRead = { main?: Record<string, unknown> } | null;
+
+/** Read both former mementos (one DB copy) and seed our trial start from the
+ *  former main extension's, prefer-older. null = the read failed. */
+async function readLegacyMementos(context: vscode.ExtensionContext, globalStorageRoot: string) {
+  const mementos = legacyMementosFromRows(
+    await sqliteSelect(join(globalStorageRoot, "state.vscdb"), LEGACY_MEMENTOS_SQL)
+  );
+  // The former main extension's memento lives in this same desktop DB, where a
+  // remote window's main extension can't read it. Seed our trial start from it
+  // (prefer-older), so a remote-only upgrader's ended trial is not restarted.
+  // All three sources in one place, oldest wins: our own, the former companion's
+  // (its copy into our state below only fills empty keys, so it can't be relied on
+  // to bring an older value) and the former main extension's.
+  const own = context.globalState.get<unknown>(LICENSE_TRIAL_KEY);
+  const seeded = seedTrialStart(
+    [own, mementoTrialStart(mementos?.bridge), mementoTrialStart(mementos?.main)],
+    Date.now()
+  );
+  if (seeded !== undefined && (typeof own !== "number" || !Number.isFinite(own) || seeded < own)) {
+    await context.globalState.update(LICENSE_TRIAL_KEY, seeded);
+  }
+  return mementos;
+}
+
+/** Runs the rename migration and returns what it read of the former mementos
+ *  (null when the state DB could not be read), for legacyState(). */
+async function migrateRenameState(context: vscode.ExtensionContext): Promise<LegacyRead> {
   const rootConfig = vscode.workspace.getConfiguration();
   await migrateLegacySettings({
     inspect: (key) => {
@@ -58,18 +92,15 @@ async function migrateRenameState(context: vscode.ExtensionContext): Promise<voi
   });
 
   const globalStorageRoot = join(context.globalStorageUri.fsPath, "..");
-  const rows = await sqliteSelect(
-    join(globalStorageRoot, "state.vscdb"),
-    `SELECT value FROM ItemTable WHERE key='${LEGACY_EXTENSION_ID}'`
-  );
-  const legacyMemento = parseLegacyMemento(rows?.[0]?.[0]);
-  if (legacyMemento !== undefined) {
-    await copyMissingMementoValues(context.globalState, legacyMemento);
+  // One read (one DB copy) for both former mementos.
+  const mementos = await readLegacyMementos(context, globalStorageRoot);
+  if (mementos?.bridge !== undefined) {
+    await copyMissingMementoValues(context.globalState, mementos.bridge);
   }
 
   // Preserve cached host snapshots and any other companion-owned files while
   // retaining the old directory as a non-destructive rollback source.
-  const legacyStorage = join(globalStorageRoot, LEGACY_EXTENSION_ID);
+  const legacyStorage = join(globalStorageRoot, LEGACY_BRIDGE_EXTENSION_ID);
   if (existsSync(legacyStorage)) {
     await cp(legacyStorage, context.globalStorageUri.fsPath, {
       recursive: true,
@@ -77,11 +108,13 @@ async function migrateRenameState(context: vscode.ExtensionContext): Promise<voi
       errorOnExist: false,
     });
   }
+  return mementos;
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  let legacyRead: LegacyRead = null;
   try {
-    await migrateRenameState(context);
+    legacyRead = await migrateRenameState(context);
   } catch (err) {
     console.warn(`[sessiondeck-bridge] rename migration was incomplete: ${String(err)}`);
   }
@@ -92,6 +125,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // validated before any fs use; targetHostId is HOST_ID_RE-gated by the
   // validator, which is what makes it safe as a directory name.
   const actionsDir = join(context.globalStorageUri.fsPath, "actions");
+  const claimsDir = join(context.globalStorageUri.fsPath, "claims");
   // Desktop-side Claude panel titles for remote (WSL/SSH) windows: the main
   // extension there can't reach this machine's workspaceStorage, so it asks us.
   // Derive the workspaceStorage root from OUR OWN globalStorage dir — editor- and
@@ -186,7 +220,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // what lets a remote instance whose sync lagged still be licensed. If the owner
   // wants stricter data minimization, drop the `key` line — trial-authority (the
   // trialStart merge) is independent of it and still works.
-  const LICENSE_TRIAL_KEY = "licenseTrialStart";
   const license = (): BridgeLicense => {
     let trialStart = context.globalState.get<number>(LICENSE_TRIAL_KEY);
     if (typeof trialStart !== "number" || !Number.isFinite(trialStart)) {
@@ -199,6 +232,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     return out;
   };
 
+  // legacyState: when the activation read failed, read again (one DB copy), at most
+  // once a minute; the main asks once per window activation and gives up after a
+  // few unreadable answers, so a DB that never reads is not copied forever.
+  let legacyRetryAt = 0;
+  const legacyState = async (): Promise<LegacyStateDoc> => {
+    let fresh = false;
+    if (legacyRead === null && Date.now() - legacyRetryAt >= 60_000) {
+      legacyRetryAt = Date.now();
+      fresh = true;
+      try {
+        legacyRead = await readLegacyMementos(context, globalStorageRoot);
+      } catch {
+        legacyRead = null;
+      }
+    }
+    return legacyStateFromRead(legacyRead, fresh);
+  };
+
   // In-memory map, effectively keyed by host.id (filename is `<host.id>.json`),
   // caching the last-read doc + mtime so list() only re-reads changed files.
   const store = new Map<string, CacheEntry>();
@@ -209,14 +260,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Register all commands together once rename migration has settled. VS Code
   // awaits this activation promise before completing a command-triggered probe.
   context.subscriptions.push(
-    vscode.commands.registerCommand("sessionDeckBridge.hello", () => ({ v: 1 as const, version, instanceId })),
+    vscode.commands.registerCommand("sessionDeckBridge.hello", () => bridgeHello(version, instanceId)),
     vscode.commands.registerCommand("sessionDeckBridge.publish", (doc: unknown) => ingest(doc, Date.now())),
     vscode.commands.registerCommand("sessionDeckBridge.list", () => list()),
     vscode.commands.registerCommand("sessionDeckBridge.titles", () => titles()),
     vscode.commands.registerCommand("sessionDeckBridge.cursorSessions", (arg: unknown) => cursorSessionsRpc(arg)),
     vscode.commands.registerCommand("sessionDeckBridge.license", () => license()),
     vscode.commands.registerCommand("sessionDeckBridge.postAction", (action: unknown) => postAction(action)),
-    vscode.commands.registerCommand("sessionDeckBridge.takeActions", (hostId: unknown) => takeActions(hostId))
+    vscode.commands.registerCommand("sessionDeckBridge.takeActions", (hostId: unknown) => takeActions(hostId)),
+    // Command rev 2. legacyState: the former extension's pins, filter and sort, read
+    // here on the desktop for remote windows that can't see that memento.
+    vscode.commands.registerCommand("sessionDeckBridge.legacyState", () => legacyState()),
+    // claimOnce: one winner per name across every window on this desktop (each
+    // window runs its own companion; they share this storage dir), for notices
+    // that must show once per machine rather than once per window.
+    vscode.commands.registerCommand("sessionDeckBridge.claimOnce", async (name: unknown) => ({
+      claimed: await claimOnceFile(claimsDir, name),
+    }))
   );
 
   // Dev-only backdoor: same ingest path as publish, but honours a receivedAt

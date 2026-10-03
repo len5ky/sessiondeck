@@ -10,10 +10,16 @@
 // this file — it is copied verbatim into the companion extension at build time,
 // so any import that isn't a bare Node builtin would break the copy.
 //
+// One exception to "only JSON + string work": claimOnceFile() uses node:fs (a Node
+// builtin, so the companion bundle stays self-contained).
+//
 // The validator treats every input as hostile (it ingests documents produced by
 // remote extension hosts). Structural violations are rejected; everything else
 // is sanitized into a freshly built object — the input is never spread or
 // mutated, so extra fields and prototype-pollution keys can never leak through.
+
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 // ---- rename migrations -----------------------------------------------------
 
@@ -125,10 +131,243 @@ export async function copyMissingMementoValues(
 
 export const BRIDGE_V = 1;
 
+/** Revision of the companion's COMMAND SET, reported as `rev` in hello. Separate
+ *  from BRIDGE_V on purpose: BRIDGE_V versions the snapshot/action DOCUMENTS, which
+ *  did not change, and bumping it would make old and new peers reject each other's
+ *  snapshots. A hello without `rev` is revision 1 (0.42.4 and older).
+ *  Revision 2 adds `legacyState` and `claimOnce`, and its `license` seeds the trial
+ *  start from the former extension's saved state. */
+export const BRIDGE_COMMAND_REV = 2;
+
 export interface BridgeHelloResult {
   v: 1;
   version: string;
   instanceId?: string;
+  /** Command-set revision (absent = 1). */
+  rev?: number;
+}
+
+/** The companion's hello answer. `v` and `version` are what every main since 1.0
+ *  checks; `rev` is ignored by mains older than command rev 2. */
+export function bridgeHello(version: string, instanceId: string): BridgeHelloResult {
+  return { v: 1, version, instanceId, rev: BRIDGE_COMMAND_REV };
+}
+
+/** The command-set revision a hello result reports: 1 when absent or malformed. */
+export function helloRev(hello: unknown): number {
+  if (!isObject(hello)) return 1;
+  const rev = hello.rev;
+  return typeof rev === "number" && Number.isInteger(rev) && rev >= 1 ? rev : 1;
+}
+
+// ---- former-extension state, read on the desktop (command rev 2) -------------
+// VS Code keeps every extension's saved state (its memento) in the DESKTOP state
+// DB. In a remote window the main extension runs on the remote host and cannot
+// read the former extension's memento, so a remote-only upgrader lost the trial
+// start (the trial restarted) along with pins and the filter. The companion runs on
+// the desktop, so it reads that memento and hands over what matters.
+
+/** The former main extension's id; its memento lives under this key. */
+export const LEGACY_MAIN_EXTENSION_ID = "lensky.claude-overview";
+/** Every sort and filter mode the Sessions view has. tree.ts derives its SortMode
+ *  and FilterMode types from these lists, so a new mode can't be added there
+ *  without becoming importable here. */
+export const SORT_MODES = ["activity", "name", "heat"] as const;
+export const FILTER_MODES = ["all", "1h", "24h", "attention"] as const;
+const LEGACY_FILTER_MODES = FILTER_MODES;
+const LEGACY_SORT_MODES = SORT_MODES;
+const LEGACY_PIN_CAP = 50; // = the main extension's MAX_PINS
+
+/** The former companion's id (its memento key in the same DB). */
+export const LEGACY_BRIDGE_EXTENSION_ID = "lensky.claude-overview-bridge";
+
+/** The one query the companion runs against the desktop state DB at activation:
+ *  both former mementos in a single read (each read copies the whole DB). */
+export const LEGACY_MEMENTOS_SQL =
+  `SELECT key, value FROM ItemTable WHERE key IN ('${LEGACY_BRIDGE_EXTENSION_ID}', '${LEGACY_MAIN_EXTENSION_ID}')`;
+
+/** Split that query's rows into the two mementos. null in = the read failed (no
+ *  engine, copy or query error), which is NOT the same as "no former extension". */
+export function legacyMementosFromRows(
+  rows: string[][] | null
+): { bridge?: Record<string, unknown>; main?: Record<string, unknown> } | null {
+  if (rows === null) return null;
+  const out: { bridge?: Record<string, unknown>; main?: Record<string, unknown> } = {};
+  for (const [key, value] of rows) {
+    const memento = parseLegacyMemento(value);
+    if (memento === undefined) continue;
+    if (key === LEGACY_BRIDGE_EXTENSION_ID) out.bridge = memento;
+    else if (key === LEGACY_MAIN_EXTENSION_ID) out.main = memento;
+  }
+  return out;
+}
+
+/** The trial start a memento holds, when it is a finite number. */
+export function mementoTrialStart(memento: Readonly<Record<string, unknown>> | undefined): number | undefined {
+  const v = memento?.licenseTrialStart;
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/** The companion's trial start: the OLDEST valid value across every source it
+ *  has (its own, the former companion's memento, the former main extension's
+ *  memento), so the result never depends on which source was read or copied
+ *  first. A valid value is a finite, positive ms epoch not after `nowMs`; a
+ *  future-dated or non-numeric value is ignored. Undefined when no source has a
+ *  valid value (license() then stamps now). The caller writes it only when it is
+ *  earlier than what it holds, so a trial start only ever moves earlier. */
+export function seedTrialStart(candidates: readonly unknown[], nowMs: number): number | undefined {
+  let oldest: number | undefined;
+  for (const c of candidates) {
+    if (typeof c !== "number" || !Number.isFinite(c) || c <= 0 || c > nowMs) continue;
+    if (oldest === undefined || c < oldest) oldest = c;
+  }
+  return oldest;
+}
+
+/** `sessionDeckBridge.legacyState` result. Pins travel as [cwd, lastSeenMs] pairs
+ *  rather than an object, so a hostile key can never become a prototype key. */
+export interface LegacyStateDoc {
+  /** False when the desktop holds no former-extension memento, or (with
+   *  `unreadable`) when the companion could not read the state DB. */
+  found: boolean;
+  /** The read failed: nothing is known yet, so the main must ask again later
+   *  rather than treat this as "no former extension". */
+  unreadable?: true;
+  /** With `unreadable`: the failure comes from a read made for THIS request, not a
+   *  cached failure (the companion re-reads at most once a minute). Only fresh
+   *  failures count toward LEGACY_IMPORT_MAX_ATTEMPTS. */
+  fresh?: true;
+  filterMode?: (typeof LEGACY_FILTER_MODES)[number];
+  sortMode?: (typeof LEGACY_SORT_MODES)[number];
+  pinnedProjects?: [string, number][];
+}
+
+function enumOf<T extends string>(x: unknown, allowed: readonly T[]): T | undefined {
+  return typeof x === "string" && (allowed as readonly string[]).includes(x) ? (x as T) : undefined;
+}
+
+function pinPairs(x: unknown): [string, number][] | undefined {
+  const entries: [string, number][] = [];
+  if (Array.isArray(x)) {
+    for (const e of x) {
+      if (Array.isArray(e) && e.length === 2) entries.push([e[0] as string, e[1] as number]);
+    }
+  } else if (isObject(x)) {
+    for (const k of Object.keys(x)) entries.push([k, x[k] as number]);
+  } else {
+    return undefined;
+  }
+  const out: [string, number][] = [];
+  for (const [cwd, ms] of entries) {
+    if (typeof cwd !== "string" || cwd.length === 0 || cwd.length > CAPS.cwd) continue;
+    if (typeof ms !== "number" || !Number.isFinite(ms)) continue;
+    out.push([cwd, ms]);
+  }
+  // Newest first, capped like the main extension's own pin set.
+  out.sort((a, b) => b[1] - a[1]);
+  return out.slice(0, LEGACY_PIN_CAP);
+}
+
+/** Build the legacyState answer from the former extension's memento (companion
+ *  side). Only the allow-listed keys leave; everything is rebuilt fresh. */
+export function legacyStateFromRead(
+  mementos: { main?: Record<string, unknown> } | null,
+  fresh = false
+): LegacyStateDoc {
+  if (mementos !== null) return legacyStateFromMemento(mementos.main);
+  return fresh ? { found: false, unreadable: true, fresh: true } : { found: false, unreadable: true };
+}
+
+export function legacyStateFromMemento(memento: Readonly<Record<string, unknown>> | undefined): LegacyStateDoc {
+  if (memento === undefined) return { found: false };
+  return validateLegacyState({
+    found: true,
+    filterMode: memento.filterMode,
+    sortMode: memento.sortMode,
+    pinnedProjects: memento.pinnedProjects,
+  }) ?? { found: false };
+}
+
+/** Validate a legacyState result (main side; hostile input). Fresh object out,
+ *  unknown or malformed fields dropped; null when it isn't a document at all. */
+export function validateLegacyState(input: unknown): LegacyStateDoc | null {
+  if (!isObject(input) || typeof input.found !== "boolean") return null;
+  const out: LegacyStateDoc = { found: input.found };
+  if (!input.found) {
+    if (input.unreadable === true) {
+      out.unreadable = true;
+      if (input.fresh === true) out.fresh = true;
+    }
+    return out;
+  }
+  const filterMode = enumOf(input.filterMode, LEGACY_FILTER_MODES);
+  if (filterMode !== undefined) out.filterMode = filterMode;
+  const sortMode = enumOf(input.sortMode, LEGACY_SORT_MODES);
+  if (sortMode !== undefined) out.sortMode = sortMode;
+  const pins = pinPairs(input.pinnedProjects);
+  if (pins !== undefined && pins.length > 0) out.pinnedProjects = pins;
+  return out;
+}
+
+/** How many window activations may ask about an unreadable desktop DB before the
+ *  remote window gives up on the import for good. */
+export const LEGACY_IMPORT_MAX_ATTEMPTS = 5;
+
+/** After one legacyState answer: is the import finished, and how many fresh
+ *  failed reads have been seen so far (persisted across activations)? Done when
+ *  the companion actually read the DB (found or definitively none), or after
+ *  LEGACY_IMPORT_MAX_ATTEMPTS failed reads. A cached failure (not `fresh`) counts
+ *  for nothing, so several activations inside the companion's one-minute re-read
+ *  window can't use up the attempts on a single failed read. */
+export function legacyImportOutcome(
+  doc: LegacyStateDoc,
+  unreadableSoFar: number
+): { done: boolean; unreadable: number } {
+  if (doc.unreadable !== true) return { done: true, unreadable: unreadableSoFar };
+  if (doc.fresh !== true) return { done: false, unreadable: unreadableSoFar };
+  const unreadable = unreadableSoFar + 1;
+  return { done: unreadable >= LEGACY_IMPORT_MAX_ATTEMPTS, unreadable };
+}
+
+/** What a remote window copies into its own saved state: only keys it has not set
+ *  itself (the user's choices in this install win). */
+export function legacyStateUpdates(
+  doc: LegacyStateDoc,
+  has: (key: string) => boolean
+): [key: string, value: unknown][] {
+  if (!doc.found) return [];
+  const out: [string, unknown][] = [];
+  if (doc.filterMode !== undefined && !has("filterMode")) out.push(["filterMode", doc.filterMode]);
+  if (doc.sortMode !== undefined && !has("sortMode")) out.push(["sortMode", doc.sortMode]);
+  if (doc.pinnedProjects !== undefined && !has("pinnedProjects")) {
+    const pins: Record<string, number> = {};
+    for (const [cwd, ms] of doc.pinnedProjects) {
+      Object.defineProperty(pins, cwd, { value: ms, enumerable: true, writable: true, configurable: true });
+    }
+    out.push(["pinnedProjects", pins]);
+  }
+  return out;
+}
+
+// ---- once-per-machine claims (command rev 2) -----------------------------------
+
+/** Claim names: lower-case, digits, dot and dash, so a name is always a safe
+ *  file name (`key-expired-2026-08`). */
+export const CLAIM_NAME_RE = /^[a-z0-9][a-z0-9.-]{0,63}$/;
+
+/** Claim `name` once in `dir` by creating `<dir>/<name>` exclusively (O_EXCL): of
+ *  any number of racing callers, across processes, exactly one gets true. A name
+ *  already claimed gives false; an invalid name or an unusable dir gives undefined
+ *  (the caller decides without a claim). Only for dirs on a local filesystem. */
+export async function claimOnceFile(dir: string, name: unknown): Promise<boolean | undefined> {
+  if (typeof name !== "string" || !CLAIM_NAME_RE.test(name)) return undefined;
+  try {
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, name), String(Date.now()), { flag: "wx" });
+    return true;
+  } catch (err) {
+    return (err as { code?: unknown }).code === "EEXIST" ? false : undefined;
+  }
 }
 
 export interface CursorEnumSessionWire {

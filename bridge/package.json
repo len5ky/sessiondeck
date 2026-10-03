@@ -2,7 +2,7 @@
   "name": "sessiondeck-bridge",
   "displayName": "SessionDeck Bridge",
   "description": "Local desktop companion for SessionDeck. Collects session snapshots from your remote windows (WSL, SSH, containers) so one tree shows every host. No UI or settings, and no network calls.",
-  "version": "0.42.4",
+  "version": "0.42.5",
   "publisher": "len5ky",
   "license": "MIT",
   "icon": "icon.png",

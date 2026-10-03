@@ -79,7 +79,7 @@ None of these tools writes an approval or "waiting for you" state to disk. Their
 
 ![Cross-host: sessions from other machines](media/cross-host.gif)
 
-If you work in remote windows, each remote host can show up as its own section in your local tree. That needs a second, invisible extension, **SessionDeck Bridge** (`len5ky.sessiondeck-bridge`), installed on the local desktop side. Installing SessionDeck from the Marketplace or Open VSX installs it there too. It has no UI and no settings. It relays snapshots over VS Code's own command channel and serves tab titles to remote windows, which can't read local editor storage.
+If you work in remote windows, each remote host can show up as its own section in your local tree. That needs a second, invisible extension, **SessionDeck Bridge** (`len5ky.sessiondeck-bridge`), installed on the local desktop side. Installing SessionDeck from the Marketplace or Open VSX installs it there too. Installed from a remote window, VS Code also copies the bridge onto that remote host, where it never runs; you can leave it there or uninstall it. It has no UI and no settings. It relays snapshots over VS Code's own command channel and serves tab titles to remote windows, which can't read local editor storage.
 
 If everything runs in local windows on one machine you don't need it, and you can uninstall it. Without it, remote sessions also show `project-hash` names instead of tab titles.
 
@@ -196,7 +196,7 @@ A turn killed before it wrote anything just drops off when its process dies.
 
 ## Pricing
 
-The first 3 days are unlimited. After that, 3 sessions stay free for good; subagents and remote hosts don't count. Neither needs a key or an account. A license ($5.99/month or $18.99 once, per person, any number of machines) lifts the cap. Buy it at [sessiondeck.dev](https://sessiondeck.dev), then run **SessionDeck: Enter License Key** or set `sessionDeck.licenseKey`. The key is checked offline. The bridge needs no license of its own.
+The first 3 days are unlimited. After that, 3 sessions stay free for good; subagents and remote hosts don't count. Neither needs a key or an account. A license ($5.99/month or $18.99 once, per person, any number of machines) lifts the cap. Buy it at [sessiondeck.dev](https://sessiondeck.dev/?utm_source=github&utm_medium=readme), then run **SessionDeck: Enter License Key** or set `sessionDeck.licenseKey`. The key is checked offline. The bridge needs no license of its own.
 
 ## License
 

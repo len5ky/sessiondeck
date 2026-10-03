@@ -51,6 +51,8 @@ export interface ControlRow {
   tooltip: string;
   /** Command id to run on click; omit for a pure status row. */
   command?: string;
+  /** Arguments passed to `command` on click. */
+  args?: string[];
 }
 
 /** The live snapshot the panel renders — a subset of the doctor probes plus the
@@ -303,6 +305,7 @@ export function buildControlPanelRows(p: ControlPanelInput): ControlRow[] {
       mark: "action",
       tooltip: tip("Buy License", "Open the purchase page — monthly or lifetime, per person."),
       command: "sessionDeck.buyLicense",
+      args: ["panel"],
     },
     {
       id: "enter-key",

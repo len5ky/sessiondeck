@@ -31,8 +31,17 @@ export const TRIAL_MS = TRIAL_DAYS * DAY_MS;
 export const FREE_MAX_SESSIONS = 3;
 /** SINGLE, clearly-marked purchase URL: the landing page's checkout anchor, which
  *  hands off to Stripe (see docs/LICENSING.md, "Fulfillment flow"). Change ONLY this
- *  constant. */
-export const BUY_URL = "https://sessiondeck.dev/#checkout";
+ *  constant. The UTM query (before the hash) feeds the site's first-touch
+ *  attribution; buyUrl adds utm_content per entry point. */
+export const BUY_URL = "https://sessiondeck.dev/?utm_source=extension&utm_medium=buy_button#checkout";
+
+/** BUY_URL tagged with the entry point that opened it (utm_content), e.g. "cap",
+ *  "expired", "panel". No content → BUY_URL unchanged. */
+export function buyUrl(content?: string): string {
+  if (content === undefined || content === "") return BUY_URL;
+  const [base, hash] = BUY_URL.split("#");
+  return `${base}&utm_content=${encodeURIComponent(content)}${hash !== undefined ? `#${hash}` : ""}`;
+}
 
 /** Result of parsing a raw key string. `expiry` is the 6-digit YYYYMM number. */
 export type ParsedKey =
@@ -334,6 +343,49 @@ export function decideKeyExpiredNotice(i: KeyExpiredInput): { show: false } | { 
   return { show: true, through };
 }
 
+/** Runs the once-per-month key-lapse notice for one window. The claim (which may
+ *  wait for the desktop companion's first answer) decides which window shows it.
+ *  The "already notified" latch is saved only AFTER that: once this window has
+ *  shown the notice, or once another window won the claim and shows it. A window
+ *  closed during the wait claims, shows and saves nothing, so the notice is still
+ *  due in the next window.
+ *  While a claim is pending, later ticks don't start another one. */
+export class KeyExpiredNoticeRunner {
+  private readonly pending = new Set<string>();
+  constructor(
+    private readonly deps: {
+      /** "disposed": the window closed before claiming; nothing more happens. */
+      claim(name: string): Promise<boolean | "disposed">;
+      show(through: string): void;
+      saveLatch(through: string): void;
+      /** True once the window is closing; checked again before showing. */
+      disposed?: () => boolean;
+    }
+  ) {}
+
+  /** One tick. True while a notice is due or in flight (the caller holds the
+   *  over-limit reminder back for that tick). */
+  run(d: { show: false } | { show: true; through: string }): boolean {
+    if (!d.show) return false;
+    const { through } = d;
+    if (this.pending.has(through)) return true;
+    this.pending.add(through);
+    void this.deps
+      .claim(`key-expired-${through}`)
+      .then((won) => {
+        // A closing window shows nothing and saves nothing: the notice stays due
+        // for the next window. The claim itself is never made once the window is
+        // disposed; only a dispose landing in the single promise turn between a
+        // won claim and this check would leave a claim with no notice.
+        if (won === "disposed" || this.deps.disposed?.() === true) return;
+        if (won) this.deps.show(through);
+        this.deps.saveLatch(through);
+      })
+      .finally(() => this.pending.delete(through));
+    return true;
+  }
+}
+
 /** The lapse notice text: what happened, what still works, what to do next. */
 export function keyExpiredMessage(through: string): string {
   return (
@@ -341,6 +393,26 @@ export function keyExpiredMessage(through: string): string {
     `3 sessions stay fully covered. If your subscription renewed, paste the new key from your renewal email ` +
     `(sessiondeck.dev can resend it). Otherwise you can buy a new one there.`
   );
+}
+
+// ---- Over-limit reminder ------------------------------------------------------
+
+export const OVER_LIMIT_REMINDER_MESSAGE =
+  "Free tier covers 3 sessions; you have more, and the extras are locked. A license covers all of them.";
+
+/** At most one over-limit reminder per calendar day, and never in the same tick as
+ *  another license notice (Trial ended, the key-lapse notice): those already offer
+ *  Enter Key and Buy, so a second toast at that moment only stacks. The day is
+ *  stamped anyway, which moves the reminder to the next day rather than dropping
+ *  it: while the fleet stays over the cap it comes back tomorrow. */
+export function decideOverLimitReminder(i: {
+  overLimit: boolean;
+  today: string;
+  remindedOn: string | undefined;
+  otherNoticeShown: boolean;
+}): { show: boolean; stamp?: string } {
+  if (!i.overLimit || i.remindedOn === i.today) return { show: false };
+  return { show: !i.otherNoticeShown, stamp: i.today };
 }
 
 // ---- Trial copy (exact user-facing text, tested) -----------------------------

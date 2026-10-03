@@ -46,6 +46,7 @@ import {
   type AgentFamily,
   AGENT_FAMILIES,
   AGENT_FAMILY_LABELS,
+  RootFetchSignal,
 } from "./format";
 import { FILTER_LABELS, FilterMode, SessionsProvider, SessionNode, CursorNode, ComposerNode, CodexNode, ProjectNode, RemoteSessionNode, InboxRefNode, SortMode, TRIAL_START_KEY } from "./tree";
 import { AccountDecorationProvider } from "./decorations";
@@ -59,6 +60,9 @@ import {
   legacyExtensionMessage,
   migrateLegacySettings,
   parseLegacyMemento,
+  legacyStateUpdates,
+  legacyImportOutcome,
+  claimOnceFile,
 } from "./bridgeSchema";
 import { HostIdentity, loadHostIdentity } from "./hostid";
 import { SessionAlerts } from "./alerts";
@@ -66,14 +70,17 @@ import { FocusDigest, digestMessage } from "./digest";
 import { UnfocusedAlerts, UnfocusedAlertConfig, resolvePlatformTools } from "./osalert";
 import { formatHealth, driftHarness, hooksHealth, affectedSources, captureFixtureSlice, buildCaptureSummary, CaptureIdentity } from "./canary";
 import {
-  BUY_URL,
+  buyUrl,
   TRIAL_MS,
   decideKeyExpiredNotice,
+  decideOverLimitReminder,
+  OVER_LIMIT_REMINDER_MESSAGE,
   decideTrialToast,
   expiredMonthlyKey,
   isLicensed,
   isReturningInstall,
   keyExpiredMessage,
+  KeyExpiredNoticeRunner,
   licenseStatusItem,
   WELCOME_MESSAGE,
   TRIAL_ENDED_MESSAGE,
@@ -165,7 +172,9 @@ class ControlPanelProvider implements vscode.TreeDataProvider<ControlRow> {
   dispose(): void {
     this.emitter.dispose();
   }
+  readonly rootFetch = new RootFetchSignal();
   getChildren(element?: ControlRow): ControlRow[] {
+    if (element === undefined) this.rootFetch.fetched();
     return element === undefined ? this.rows : []; // flat: rows are leaves
   }
   getTreeItem(row: ControlRow): vscode.TreeItem {
@@ -177,7 +186,7 @@ class ControlPanelProvider implements vscode.TreeDataProvider<ControlRow> {
     item.tooltip = md;
     const color = CONTROL_MARK_COLOR[row.mark];
     item.iconPath = color !== undefined ? new vscode.ThemeIcon(row.icon, new vscode.ThemeColor(color)) : new vscode.ThemeIcon(row.icon);
-    if (row.command !== undefined) item.command = { command: row.command, title: row.label };
+    if (row.command !== undefined) item.command = { command: row.command, title: row.label, arguments: row.args };
     return item;
   }
 }
@@ -653,22 +662,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // At most ONE reminder toast per day while free + over-limit (globalState-stamped
   // by calendar day). Honest register per the brand voice; buttons act immediately.
+  // `otherNoticeShown`: Trial ended or the key-lapse notice went up this tick; the
+  // reminder then waits until tomorrow instead of stacking a second toast.
   const REMINDER_KEY = "licenseReminderDay";
-  const maybeRemindLicense = (): void => {
-    if (!provider.freeTierOverLimit) return;
-    const today = new Date().toISOString().slice(0, 10); // local-ish calendar day
-    if (context.globalState.get<string>(REMINDER_KEY) === today) return;
-    void context.globalState.update(REMINDER_KEY, today);
+  const maybeRemindLicense = (otherNoticeShown: boolean): void => {
+    const d = decideOverLimitReminder({
+      overLimit: provider.freeTierOverLimit,
+      today: new Date().toISOString().slice(0, 10), // local-ish calendar day
+      remindedOn: context.globalState.get<string>(REMINDER_KEY),
+      otherNoticeShown,
+    });
+    if (d.stamp !== undefined) void context.globalState.update(REMINDER_KEY, d.stamp);
+    if (!d.show) return;
     void vscode.window
       .showInformationMessage(
-        "Free tier covers 3 sessions; you have more, and the extras are locked. A license covers all of them.",
+        OVER_LIMIT_REMINDER_MESSAGE,
         "Enter Key",
         "Buy",
         "Later"
       )
       .then((choice) => {
         if (choice === "Enter Key") void vscode.commands.executeCommand("sessionDeck.enterLicenseKey");
-        else if (choice === "Buy") void vscode.commands.executeCommand("sessionDeck.buyLicense");
+        else if (choice === "Buy") void vscode.commands.executeCommand("sessionDeck.buyLicense", "cap");
       });
   };
 
@@ -693,7 +708,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     bridge.licenseCached !== undefined ||
     (bridge.probeSettled && !bridge.available) ||
     Date.now() - activatedAt > 60_000;
-  const maybeTrialToast = (): void => {
+  const maybeTrialToast = (): boolean => {
     const trialStart = context.globalState.get<number>(TRIAL_START_KEY);
     const now = Date.now();
     // Recompute from globalState rather than the provider's last reload, so a
@@ -735,16 +750,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         )
         .then((choice) => {
           if (choice === "Enter Key") void vscode.commands.executeCommand("sessionDeck.enterLicenseKey");
-          else if (choice === "Buy") void vscode.commands.executeCommand("sessionDeck.buyLicense");
+          else if (choice === "Buy") void vscode.commands.executeCommand("sessionDeck.buyLicense", "trial_ended");
         });
     }
+    return d.toast !== null;
   };
 
   // Once per lapsed monthly key: the tier just dropped to free, so say so and name
-  // the next step. Latched on the key's yyyy-mm BEFORE showing (two racing windows
-  // can't both show); a later renewal that lapses gets its own notice.
+  // the next step; a later renewal that lapses gets its own notice. The globalState
+  // latch alone was per window: two windows refreshing as the key lapsed both read
+  // it unset before either write reached the other, and both showed the notice.
+  // So the notice shows only in the window that wins an exclusive claim for that
+  // month (licenseNoticeClaim), and the latch is saved after that (below).
   const KEY_EXPIRED_KEY = "licenseKeyExpiredNotified";
-  const maybeKeyExpiredNotice = (): void => {
+  const maybeKeyExpiredNotice = (): boolean => {
     const d = decideKeyExpiredNotice({
       key: provider.licenseKey(),
       nowMs: Date.now(),
@@ -752,17 +771,38 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       notificationsOn: notificationsOn(),
       notifiedFor: context.globalState.get<string>(KEY_EXPIRED_KEY),
     });
-    if (!d.show) return;
-    void context.globalState.update(KEY_EXPIRED_KEY, d.through);
-    // This notice already offers Enter Key; skip today's over-limit reminder.
-    void context.globalState.update(REMINDER_KEY, new Date().toISOString().slice(0, 10));
-    void vscode.window
-      .showInformationMessage(keyExpiredMessage(d.through), "Enter Key", "Open sessiondeck.dev")
-      .then((choice) => {
-        if (choice === "Enter Key") void vscode.commands.executeCommand("sessionDeck.enterLicenseKey");
-        else if (choice === "Open sessiondeck.dev") void vscode.commands.executeCommand("sessionDeck.buyLicense");
-      });
+    return keyExpiredRunner.run(d);
   };
+  // The latch is saved only once the notice is up here, or another window won the
+  // claim and shows it, so closing this window during the claim's wait loses
+  // nothing. Returns true even when another window wins: this tick still holds back
+  // the over-limit reminder, so no window stacks it on the lapse notice.
+  const keyExpiredRunner = new KeyExpiredNoticeRunner({
+    claim: (name) => licenseNoticeClaim(name),
+    show: (through) => {
+      void vscode.window
+        .showInformationMessage(keyExpiredMessage(through), "Enter Key", "Open sessiondeck.dev")
+        .then((choice) => {
+          if (choice === "Enter Key") void vscode.commands.executeCommand("sessionDeck.enterLicenseKey");
+          else if (choice === "Open sessiondeck.dev") void vscode.commands.executeCommand("sessionDeck.buyLicense", "expired");
+        });
+    },
+    saveLatch: (through) => void context.globalState.update(KEY_EXPIRED_KEY, through),
+    disposed: () => bridge.isDisposed,
+  });
+
+  // Exclusive once-per-machine claim for a one-time notice. Through the desktop
+  // companion when it answers (command rev 2): every window on this desktop, local
+  // or remote, claims in the same directory. Without it, in this extension host's
+  // own storage, which covers the windows sharing this host (all local windows, or
+  // all windows into one remote) but not a local and a remote window together.
+  // A window still waiting for its companion's first answer waits for that check
+  // to finish (it gives up by itself after 60 s) before falling back, so it doesn't claim locally while the other windows
+  // claim through the companion. A claim that can't be made at all shows the
+  // notice: late duplication beats silence.
+  // A window closing during the wait gets "disposed" and claims nothing.
+  const licenseNoticeClaim = (name: string): Promise<boolean | "disposed"> =>
+    bridge.claimOnceOrLocal(name, (n) => claimOnceFile(join(context.globalStorageUri.fsPath, "claims"), n));
 
   // ---- Dirty-set discovery (perf) -------------------------------------------
   // Every 3s tick used to run a full snapshot() — readdir the registry, re-read
@@ -952,6 +992,37 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   };
 
+  // Remote-only upgraders from the former extension: its saved state (pins, filter,
+  // sort) sits in the DESKTOP state DB, which this remote host can't read, so the
+  // rename migration above found nothing. Ask the desktop companion (command rev 2)
+  // per activation and copy what this install hasn't set itself. Done once the
+  // companion actually read its DB; a failed read is retried by later activations,
+  // up to LEGACY_IMPORT_MAX_ATTEMPTS. A pre-rev-2 companion is never asked. (The trial
+  // start needs none of this: a rev-2 companion seeds its own from the same memento
+  // and reconcileTrialStart merges it prefer-older.)
+  const LEGACY_IMPORT_KEY = "legacyStateImported";
+  const LEGACY_UNREADABLE_KEY = "legacyStateUnreadable";
+  // Asked at most once per activation; an unreadable answer is retried by later
+  // activations only (legacyImportOutcome caps those), never every tick.
+  let legacyImportAsked = false;
+  const importLegacyStateViaBridge = async (): Promise<void> => {
+    if (legacyImportAsked || vscode.env.remoteName === undefined || legacy.legacyMemento) return;
+    if (context.globalState.get<boolean>(LEGACY_IMPORT_KEY) === true) return;
+    if (bridge.commandRev < 2) return; // an old companion is never asked; a later one may be
+    legacyImportAsked = true;
+    const doc = await bridge.legacyState();
+    if (doc === undefined) return; // no usable answer this activation; ask again next one
+    const updates = legacyStateUpdates(doc, (key) => context.globalState.get(key) !== undefined);
+    for (const [key, value] of updates) await context.globalState.update(key, value);
+    const outcome = legacyImportOutcome(doc, context.globalState.get<number>(LEGACY_UNREADABLE_KEY) ?? 0);
+    if (outcome.unreadable > 0) await context.globalState.update(LEGACY_UNREADABLE_KEY, outcome.unreadable);
+    if (outcome.done) await context.globalState.update(LEGACY_IMPORT_KEY, true);
+    if (updates.length > 0) {
+      syncFilterIndicator();
+      provider.forceReload();
+    }
+  };
+
   // Elapsed ms since an hrtime mark — the watchdog's phase clock. hrtime.bigint()
   // is a couple of nanoseconds per call, so timing costs the tick nothing measurable.
   const msSince = (start: bigint): number => Number(process.hrtime.bigint() - start) / 1e6;
@@ -1066,6 +1137,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // Fire-and-forget — the merged value lands in globalState and the tree
         // picks it up on the next tick. Never resets local upward.
         if (bridge.available) void reconcileTrialStart();
+        if (bridge.available) void importLegacyStateViaBridge();
         if (bridgePublishing && hostIdentity !== undefined) {
           if (decision.publish && panelModel !== undefined) {
             // buildSnapshot reads `panelModel`, which is built from the tree's already
@@ -1101,9 +1173,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       updateChip();
       updateKeyItem();
       controlPanel.refresh();
-      maybeKeyExpiredNotice();
-      maybeTrialToast();
-      maybeRemindLicense();
+      // One license notice per tick: whichever of these shows first holds the
+      // over-limit reminder back to the next day.
+      const keyNotice = maybeKeyExpiredNotice();
+      const trialNotice = maybeTrialToast();
+      maybeRemindLicense(keyNotice || trialNotice);
       syncFilterIndicator();
       if (panelOpen && panelModel !== undefined) overviewPanel.update(panelModel);
       if (tableVisible && panelModel !== undefined) tableView.update(panelModel);
@@ -2092,10 +2166,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       });
       if (value === undefined) return; // cancelled
       await cfg.update("licenseKey", value.trim(), vscode.ConfigurationTarget.Global);
+      // Arm before the repaint is requested, then confirm only once the Sessions
+      // tree and the Control Panel have fetched the new state (or a hidden view's
+      // timeout passed), so the toast never runs ahead of what the views show.
+      const repainted = Promise.all([provider.rootFetch.wait(1500), controlPanel.rootFetch.wait(1500)]);
       provider.forceReload();
       if (overviewPanel.isOpen()) overviewPanel.update(buildPanelModel());
       refresh();
       const licensed = isLicensed(provider.currentLicenseState);
+      await repainted;
       void vscode.window.showInformationMessage(
         value.trim() === ""
           ? "License key cleared."
@@ -2106,9 +2185,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
 
     // Open the purchase page. BUY_URL is a single clearly-marked constant in
-    // src/license.ts (the sessiondeck.dev checkout anchor).
-    vscode.commands.registerCommand("sessionDeck.buyLicense", () => {
-      void vscode.env.openExternal(vscode.Uri.parse(BUY_URL));
+    // src/license.ts (the sessiondeck.dev checkout anchor). Internal callers pass
+    // an entry-point tag (utm_content); menu invocations pass a tree element, so
+    // only a string counts.
+    vscode.commands.registerCommand("sessionDeck.buyLicense", (content?: unknown) => {
+      void vscode.env.openExternal(vscode.Uri.parse(buyUrl(typeof content === "string" ? content : undefined)));
     }),
 
     // Free-tier status-bar item click → QuickPick.
@@ -2123,7 +2204,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
       if (pick === undefined) return;
       if (pick.id === "enter") await vscode.commands.executeCommand("sessionDeck.enterLicenseKey");
-      else if (pick.id === "buy") await vscode.commands.executeCommand("sessionDeck.buyLicense");
+      else if (pick.id === "buy") await vscode.commands.executeCommand("sessionDeck.buyLicense", "menu");
       // "What's included" is the full feature list rendered as a markdown document —
       // never the old truncated toast (which cut the list off mid-sentence).
       else await vscode.commands.executeCommand("sessionDeck.whatsIncluded");

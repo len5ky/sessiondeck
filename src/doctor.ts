@@ -427,8 +427,18 @@ function cursorMonitoringCheck(p: DoctorProbes): DoctorCheck {
   return { mark: "ok", title: "Cursor monitoring", detail: "on (9 events) · no events yet" };
 }
 
+/** Whether the desktop bridge is reachable from this window: the one answer both
+ *  the "Bridge companion" line and every bridge-dependent hint read, so Diagnostics
+ *  can't say "answering" on one line and "install the bridge" on another. */
+type BridgeReach = "off" | "missing" | "answering";
+function bridgeReach(p: DoctorProbes): BridgeReach {
+  if (!p.crossHost) return "off";
+  return p.bridgeAvailable ? "answering" : "missing";
+}
+
 function bridgeCheck(p: DoctorProbes): DoctorCheck {
-  if (!p.crossHost) {
+  const reach = bridgeReach(p);
+  if (reach === "off") {
     return {
       mark: "info",
       title: "Bridge companion",
@@ -436,7 +446,7 @@ function bridgeCheck(p: DoctorProbes): DoctorCheck {
       fix: "set sessionDeck.crossHost: true to aggregate your other hosts",
     };
   }
-  if (!p.bridgeAvailable) {
+  if (reach === "missing") {
     return {
       mark: "problem",
       title: "Bridge companion",
@@ -459,7 +469,7 @@ function bridgeCheck(p: DoctorProbes): DoctorCheck {
 }
 
 function cursorEnumerationCheck(p: DoctorProbes): DoctorCheck {
-  if (!p.crossHost || !p.bridgeAvailable) {
+  if (bridgeReach(p) !== "answering") {
     return { mark: "info", title: "Cursor enumeration (bridge)", detail: "n/a: bridge companion not connected" };
   }
   if (!p.cursorEnumAvailable) {
@@ -502,11 +512,16 @@ function titlesCheck(p: DoctorProbes): DoctorCheck {
     mark: "info",
     title: "Real tab titles",
     detail: `via ${via} — none extracted yet; rows fall back to project labels`,
-    fix:
-      p.titlePath === "bridge"
-        ? `needs the desktop bridge companion: ${BRIDGE_INSTALL_HINT}`
-        : "open a Claude tab so the editor serializes its title",
+    fix: p.titlePath === "bridge" ? bridgeTitlesFix(bridgeReach(p)) : "open a Claude tab so the editor serializes its title",
   };
+}
+
+/** What to do when a remote window has no titles yet, given the same bridge answer
+ *  the "Bridge companion" line shows. */
+function bridgeTitlesFix(reach: BridgeReach): string {
+  if (reach === "answering") return "open a Claude tab in a desktop window so the editor serializes its title";
+  if (reach === "off") return "set sessionDeck.crossHost: true so the desktop bridge companion can supply them";
+  return `needs the desktop bridge companion: ${BRIDGE_INSTALL_HINT}`;
 }
 
 function sqliteCheck(p: DoctorProbes): DoctorCheck {

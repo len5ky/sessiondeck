@@ -341,13 +341,18 @@ export function externalModelFromLabel(label: string): string | undefined {
 
 export type Layout = "list" | "columns";
 
-/** Sort: Name order for project rows. Rows show the folder's last path segment, so
- *  that is what sorts (case-insensitively), with the full path only as a tiebreak.
- *  Sorting on the full cwd put worktrees in another parent folder out of visible
- *  order. Handles `/` and `\\` separators (remote hosts may be Windows). */
+/** The folder name a project row shows: the last segment of its cwd, splitting on
+ *  both `/` and `\\`. `node:path` basename() on a POSIX host keeps a Windows remote
+ *  cwd (`C:\\work\\zoo`) whole, so every project label goes through this instead. */
+export function projectDisplayName(cwd: string): string {
+  return cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? cwd;
+}
+
+/** Sort: Name order for project rows. Rows show projectDisplayName(cwd), so that is
+ *  what sorts (case-insensitively), with the full path only as a tiebreak. Sorting
+ *  on the full cwd put worktrees in another parent folder out of visible order. */
 export function compareProjectNames(aCwd: string, bCwd: string): number {
-  const name = (cwd: string): string => cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? cwd;
-  const byName = name(aCwd).localeCompare(name(bCwd), undefined, { sensitivity: "base" });
+  const byName = projectDisplayName(aCwd).localeCompare(projectDisplayName(bCwd), undefined, { sensitivity: "base" });
   return byName !== 0 ? byName : aCwd.localeCompare(bCwd);
 }
 
@@ -1795,4 +1800,40 @@ export function decidePanelBuild(need: FreshnessNeed): BuildDecision {
   const panelNeeds = need.panelOpen && (need.signatureChanged || need.panelJustOpened);
   const bridgeNeeds = need.bridgePublishing && (need.signatureChanged || need.heartbeatDue);
   return { build: panelNeeds || bridgeNeeds, publish: bridgeNeeds };
+}
+
+// ---- Repaint ordering ---------------------------------------------------------
+// A toast that reports a state change ("License key cleared.") must not appear
+// before the views show that state. Firing onDidChangeTreeData only asks VS Code to
+// re-fetch; the paint follows the fetch. A view's provider calls fetched() from
+// getChildren(root); the caller arms wait() BEFORE firing the change and shows
+// its toast when it resolves. A hidden view never fetches, so wait() also resolves
+// on a timeout: the toast is late at worst, never lost.
+
+export class RootFetchSignal {
+  private waiters: (() => void)[] = [];
+
+  /** Resolves "fetched" a moment after the next root fetch (the paint follows the
+   *  fetch by a frame or so), or "timeout" after timeoutMs. */
+  wait(timeoutMs: number, settleMs = 50): Promise<"fetched" | "timeout"> {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (r: "fetched" | "timeout"): void => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(r);
+      };
+      const timer = setTimeout(() => finish("timeout"), timeoutMs);
+      this.waiters.push(() => setTimeout(() => finish("fetched"), settleMs));
+    });
+  }
+
+  /** Called by the provider from getChildren(root). */
+  fetched(): void {
+    if (this.waiters.length === 0) return;
+    const ws = this.waiters;
+    this.waiters = [];
+    for (const w of ws) w();
+  }
 }

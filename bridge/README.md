@@ -12,7 +12,7 @@ this companion on your desktop automatically. If you installed SessionDeck from 
 ## What it does
 
 It has no UI, no views, no settings of its own, and does no network I/O. It
-registers eight commands that SessionDeck windows call across extension hosts,
+registers ten commands that SessionDeck windows call across extension hosts,
 and owns a small aggregation store:
 
 - `sessionDeckBridge.hello()` — availability and version handshake.
@@ -26,7 +26,14 @@ and owns a small aggregation store:
   (read-only) so remote windows can list Cursor agent sessions.
 - `sessionDeckBridge.license()` — keeps one trial start date for the whole
   desktop, so every remote window sees the same trial, and passes on a license
-  key you entered in SessionDeck's settings.
+  key you entered in SessionDeck's settings. If you used SessionDeck under its
+  former name, the trial start is taken from that install, so upgrading never
+  restarts a trial.
+- `sessionDeckBridge.legacyState()` — passes the former install's pinned
+  projects, filter and sort order to remote windows, which can't read them
+  from the desktop themselves.
+- `sessionDeckBridge.claimOnce(name)` — lets exactly one window on this desktop
+  show a one-time notice, such as the one when a monthly key runs out.
 - `sessionDeckBridge.postAction(action)` / `sessionDeckBridge.takeActions(hostId)`
   — a click on a session that lives on another host is queued here and picked up
   by that host's window, which then focuses the session. Queued clicks expire

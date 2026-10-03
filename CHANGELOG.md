@@ -5,6 +5,34 @@ packages share one version number.
 
 ## [Unreleased]
 
+## [0.42.5] - 2026-10-03
+
+### Changed
+- Buy links from the extension, README and marketplace manifests now carry UTM
+  parameters for sales attribution.
+
+### Fixed
+- Projects on a Windows remote host now show their folder name instead of the
+  whole path when the window runs on Linux or WSL, and Sort: Name orders them by
+  that name.
+- Diagnostics no longer tells you to install SessionDeck Bridge on the Real tab
+  titles line while the Bridge line says it is answering. With the bridge
+  answering it says to open a Claude tab in a desktop window instead.
+- When the trial ends with more than 3 sessions running, you get one notice
+  ("Trial ended") instead of two at once. The free-tier reminder about locked
+  sessions comes the next day.
+- After Enter License Key, the confirmation ("License key cleared.", "Licensed
+  — thank you.") appears once the Sessions view and Control Panel show the new
+  state, not a moment before.
+- Upgrading from the extension's former name in a remote (WSL or SSH) window no
+  longer restarts a trial that had already ended. Your pinned projects, filter
+  and sort order also carry over to remote windows. Needs SessionDeck Bridge
+  0.42.5 or later on the desktop.
+- The notice that a monthly key has run out now shows in one window, not in
+  every window that was open when it lapsed. With SessionDeck Bridge 0.42.5 or
+  later this holds across local and remote windows; without it, across the
+  windows on one host.
+
 ## [0.42.4] - 2026-10-02
 
 ### Added
