@@ -27,6 +27,7 @@
 // the resolved platform tools and (in tests) the clock + spawner.
 
 import { spawn } from "node:child_process";
+import { powershellExe } from "./procs";
 
 /** The two opt-in channels' on/off state (both default false), read live from config. */
 export interface UnfocusedAlertConfig {
@@ -75,13 +76,15 @@ export function resolvePlatformTools(
   } else if (onPath("pw-play")) {
     t.soundArgv = ["pw-play", soundFile]; // PipeWire
     t.soundTool = "pw-play";
-  } else if (onPath("powershell.exe")) {
+  } else if (platform === "win32" || onPath("powershell.exe")) {
     // WSL / Windows fallback: play the default notification sound through the
     // system audio device. Play() is async and returns immediately, so a short
     // sleep keeps the process alive long enough for it to be audible. The command
     // string is a fixed literal — no interpolation of any kind.
+    // Native Windows: by absolute path, not a PATH lookup. WSL: through interop,
+    // which only PATH reaches.
     t.soundArgv = [
-      "powershell.exe",
+      platform === "win32" ? powershellExe() : "powershell.exe",
       "-NoProfile",
       "-NonInteractive",
       "-Command",

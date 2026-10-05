@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { TRIAL_START_KEY, type SessionsProvider } from "../tree";
+import { FIRST_SEEN_KEY, TRIAL_START_KEY, type SessionsProvider } from "../tree";
 import {
   DAY_MS,
   licenseState,
@@ -56,6 +56,7 @@ export function registerLicenseDebugCommand(deps: {
 
   const clearGlobalState = async (): Promise<void> => {
     await deps.context.globalState.update(TRIAL_START_KEY, undefined);
+    await deps.context.globalState.update(FIRST_SEEN_KEY, undefined);
     await deps.context.globalState.update(WELCOME_KEY, undefined);
     await deps.context.globalState.update(TRIAL_END_PENDING_KEY, undefined);
     await deps.context.globalState.update(TRIAL_END_KEY, undefined);

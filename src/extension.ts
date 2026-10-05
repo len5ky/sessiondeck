@@ -21,16 +21,29 @@ import {
   renewLeaseIfDue,
   CURSOR_SPOOL,
 } from "./hooks";
-import { focusLocalTerminal } from "./injector";
+import { codexHomeOf, focusLocalTerminal, identitySources, moveClaimIdentity, moveSession, MoveSubject, shortTitle, stopSession, sweepMoveClaims, verifiedClaudeStart } from "./injector";
 import { Navigator, navigationEnabled, resolveEditorCli, commandOnPath } from "./navigation";
-import { procIntrospection, procCensusAgeSec } from "./procs";
+import { procIntrospection, procCensusAgeSec, pidCmdline, pidHasOpen, pidAlive, pidStartTime, procStartAgreement, procTable, type LocationVerdict } from "./procs";
 import { hasNodeSqlite, hasPython3, sqliteSelect } from "./sqliteRead";
-import { buildDoctorReport, DOCTOR_SCHEME, CAPTURE_SUMMARY_SCHEME, DoctorProbes, buildDebugReport, DEBUG_REPORT_SCHEME, SettingEntry, TickWatchdog, TickPath } from "./doctor";
+import {
+  ACTIVATION_STEP,
+  buildDoctorReport,
+  DOCTOR_SCHEME,
+  CAPTURE_SUMMARY_SCHEME,
+  DoctorProbes,
+  buildDebugReport,
+  DEBUG_REPORT_SCHEME,
+  SettingEntry,
+  StartupFailure,
+  StartupHealth,
+  TickWatchdog,
+  TickPath,
+} from "./doctor";
 import { TitleSource } from "./titles";
 import { TokenScanner } from "./discovery";
 import { cursorSessions, CursorEventTail, ComposerTracker } from "./cursor";
 import { codexSessions } from "./codex";
-import { fmtAge, snapshot, hotWatchTargets, watchEventDirty, ReuseHint, WatchTarget } from "./discovery";
+import { fmtAge, snapshot, hotWatchTargets, watchEventDirty, ReuseHint, WatchTarget, registryStatus, registryStartEntries } from "./discovery";
 import {
   sanitizeReason,
   sessionPropertiesMarkdown,
@@ -47,12 +60,14 @@ import {
   AGENT_FAMILIES,
   AGENT_FAMILY_LABELS,
   RootFetchSignal,
+  codexPreviewMarkdown,
+  previewDocPath,
 } from "./format";
-import { FILTER_LABELS, FilterMode, SessionsProvider, SessionNode, CursorNode, ComposerNode, CodexNode, ProjectNode, RemoteSessionNode, InboxRefNode, SortMode, TRIAL_START_KEY } from "./tree";
-import { AccountDecorationProvider } from "./decorations";
+import { saveQuietly, onFailedSave, unsavedSettingKeys, decideTrialStart, trialOrigin, FIRST_SEEN_KEY, MIGRATION_FAILURES_KEY, ROW_CLICK_CMD, RowClickIndex, clickSafeProvider, revealWhenVisible, rowClickTarget, FILTER_LABELS, FilterMode, SessionsProvider, SessionNode, CursorNode, ComposerNode, CodexNode, ProjectNode, RemoteSessionNode, InboxRefNode, resolveRowArg, SortMode, TRIAL_START_KEY } from "./tree";
+import { AccountDecorationProvider, PreviewDocs } from "./decorations";
 import { OverviewPanel } from "./panel";
 import { TableViewProvider } from "./tableView";
-import { BridgeClient, buildSnapshot } from "./bridge";
+import { BridgeClient, buildSnapshot, FOCUS_NOTE_MS, LatestClick, PublisherLease, publishGate, type FocusNotice, focusNotice, navReport, remoteFocusPrecheck, actOnRemoteStop, followStop, STOP_ANSWER_WAIT_MS, stopNotice, waitForFocusResult } from "./bridge";
 import {
   copyMissingMementoValues,
   hostDisplayLabel,
@@ -63,6 +78,9 @@ import {
   legacyStateUpdates,
   legacyImportOutcome,
   claimOnceFile,
+  type FocusAction,
+  type FocusResult,
+  LEGACY_IMPORT_MAX_ATTEMPTS,
 } from "./bridgeSchema";
 import { HostIdentity, loadHostIdentity } from "./hostid";
 import { SessionAlerts } from "./alerts";
@@ -92,7 +110,7 @@ import {
   trialWasObserved,
 } from "./license";
 import { registerLicenseDebugCommand } from "./debug/licenseDebug";
-import { buildControlPanelRows, ControlRow, ControlPanelInput, ControlMark, WHATS_INCLUDED_MD } from "./controlPanel";
+import { buildControlPanelRows, keepControlRows, ControlRow, ControlPanelInput, ControlMark, WHATS_INCLUDED_MD } from "./controlPanel";
 
 const PREVIEW_SCHEME = "sessiondeck";
 const PROPS_SCHEME = "sessiondeck-props";
@@ -119,10 +137,15 @@ async function migrateRenameState(
   });
 
   const globalStorageRoot = join(context.globalStorageUri.fsPath, "..");
-  const rows = await sqliteSelect(
-    join(globalStorageRoot, "state.vscdb"),
-    `SELECT value FROM ItemTable WHERE key='${LEGACY_EXTENSION_ID}'`
-  );
+  const stateDb = join(globalStorageRoot, "state.vscdb");
+  const rows = await sqliteSelect(stateDb, `SELECT value FROM ItemTable WHERE key='${LEGACY_EXTENSION_ID}'`);
+  // null is "could not read", not "nothing there" (the legacy import makes the
+  // same distinction): a database that exists but didn't read may still hold the
+  // former extension's trial start, so this counts as a failed migration.
+  // After LEGACY_IMPORT_MAX_ATTEMPTS failed starts the trial origin is settled
+  // without it (decideTrialStart), and an unreadable database stops failing.
+  const gaveUp = (context.globalState.get<number>(MIGRATION_FAILURES_KEY) ?? 0) >= LEGACY_IMPORT_MAX_ATTEMPTS;
+  if (rows === null && existsSync(stateDb) && !gaveUp) throw new Error("the editor's state database could not be read");
   const legacyMemento = parseLegacyMemento(rows?.[0]?.[0]);
   // In a remote window this reads the remote host's state DB, which never holds
   // the old memento (VS Code keeps extension mementos on the desktop side), so
@@ -159,15 +182,20 @@ const CONTROL_MARK_COLOR: Record<ControlMark, string | undefined> = {
  *  colour by mark, a never-truncated MarkdownString tooltip, and the click command)
  *  and re-reads the live snapshot on refresh(). */
 class ControlPanelProvider implements vscode.TreeDataProvider<ControlRow> {
-  private readonly emitter = new vscode.EventEmitter<void>();
+  private readonly emitter = new vscode.EventEmitter<ControlRow[] | undefined>();
   readonly onDidChangeTreeData = this.emitter.event;
   private rows: ControlRow[] = [];
   constructor(private readonly supply: () => ControlPanelInput) {
     this.rows = buildControlPanelRows(supply());
   }
+  /** Runs every tick. Fires nothing when no row changed, only the changed rows
+   *  when the set and order hold, and a full redraw otherwise (or when a toast
+   *  waits for the redraw), so a click on a row isn't lost to a redraw it didn't need. */
   refresh(): void {
-    this.rows = buildControlPanelRows(this.supply());
-    this.emitter.fire();
+    const update = keepControlRows(this.rows, buildControlPanelRows(this.supply()));
+    this.rows = update.rows;
+    if (update.structural || this.rootFetch.waiting) this.emitter.fire(undefined);
+    else if (update.changed.length > 0) this.emitter.fire(update.changed);
   }
   dispose(): void {
     this.emitter.dispose();
@@ -186,22 +214,185 @@ class ControlPanelProvider implements vscode.TreeDataProvider<ControlRow> {
     item.tooltip = md;
     const color = CONTROL_MARK_COLOR[row.mark];
     item.iconPath = color !== undefined ? new vscode.ThemeIcon(row.icon, new vscode.ThemeColor(color)) : new vscode.ThemeIcon(row.icon);
-    if (row.command !== undefined) item.command = { command: row.command, title: row.label, arguments: row.args };
+    if (row.command !== undefined) item.command = { command: row.command, title: row.label };
     return item;
   }
 }
 
+let logChannel: vscode.LogOutputChannel | undefined;
+/** One line in SessionDeck's output channel (View > Output > SessionDeck),
+ *  created on first use. console.log from an extension host lands in no place a
+ *  user or tester can find (not the extension-host log, not the window console on
+ *  a remote host). Never put conversation content here: kinds, pids, outcomes. */
+function logLine(line: string): void {
+  logChannel ??= vscode.window.createOutputChannel("SessionDeck", { log: true });
+  logChannel.info(line);
+}
+
+/** Test seam: startup step names that throw on purpose (test/activationHarness.ts). */
+export const injectedStartupFaults = new Set<string>();
+
+/** Commands that can't work while a startup step has failed. They answer with a
+ *  short message naming what failed instead of failing in some stranger way. */
+/** What Move into Editor depends on: where a session runs, and reaching a window. */
+const MOVE_NEEDS = ["process table", "navigation"] as const;
+
+const COMMAND_NEEDS: Readonly<Record<string, readonly string[]>> = {
+  "sessionDeck.focusRemoteSession": ["bridge client"],
+  // The inline action and every context menu entry run this one command.
+  "sessionDeck.moveSession": MOVE_NEEDS,
+  "sessionDeck.showLastMessage": ["preview documents"],
+  "sessionDeck.sessionProperties": ["preview documents"],
+  "sessionDeck.whatsIncluded": ["license documents"],
+  "sessionDeck.doctor": ["diagnostics documents"],
+  "sessionDeck.copyDebugReport": ["diagnostics documents"],
+  "sessionDeck.captureDriftFixture": ["diagnostics documents"],
+};
+
+type CommandHandler = Parameters<typeof vscode.commands.registerCommand>[1];
+
+/** Every sessionDeck.* id the manifest contributes or names: commands, menu
+ *  items, keybindings and command: links in the welcome views. */
+function manifestCommandIds(packageJSON: unknown): string[] {
+  const c = (packageJSON as { contributes?: Record<string, unknown> } | undefined)?.contributes ?? {};
+  const ids = new Set<string>();
+  const add = (v: unknown): void => {
+    if (typeof v === "string" && v.startsWith("sessionDeck.")) ids.add(v);
+  };
+  const items = (v: unknown): Record<string, unknown>[] => (Array.isArray(v) ? (v as Record<string, unknown>[]) : []);
+  for (const x of items(c.commands)) add(x.command);
+  for (const x of items(c.keybindings)) add(x.command);
+  for (const list of Object.values((c.menus ?? {}) as Record<string, unknown>)) for (const x of items(list)) add(x.command);
+  for (const w of items(c.viewsWelcome)) {
+    if (typeof w.contents === "string") for (const m of w.contents.matchAll(/command:(sessionDeck\.[A-Za-z0-9_]+)/g)) add(m[1]);
+  }
+  return [...ids];
+}
+
+/** A command that can't run because a startup step failed: say so, with a way
+ *  to the detail (the output channel). */
+function tellUnavailable(failure: StartupFailure | undefined): void {
+  const what = failure === undefined ? "part of SessionDeck" : failure.feature;
+  void vscode.window
+    .showWarningMessage(`SessionDeck: this command is unavailable because ${what} failed to start.`, "Show Details")
+    .then((choice) => {
+      if (choice === "Show Details") logChannel?.show(true);
+    });
+}
+
+/** After a failed startup: register every command the manifest names that nothing
+ *  registered, so a click says what failed instead of "command not found". */
+async function registerMissingCommands(
+  context: vscode.ExtensionContext,
+  registered: Set<string>,
+  health: StartupHealth
+): Promise<void> {
+  let existing = new Set<string>();
+  try {
+    existing = new Set(await vscode.commands.getCommands(true));
+  } catch {
+    // unknown: try every id; a duplicate registration throws and is skipped below
+  }
+  const failure = health.blockedBy([ACTIVATION_STEP]) ?? health.failures[0];
+  for (const id of manifestCommandIds(context.extension.packageJSON)) {
+    if (registered.has(id) || existing.has(id)) continue;
+    try {
+      context.subscriptions.push(vscode.commands.registerCommand(id, () => tellUnavailable(failure)));
+      registered.add(id);
+    } catch {
+      // registered by someone else in the meantime
+    }
+  }
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  const health = new StartupHealth(logLine, injectedStartupFaults);
+  const registered = new Set<string>();
+  // Each registration is added to the subscriptions the moment it succeeds: the
+  // call sites register many commands inside one push(...), and a throw midway
+  // would otherwise leave the earlier ones registered but never disposed. The
+  // returned disposable is a no-op so those push(...) calls don't dispose twice.
+  const registerCommand = (id: string, handler: CommandHandler): vscode.Disposable => {
+    const needs = COMMAND_NEEDS[id];
+    const disposable = vscode.commands.registerCommand(
+      id,
+      needs === undefined
+        ? handler
+        : (...args: unknown[]) => {
+            const failed = health.blockedBy(needs);
+            if (failed !== undefined) return tellUnavailable(failed);
+            return handler(...args);
+          }
+    );
+    context.subscriptions.push(disposable);
+    registered.add(id);
+    return { dispose: () => undefined };
+  };
+  // The notice goes up once per window: at the end of activation, or later when
+  // the first failure is a save that matters across restarts and lands after it.
+  let started = false;
+  let noticeShown = false;
+  const showNotice = (): void => {
+    const notice = health.notice();
+    if (!started || noticeShown || notice === undefined) return;
+    noticeShown = true;
+    void vscode.window.showWarningMessage(notice, "Show Details").then((choice) => {
+      if (choice === "Show Details") logChannel?.show(true);
+    });
+  };
+  onFailedSave((key, err) => {
+    try {
+      logLine(`storage: could not save ${key}: ${err instanceof Error ? err.message : String(err)}`);
+    } catch {
+      // no output channel; Diagnostics still lists the key
+    }
+    if (!KEPT_ACROSS_RESTARTS.has(key)) return;
+    health.record(STORAGE_STEP, "saved trial and notice state", err);
+    showNotice();
+  });
+  try {
+    await startSessionDeck(context, health, registerCommand);
+  } catch (err) {
+    health.record(ACTIVATION_STEP, "most of SessionDeck", err);
+  }
+  // Let the saves activation started report a failure before the notice is built.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  started = true;
+  if (health.failures.some((f) => f.step !== STORAGE_STEP)) await registerMissingCommands(context, registered, health);
+  showNotice();
+}
+
+const STORAGE_STEP = "storage";
+/** State whose loss shows across restarts: the trial origin and the notice
+ *  latches (a lost latch shows its notice again; a lost start restarts a trial). */
+const KEPT_ACROSS_RESTARTS = new Set([
+  TRIAL_START_KEY,
+  FIRST_SEEN_KEY,
+  MIGRATION_FAILURES_KEY,
+  "trialSeenAt",
+  "trialEndedPending",
+  "trialEndedShown",
+  "trialWelcomeShown",
+  "trialWelcomeDisplayed",
+  "licenseKeyExpiredNotified",
+  "licenseReminderDay",
+]);
+
+async function startSessionDeck(
+  context: vscode.ExtensionContext,
+  health: StartupHealth,
+  registerCommand: (id: string, handler: CommandHandler) => vscode.Disposable
+): Promise<void> {
   const activatedAt = Date.now();
   // Read before anything this activation creates it: the folder holds the host id
   // and hook spool, so its presence means SessionDeck (or its former name) ran here.
   const stateDirExisted = existsSync(STATE_DIR);
-  let legacy = { legacyMemento: false, legacySettings: false };
-  try {
-    legacy = await migrateRenameState(context);
-  } catch (err) {
-    console.warn(`[sessiondeck] rename migration was incomplete: ${String(err)}`);
-  }
+  const legacy = await health.runAsync(
+    "state migration",
+    "settings and trial state from the former extension name (retried at the next start)",
+    () => migrateRenameState(context),
+    { legacyMemento: false, legacySettings: false }
+  );
   // An old-name copy still installed next to SessionDeck duplicates the tree and
   // writes the same hook script. Say so once per window, with the way out.
   const legacyInstalled = installedLegacyExtensions((id) => vscode.extensions.getExtension(id) !== undefined);
@@ -219,7 +410,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.globalState.get<boolean>("trialWelcomeShown") === undefined &&
     isReturningInstall({ ...legacy, stateDirExisted })
   ) {
-    await context.globalState.update("trialWelcomeShown", true);
+    await health.runAsync(
+      "license state",
+      "the saved trial state",
+      () => Promise.resolve(context.globalState.update("trialWelcomeShown", true)),
+      undefined
+    );
   }
   let refreshFn: () => void = () => undefined;
   const getExtraDirs = (): string[] =>
@@ -241,7 +437,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     };
     void vscode.commands.executeCommand("setContext", "sessionDeck.hooksInstalled", hooksProbe.installed);
   };
-  syncHooksContext();
+  health.run("hooks status", "the hooks status", syncHooksContext, undefined);
 
   const titles = new TitleSource(context.globalStorageUri, () => refreshFn());
   // Off-tick model/mode/token scanner: pre-window session scans + lazy subagent
@@ -249,7 +445,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // replaces its "…" placeholder. Assigned to the provider below.
   const tokenScanner = new TokenScanner(() => refreshFn());
   const decorations = new AccountDecorationProvider();
-  context.subscriptions.push(vscode.window.registerFileDecorationProvider(decorations));
+  health.run(
+    "file decorations",
+    "account colours on rows",
+    () => context.subscriptions.push(vscode.window.registerFileDecorationProvider(decorations)),
+    0
+  );
   const showCursorAgents = (): boolean =>
     vscode.workspace.getConfiguration("sessionDeck").get<boolean>("showCursorAgents", true);
   const showCodexAgents = (): boolean =>
@@ -287,15 +488,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // without ever breaking activation.
   const crossHostEnabled = (): boolean =>
     vscode.workspace.getConfiguration("sessionDeck").get<boolean>("crossHost", true);
-  let hostIdentity: HostIdentity | undefined;
-  let hostIdentityError: string | undefined;
-  try {
-    hostIdentity = loadHostIdentity();
-  } catch (err) {
-    hostIdentity = undefined;
-    hostIdentityError = err instanceof Error ? err.message : String(err);
-    console.log(`[sessiondeck] host identity unavailable — cross-host disabled: ${String(err)}`);
-  }
+  const hostIdentity: HostIdentity | undefined = health.run(
+    "host identity",
+    "cross-host sessions",
+    () => loadHostIdentity(),
+    undefined
+  );
+  const hostIdentityError: string | undefined = health.blockedBy(["host identity"])?.error;
 
   const provider = new SessionsProvider(
     context.globalState,
@@ -313,6 +512,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     () => layoutOf(),
     () => vscode.workspace.getConfiguration("sessionDeck").get<boolean>("inboxLane", true)
   );
+  // The provider owns the remote last-message command + content-provider
+  // disposables (registered in its constructor) — dispose them with the extension.
+  // Pushed at once, so a failure further down can't leave them behind.
+  context.subscriptions.push({ dispose: () => provider.dispose() });
+  // A failed migration leaves the former extension's trial start unread: stamping
+  // one now would block it for good (the retry only fills missing keys). So the
+  // trial origin waits, for at most LEGACY_IMPORT_MAX_ATTEMPTS starts, with the
+  // clock running from the first of them; see decideTrialStart.
+  const trialDecision = decideTrialStart({
+    saved: context.globalState.get<number>(TRIAL_START_KEY),
+    firstSeen: context.globalState.get<number>(FIRST_SEEN_KEY),
+    failures: context.globalState.get<number>(MIGRATION_FAILURES_KEY) ?? 0,
+    migrationFailed: health.blockedBy(["state migration"]) !== undefined,
+    endedLatch:
+      context.globalState.get<boolean>("trialEndedPending") === true ||
+      context.globalState.get<boolean>("trialEndedShown") === true,
+    seenAt: context.globalState.get<number>("trialSeenAt"),
+    now: Date.now(),
+    maxAttempts: LEGACY_IMPORT_MAX_ATTEMPTS,
+    trialMs: TRIAL_MS,
+  });
+  if (trialDecision.firstSeen !== undefined) saveQuietly(context.globalState, FIRST_SEEN_KEY, trialDecision.firstSeen);
+  if (trialDecision.failures !== undefined) saveQuietly(context.globalState, MIGRATION_FAILURES_KEY, trialDecision.failures);
+  if (trialDecision.stamp !== undefined) saveQuietly(context.globalState, TRIAL_START_KEY, trialDecision.stamp);
+  const trialWaiting = !trialDecision.settled;
   provider.tokenScanner = tokenScanner;
   // Carry the trial origin across the user's own machines via Settings Sync, so the
   // grain matches the license (per-person, not per-machine): a synced trialStart on
@@ -325,10 +549,39 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // + a doctor/debug section. Fed by the thin instrumentation in refresh() below.
   const watchdog = new TickWatchdog();
 
+  // Rows get an argument-free click command (see RowClickIndex in tree.ts): VS Code drops a
+  // row's command arguments on every full refresh, and a click in that gap failed
+  // with "Actual command not found".
+  const rowClicks = new RowClickIndex<Parameters<SessionsProvider["getTreeItem"]>[0]>();
   const view = vscode.window.createTreeView("sessionDeck.sessions", {
-    treeDataProvider: provider,
+    treeDataProvider: clickSafeProvider(provider, rowClicks),
   });
   context.subscriptions.push(view);
+  // Which groups are open decides whether a group's own line can repaint without
+  // making its rows briefly unclickable (SessionsProvider.fireTreeChanges).
+  context.subscriptions.push(
+    view.onDidExpandElement((e) => provider.noteOpen(e.element, true)),
+    view.onDidCollapseElement((e) => provider.noteOpen(e.element, false)),
+    // Column View hides this view: only whole-tree refreshes while hidden.
+    view.onDidChangeVisibility((e) => provider.setViewVisible(e.visible))
+  );
+  provider.setViewVisible(view.visible);
+  // A group that comes to need you opens without changing its id (an id change
+  // redraws the whole level): reveal with expand, without moving selection or focus.
+  // Only while the view is visible: reveal shows a hidden view (see revealWhenVisible).
+  const needsYouReveal = revealWhenVisible(view, (n) => provider.isCurrent(n));
+  context.subscriptions.push({ dispose: needsYouReveal.dispose });
+  provider.expandRow = needsYouReveal.expand;
+  context.subscriptions.push(
+    registerCommand(ROW_CLICK_CMD, async () => {
+      const target = rowClickTarget(view.selection, rowClicks);
+      if ("message" in target) {
+        void vscode.window.showInformationMessage(target.message);
+        return;
+      }
+      await vscode.commands.executeCommand(target.command.command, ...(target.command.arguments ?? []));
+    })
+  );
   const syncFilterIndicator = (): void => {
     view.description = filterBadgeLabel(provider.filterMode, provider.hiddenAgentTypes);
     void vscode.commands.executeCommand(
@@ -338,21 +591,26 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
   };
   syncFilterIndicator();
-  // The provider owns the remote last-message command + content-provider
-  // disposables (registered in its constructor) — dispose them with the extension.
-  context.subscriptions.push({ dispose: () => provider.dispose() });
 
   const pkgVersion = ((): string => {
     const v = (context.extension.packageJSON as { version?: unknown }).version;
     return typeof v === "string" ? v : "0.0.0";
   })();
-  const bridge = new BridgeClient({
+  const bridgeOptions = {
     selfHostId: hostIdentity?.id,
     ourVersion: pkgVersion,
     // crossHost off = zero work: skip the 60s hello probe entirely (a later flip
     // back to true just needs a reload — no config watcher).
     enabled: () => crossHostEnabled(),
-  });
+  };
+  // A client that failed to start is replaced by a disabled one (no probe, no
+  // remote hosts), so everything that reads the bridge still works single-host.
+  const bridge = health.run(
+    "bridge client",
+    "the cross-host bridge",
+    () => new BridgeClient(bridgeOptions),
+    undefined
+  ) ?? new BridgeClient({ ...bridgeOptions, enabled: () => false });
   const syncTopologyContext = (): void => {
     void vscode.commands.executeCommand("setContext", "sessionDeck.inCursor", /cursor/i.test(vscode.env.appName));
     void vscode.commands.executeCommand("setContext", "sessionDeck.cursorMonitoring", cursorMonitoringInstalled());
@@ -453,10 +711,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     () => tableView.update(buildPanelModel()),
     () => void vscode.commands.executeCommand("sessionDeck.licenseMenu")
   );
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider("sessionDeck.table", tableView, {
-      webviewOptions: { retainContextWhenHidden: true },
-    })
+  health.run(
+    "table webview",
+    "the Table view",
+    () =>
+      context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider("sessionDeck.table", tableView, {
+          webviewOptions: { retainContextWhenHidden: true },
+        })
+      ),
+    0
   );
 
   // Control Panel: a collapsible sidebar segment (present under BOTH the tree and the
@@ -493,11 +757,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       licenseKeyExpiredThrough: expiredMonthlyKey(provider.licenseKey(), Date.now()),
     };
   };
-  const controlPanel = new ControlPanelProvider(controlPanelInput);
-  const controlPanelView = vscode.window.createTreeView("sessionDeck.controlPanel", {
-    treeDataProvider: controlPanel,
-  });
-  context.subscriptions.push(controlPanelView, { dispose: () => controlPanel.dispose() });
+  const controlPanel = health.run(
+    "control panel",
+    "the Control Panel view",
+    () => {
+      const cp = new ControlPanelProvider(controlPanelInput);
+      context.subscriptions.push({ dispose: () => cp.dispose() });
+      context.subscriptions.push(vscode.window.createTreeView("sessionDeck.controlPanel", { treeDataProvider: cp }));
+      return cp;
+    },
+    undefined
+  );
 
   const activityTreeOn = (): boolean =>
     vscode.workspace.getConfiguration("sessionDeck").get<boolean>("activityTree", false);
@@ -551,7 +821,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     };
   };
   const soundFile = vscode.Uri.joinPath(context.extensionUri, "media", "unfocused-ping.wav").fsPath;
-  const platformTools = resolvePlatformTools(process.platform, commandOnPath, soundFile);
+  const platformTools = health.run(
+    "os alerts",
+    "sound and OS notifications while unfocused",
+    () => resolvePlatformTools(process.platform, commandOnPath, soundFile),
+    {}
+  );
   const unfocusedAlerts = new UnfocusedAlerts(
     () => vscode.window.state.focused,
     unfocusedConfig,
@@ -672,7 +947,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       remindedOn: context.globalState.get<string>(REMINDER_KEY),
       otherNoticeShown,
     });
-    if (d.stamp !== undefined) void context.globalState.update(REMINDER_KEY, d.stamp);
+    if (d.stamp !== undefined) saveQuietly(context.globalState, REMINDER_KEY, d.stamp);
     if (!d.show) return;
     void vscode.window
       .showInformationMessage(
@@ -703,20 +978,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // The trial origin is final once the desktop companion has reported its trial
   // start, or is known to be absent (cross-host off, probe gave up), or the probe
   // window has passed anyway (a companion too old to have the license command).
+  // The companion's answer settles it even after a failed migration: it already
+  // holds the oldest trial start across the former extension's state too.
   const trialOriginSettled = (): boolean =>
-    !crossHostEnabled() ||
     bridge.licenseCached !== undefined ||
-    (bridge.probeSettled && !bridge.available) ||
-    Date.now() - activatedAt > 60_000;
+    (!trialWaiting &&
+      (!crossHostEnabled() || (bridge.probeSettled && !bridge.available) || Date.now() - activatedAt > 60_000));
   const maybeTrialToast = (): boolean => {
     const trialStart = context.globalState.get<number>(TRIAL_START_KEY);
     const now = Date.now();
     // Recompute from globalState rather than the provider's last reload, so a
     // trial origin the companion just moved earlier is already reflected.
-    const state = licenseState(provider.licenseKey(), now, trialStart ?? now);
+    const state = licenseState(provider.licenseKey(), now, trialOrigin(context.globalState, now));
     const settled = trialOriginSettled();
     if (settled && state.startsWith("trial:") && context.globalState.get<number>(TRIAL_SEEN_KEY) === undefined) {
-      void context.globalState.update(TRIAL_SEEN_KEY, now);
+      saveQuietly(context.globalState, TRIAL_SEEN_KEY, now);
     }
     const d = decideTrialToast({
       state,
@@ -731,11 +1007,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       keyExpired: expiredMonthlyKey(provider.licenseKey(), Date.now()) !== undefined,
     });
     // Persist latches BEFORE showing (pending is armed even with notifications off).
-    if (d.setTrialEndedPending === true) void context.globalState.update(TRIAL_END_PENDING_KEY, true);
-    if (d.setWelcomeShown === true) void context.globalState.update(WELCOME_KEY, true);
-    if (d.setTrialEndedShown === true) void context.globalState.update(TRIAL_END_KEY, true);
+    if (d.setTrialEndedPending === true) saveQuietly(context.globalState, TRIAL_END_PENDING_KEY, true);
+    if (d.setWelcomeShown === true) saveQuietly(context.globalState, WELCOME_KEY, true);
+    if (d.setTrialEndedShown === true) saveQuietly(context.globalState, TRIAL_END_KEY, true);
     if (d.toast === "welcome") {
-      void context.globalState.update(WELCOME_DISPLAYED_KEY, true);
+      saveQuietly(context.globalState, WELCOME_DISPLAYED_KEY, true);
       void vscode.window
         .showInformationMessage(WELCOME_MESSAGE, "What's included")
         .then((choice) => {
@@ -787,7 +1063,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           else if (choice === "Open sessiondeck.dev") void vscode.commands.executeCommand("sessionDeck.buyLicense", "expired");
         });
     },
-    saveLatch: (through) => void context.globalState.update(KEY_EXPIRED_KEY, through),
+    saveLatch: (through) => saveQuietly(context.globalState, KEY_EXPIRED_KEY, through),
     disposed: () => bridge.isDisposed,
   });
 
@@ -829,6 +1105,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // PROJECT_WATCHER_CAP most-recently-active dirs (the rest ride the ~30s reconcile,
   // which is always correct — just up to one interval slower), and any watch() that
   // still throws is caught + dropped, again leaving that project to the reconcile.
+  // This process's start time for move claims (a table query off Linux), read now
+  // so a move never waits on it.
+  void moveClaimIdentity();
+  // Once per activation, after the first refreshes have listed the sessions:
+  // delete move-claim files of sessions no longer listed (bounded, see
+  // sweepMoveClaims), so the folder doesn't grow by one file per session moved.
+  const claimSweep = setTimeout(() => {
+    void sweepMoveClaims(join(context.globalStorageUri.fsPath, "claims"), (id) => provider.findSession(id) !== undefined || provider.findCodex(id) !== undefined).catch(
+      () => undefined
+    );
+  }, 60_000);
+  context.subscriptions.push({ dispose: () => clearTimeout(claimSweep) });
+  // Without a lease this window publishes regardless, as it does when the lease
+  // file can't be written (CONTRACTS.md: a lone window must publish).
+  const publisherLease = health.run(
+    "publish lease",
+    "one-publisher-per-host coordination",
+    () => new PublisherLease(join(context.globalStorageUri.fsPath, "claims"), `${process.pid}-${Date.now().toString(36)}`),
+    undefined
+  );
+  context.subscriptions.push({ dispose: () => publisherLease?.release() });
   const RECONCILE_EVERY = 10; // ~30s at the 3s poll — the missed-event safety net
   const PROJECT_WATCHER_CAP = 100; // most-recently-active dirs get fs.watch; rest reconcile
   const dirtySessions = new Set<string>();
@@ -956,20 +1253,66 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // the LOCAL node first (never navigate from the action's strings) and invoke
   // the exact command a local click uses. Unknown session ids drop silently; the
   // action's cwd is a disambiguation hint only and is never fs-touched.
+  /** The status-bar note of the last remote-row click (replaced by the next). */
+  let focusNote: vscode.Disposable | undefined;
+  const focusClicks = new LatestClick();
+  /** Carries out a stop asked from another host (set once Stop Session is wired). */
+  let remoteStop: ((a: FocusAction, deadline: number | undefined) => Promise<void>) | undefined;
   const applyRemoteActions = async (selfHostId: string): Promise<void> => {
-    const actions = await bridge.takeActions(selfHostId);
-    for (const a of actions) {
+    const taken = await bridge.takeActions(selfHostId, (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath));
+    for (const { action: a, deadline } of taken) {
       if (a.targetHostId !== selfHostId) continue; // defense in depth
+      // The poster already told the user nothing happened: don't act late.
+      if (deadline !== undefined && Date.now() > deadline) continue;
+      if (a.kind === "stop") {
+        // Not awaited: the confirmation waits for the user, the tick does not.
+        if (remoteStop !== undefined) void remoteStop(a, deadline);
+        else if (a.id !== undefined) void bridge.postFocusResult({ id: a.id, outcome: "not-stopped", detail: "SessionDeck there is still starting. Try again." });
+        continue;
+      }
+      const report = await actOnRemoteFocus(a, deadline);
+      if (a.id !== undefined) void bridge.postFocusResult({ id: a.id, ...report });
+    }
+  };
+
+  /** What a Cursor or Codex row click did, as openCursor / openCodex return it. A
+   *  terminal focused here does not bring this window to the front. */
+  const cursorCodexReport = (r: unknown): Pick<FocusResult, "outcome" | "detail"> => {
+    if (r === "shown") return { outcome: "shown", detail: "focused its terminal there; that window may not have come to the front" };
+    if (r === "handed-off" || r === "outside") return { outcome: r };
+    return { outcome: "preview" };
+  };
+
+  /** Perform one focus action here and say what happened (the report the posting
+   *  window shows its user). A Claude session is shown with the window raised,
+   *  since the user is looking at another window. */
+  const actOnRemoteFocus = async (a: FocusAction, deadline: number | undefined): Promise<Pick<FocusResult, "outcome" | "detail">> => {
+    try {
       if (a.tool === "claude") {
         const node = provider.findSession(a.sessionId);
-        if (node !== undefined) await vscode.commands.executeCommand("sessionDeck.openSession", node);
-      } else if (a.tool === "cursor") {
-        const node = provider.findCursor(a.sessionId);
-        if (node !== undefined) await vscode.commands.executeCommand("sessionDeck.openCursor", node);
-      } else if (a.tool === "codex") {
-        const node = provider.findCodex(a.sessionId);
-        if (node !== undefined) await vscode.commands.executeCommand("sessionDeck.openCodex", node);
+        if (node === undefined) return { outcome: "not-found" };
+        if (provider.locationOf(node.row).location === "outside") {
+          // Same as a click here: its last message plus the offer to move it into
+          // the editor, in this window (the one attached to its host).
+          await vscode.commands.executeCommand("sessionDeck.openSession", node);
+          return { outcome: "outside" };
+        }
+        provider.noteFocus({ kind: "session", id: node.row.meta.sessionId });
+        await provider.markRead(node);
+        refresh();
+        if (navigator === undefined) return navReport("disabled");
+        return navReport(await navigator.navigate(node.row, { raise: true, deadline }));
       }
+      if (a.tool === "cursor") {
+        const node = provider.findCursor(a.sessionId);
+        if (node === undefined) return { outcome: "not-found" };
+        return cursorCodexReport(await vscode.commands.executeCommand<unknown>("sessionDeck.openCursor", node));
+      }
+      const node = provider.findCodex(a.sessionId);
+      if (node === undefined) return { outcome: "not-found" };
+      return cursorCodexReport(await vscode.commands.executeCommand<unknown>("sessionDeck.openCodex", node));
+    } catch (err) {
+      return { outcome: "failed", detail: err instanceof Error ? err.message : String(err) };
     }
   };
 
@@ -1039,7 +1382,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // (a user back after a week recovers immediately) and then daily from the tick,
   // whenever Claude hooks (in any config home) OR Cursor monitoring is installed.
   const leaseInPlay = (): boolean => cursorMonitoringInstalled() || hooksInstalledInAnyHome(computeHomes());
-  let lastLeaseRenew = renewLeaseIfDue(0, Date.now(), leaseInPlay);
+  let lastLeaseRenew = health.run(
+    "hooks lease",
+    "the hooks lease renewal",
+    () => renewLeaseIfDue(0, Date.now(), leaseInPlay),
+    0
+  );
   const refresh = (): void => {
     const homes = computeHomes();
     reconcileWatchers(homes);
@@ -1102,7 +1450,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // change-signature — the same string that fires the sidebar tree's repaint — so
       // the panel and published snapshot inherit exactly the tree's freshness. Alerts
       // are NOT a consumer: they run off provider.alertRows(), never the panel model.
-      const bridgePublishing = crossHostEnabled() && bridge.available && hostIdentity !== undefined;
+      // Only the publisher-lease holder (or the window about to take a free lease)
+      // counts as publishing; the others just read the lease file each tick.
+      const bridgeUp = crossHostEnabled() && bridge.available && hostIdentity !== undefined;
+      const lease = bridgeUp ? (publisherLease?.peek() ?? "mine") : "taken";
+      const { bridgePublishing, heartbeatDue } = publishGate(bridgeUp, lease, bridge.publishDue());
       const panelOpen = overviewPanel.isOpen();
       const sig = provider.changeSignature;
       const decision = decidePanelBuild({
@@ -1110,7 +1462,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         panelOpen,
         panelJustOpened: panelOpen && !panelWasOpen,
         bridgePublishing,
-        heartbeatDue: bridgePublishing && bridge.publishDue(),
+        heartbeatDue,
       });
       panelWasOpen = panelOpen;
       const panelStart = process.hrtime.bigint();
@@ -1138,8 +1490,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         // picks it up on the next tick. Never resets local upward.
         if (bridge.available) void reconcileTrialStart();
         if (bridge.available) void importLegacyStateViaBridge();
-        if (bridgePublishing && hostIdentity !== undefined) {
-          if (decision.publish && panelModel !== undefined) {
+        if (bridgeUp && hostIdentity !== undefined) {
+          // One window per host publishes (see PublisherLease): the host's
+          // snapshot is one file, and windows overwriting each other made rows
+          // and their marks flicker on other hosts.
+          if (decision.publish && panelModel !== undefined && (publisherLease?.holds() ?? true)) {
             // buildSnapshot reads `panelModel`, which is built from the tree's already
             // hidden-filtered projects — so a session you hid locally is intentionally
             // absent from what we publish to peers too (hiding follows you across your
@@ -1155,7 +1510,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             // LOCAL panel still reflects it on its own next tick, and only the remote
             // mirror lags. (The 3s floor predates this gate — the gate just makes the
             // deferral land on the heartbeat instead of the next 3s tick's rebuild.)
-            void bridge.publish(buildSnapshot(panelModel, hostIdentity));
+            // Taking a free lease over always publishes (CONTRACTS.md: one
+            // publisher per host), even an unchanged snapshot within 15 s.
+            void bridge.publish(buildSnapshot(panelModel, hostIdentity), lease === "free");
           }
           // Consume any focus actions other hosts posted for us and perform the
           // same local navigation a click here would (guarded, fire-and-forget).
@@ -1172,7 +1529,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           : undefined;
       updateChip();
       updateKeyItem();
-      controlPanel.refresh();
+      controlPanel?.refresh();
       // One license notice per tick: whichever of these shows first holds the
       // over-limit reminder back to the next day.
       const keyNotice = maybeKeyExpiredNotice();
@@ -1217,7 +1574,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   // hook-event spool: instant refresh + permission-prompt detection. The script
   // body gains fields over time (e.g. the RC bridge id) — refresh it in place.
-  refreshHookScript();
+  health.run("hook script", "the hook script update", refreshHookScript, undefined);
   const tail = new EventTail();
   const onHookEvents = (): void => {
     let changed = false;
@@ -1257,42 +1614,53 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // hooks not installed yet; the 3s poll still covers status
     }
   };
-  watchEvents();
+  health.run("hook events", "instant updates from Claude hooks", watchEvents, undefined);
   context.subscriptions.push({ dispose: () => eventsWatcher?.close() });
 
   // "What's included" — the full feature list as a rendered markdown document (the
   // #33 virtual-doc pattern), NOT a truncated notification. The Control Panel's
   // License row and What's-included action, the license QuickPick and the trial
   // welcome toast all route here so the copy is never elided.
-  context.subscriptions.push(
-    vscode.workspace.registerTextDocumentContentProvider(LICENSE_SCHEME, {
-      provideTextDocumentContent: () => WHATS_INCLUDED_MD,
-    })
+  health.run(
+    "license documents",
+    "the What's included page",
+    () => context.subscriptions.push(PreviewDocs.register(LICENSE_SCHEME, () => WHATS_INCLUDED_MD)),
+    0
   );
 
   const previewEmitter = new vscode.EventEmitter<vscode.Uri>();
-  context.subscriptions.push(
-    vscode.workspace.registerTextDocumentContentProvider(PREVIEW_SCHEME, {
-      onDidChange: previewEmitter.event,
-      provideTextDocumentContent(uri: vscode.Uri): string {
-        const sessionId = uri.path.replace(/^\//, "").replace(/\.md$/, "");
+  context.subscriptions.push(previewEmitter);
+  health.run("preview documents", "last-message and properties previews", () => context.subscriptions.push(
+    PreviewDocs.register(
+      PREVIEW_SCHEME,
+      (uri: vscode.Uri): string => {
+        // The row's id rides in the query ("codex:<id>" or the session id); the
+        // path is only the tab's title. Older uris carried the id in the path.
+        const cx = uri.query.startsWith("codex:") ? [uri.query, uri.query.slice(6)] : /^\/codex\/(.+)\.md$/.exec(uri.path);
+        if (cx !== null) {
+          const c = provider.findCodex(cx[1]);
+          return c === undefined ? "_Session is no longer running._" : codexPreviewMarkdown(c.row);
+        }
+        const sessionId = uri.query !== "" ? uri.query : uri.path.replace(/^\//, "").replace(/\.md$/, "");
         const node = provider.findSession(sessionId);
         if (node === undefined) return "_Session is no longer running._";
         const { row } = node;
+        // The same title the tree shows (not the registry's derived name).
         const header =
-          `# ${row.meta.name ?? sessionId}\n\n` +
+          `# ${provider.sessionTitle(row)}\n\n` +
           `\`${row.meta.cwd}\` · pid ${row.meta.pid} · ${row.meta.entrypoint ?? "?"}\n\n---\n\n`;
         return header + (row.lastText !== "" ? row.lastText : "_No assistant message yet._");
       },
-    })
-  );
+      previewEmitter.event
+    )
+  ), 0);
 
   const propsEmitter = new vscode.EventEmitter<vscode.Uri>();
-  context.subscriptions.push(
-    propsEmitter,
-    vscode.workspace.registerTextDocumentContentProvider(PROPS_SCHEME, {
-      onDidChange: propsEmitter.event,
-      provideTextDocumentContent(uri: vscode.Uri): string {
+  context.subscriptions.push(propsEmitter);
+  health.run("preview documents", "last-message and properties previews", () => context.subscriptions.push(
+    PreviewDocs.register(
+      PROPS_SCHEME,
+      (uri: vscode.Uri): string => {
         const m = /^\/(session|cursor|composer|codex)\/(.+)\.md$/.exec(uri.path);
         if (m === null) return "_Session is no longer running._";
         const [, kind, id] = m;
@@ -1319,21 +1687,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           ? "_Session is no longer running._"
           : codexPropertiesMarkdown(provider.codexPropsView(node));
       },
-    })
-  );
+      propsEmitter.event
+    )
+  ), 0);
 
   // Setup Doctor: a one-shot read-only diagnostics report rendered into a virtual
   // document (reuses the TextDocumentContentProvider pattern above). The report
   // text is regenerated on each run and held here for the provider to serve.
   let doctorReport = "";
   const doctorEmitter = new vscode.EventEmitter<vscode.Uri>();
-  const doctorUri = vscode.Uri.from({ scheme: DOCTOR_SCHEME, path: "/SessionDeck Diagnostics.txt" });
-  context.subscriptions.push(
-    doctorEmitter,
-    vscode.workspace.registerTextDocumentContentProvider(DOCTOR_SCHEME, {
-      onDidChange: doctorEmitter.event,
-      provideTextDocumentContent: () => doctorReport,
-    })
+  // No leading slash: a remote window's desktop side titles a document by its
+  // Windows-style path, which showed as "\\SessionDeck Diagnostics.txt".
+  const doctorUri = vscode.Uri.from({ scheme: DOCTOR_SCHEME, path: "SessionDeck Diagnostics" });
+  context.subscriptions.push(doctorEmitter);
+  health.run(
+    "diagnostics documents",
+    "Diagnostics and the debug report",
+    () =>
+      context.subscriptions.push(
+        vscode.workspace.registerTextDocumentContentProvider(DOCTOR_SCHEME, {
+          onDidChange: doctorEmitter.event,
+          provideTextDocumentContent: () => doctorReport,
+        })
+      ),
+    0
   );
   // Gather every subsystem's real state via its own probe (no duplicated logic),
   // then hand the plain data object to the pure report builder.
@@ -1385,6 +1762,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       procPlatform: proc.platform,
       procFs: proc.procfs,
       procCensusAgeSec: procCensusAgeSec(),
+      procStartMatch: await procStartAgreement(homes.flatMap((h) => registryStartEntries(h.dir))),
       editorCli: cli.command,
       editorCliSource: cli.source,
       editorCliOnPath: commandOnPath(cli.command),
@@ -1415,6 +1793,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // Refresh tick watchdog: the ring-buffer summary (per-path percentiles, worst
       // tick phase breakdown, throw count + last error) as of now.
       watchdog: watchdog.summary(),
+      startupFailures: health.failures,
+      unsavedKeys: unsavedSettingKeys(),
     };
   };
   const runDoctor = async (): Promise<void> => {
@@ -1432,13 +1812,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // the doctor) so it can never be accidentally saved into the tree.
   let captureSummary = "";
   const captureEmitter = new vscode.EventEmitter<vscode.Uri>();
-  const captureUri = vscode.Uri.from({ scheme: CAPTURE_SUMMARY_SCHEME, path: "/Drift Fixture Capture.txt" });
-  context.subscriptions.push(
-    captureEmitter,
-    vscode.workspace.registerTextDocumentContentProvider(CAPTURE_SUMMARY_SCHEME, {
-      onDidChange: captureEmitter.event,
-      provideTextDocumentContent: () => captureSummary,
-    })
+  const captureUri = vscode.Uri.from({ scheme: CAPTURE_SUMMARY_SCHEME, path: "Drift Fixture Capture" });
+  context.subscriptions.push(captureEmitter);
+  health.run(
+    "diagnostics documents",
+    "Diagnostics and the debug report",
+    () =>
+      context.subscriptions.push(
+        vscode.workspace.registerTextDocumentContentProvider(CAPTURE_SUMMARY_SCHEME, {
+          onDidChange: captureEmitter.event,
+          provideTextDocumentContent: () => captureSummary,
+        })
+      ),
+    0
   );
   const runCaptureDriftFixture = async (): Promise<void> => {
     const fh = formatHealth(hasNodeSqlite() || (await hasPython3()));
@@ -1548,12 +1934,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   let debugReport = "";
   const debugEmitter = new vscode.EventEmitter<vscode.Uri>();
   const debugUri = vscode.Uri.from({ scheme: DEBUG_REPORT_SCHEME, path: "/SessionDeck Debug Report.md" });
-  context.subscriptions.push(
-    debugEmitter,
-    vscode.workspace.registerTextDocumentContentProvider(DEBUG_REPORT_SCHEME, {
-      onDidChange: debugEmitter.event,
-      provideTextDocumentContent: () => debugReport,
-    })
+  context.subscriptions.push(debugEmitter);
+  health.run(
+    "diagnostics documents",
+    "Diagnostics and the debug report",
+    () =>
+      context.subscriptions.push(
+        vscode.workspace.registerTextDocumentContentProvider(DEBUG_REPORT_SCHEME, {
+          onDidChange: debugEmitter.event,
+          provideTextDocumentContent: () => debugReport,
+        })
+      ),
+    0
   );
   // os.userInfo() can throw on hosts with no passwd entry — fall back to $USER.
   const currentUsername = (): string | undefined => {
@@ -1606,9 +1998,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.window.setStatusBarMessage("SessionDeck: debug report copied to clipboard", 3000);
   };
 
-  let navigator: Navigator | undefined = navigationEnabled()
-    ? new Navigator(context.globalStorageUri.fsPath)
-    : undefined;
+  // Without it a click falls back to the last-message preview, as with navigation off.
+  let navigator: Navigator | undefined = health.run(
+    "navigation",
+    "jumping to a session's window",
+    () => (navigationEnabled() ? new Navigator(context.globalStorageUri.fsPath) : undefined),
+    undefined
+  );
   context.subscriptions.push(
     { dispose: () => navigator?.dispose() },
     vscode.workspace.onDidChangeConfiguration((e) => {
@@ -1715,11 +2111,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     refresh();
   };
 
+  // Every click that falls back to a preview comes through these two: with the
+  // preview documents unregistered, say so instead of a provider error.
+  const previewUnavailable = (): boolean => {
+    const failed = health.blockedBy(["preview documents"]);
+    if (failed !== undefined) tellUnavailable(failed);
+    return failed !== undefined;
+  };
   const showPreview = async (node: SessionNode): Promise<void> => {
+    if (previewUnavailable()) return;
+    // Titled after the session, as the tree shows it; the id rides in the query.
     const uri = vscode.Uri.from({
       scheme: PREVIEW_SCHEME,
-      path: `/${node.row.meta.sessionId}.md`,
+      path: previewDocPath(provider.sessionTitle(node.row), node.row.meta.sessionId.slice(0, 8)),
+      query: node.row.meta.sessionId,
     });
+    previewEmitter.fire(uri);
+    await vscode.commands.executeCommand("markdown.showPreview", uri);
+  };
+
+  /** A Codex row's last reply (its click, and Show Last Message). */
+  const showCodexPreview = async (codexId: string): Promise<void> => {
+    if (previewUnavailable()) return;
+    const name = provider.findCodex(codexId)?.row.name ?? "";
+    const uri = vscode.Uri.from({ scheme: PREVIEW_SCHEME, path: previewDocPath(name, codexId.slice(0, 8)), query: `codex:${codexId}` });
     previewEmitter.fire(uri);
     await vscode.commands.executeCommand("markdown.showPreview", uri);
   };
@@ -1802,32 +2217,284 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     | { sessionId?: string; chatId?: string; codexId?: string; conversationId?: string };
   const resolveRowNode = (
     arg: RowContextArg | undefined
-  ): SessionNode | CursorNode | ComposerNode | CodexNode | RemoteSessionNode | undefined => {
-    // Guard non-object args up front: `"kind" in arg` would throw on a primitive.
-    if (arg === null || typeof arg !== "object") return undefined;
-    if ("kind" in arg) {
-      // A real node (SessionNode | CursorNode | ComposerNode | CodexNode) or an inbox
-      // reference, which unwraps to the real triage node it mirrors.
-      return arg.kind === "inbox-ref" ? arg.target : arg;
+  ): SessionNode | CursorNode | ComposerNode | CodexNode | RemoteSessionNode | undefined =>
+    resolveRowArg(arg, {
+      session: (id) => provider.findSession(id),
+      cursor: (id) => provider.findCursor(id),
+      codex: (id) => provider.findCodex(id),
+      composer: (id) => provider.findComposer(id),
+    });
+
+  // Where a session runs: this window's terminal shell pids count as "in the
+  // editor" on every OS, and on macOS/Windows the process table answers new pids
+  // asynchronously, so a finished batch re-renders the rows it placed.
+  const syncTerminalPids = async (): Promise<void> => {
+    const pids = new Set<number>();
+    for (const t of vscode.window.terminals) {
+      const pid = await t.processId;
+      if (pid !== undefined) pids.add(pid);
     }
-    // A table context object: resolve the single id it carries to the live node.
-    if (typeof arg.sessionId === "string") return provider.findSession(arg.sessionId);
-    if (typeof arg.chatId === "string") return provider.findCursor(arg.chatId);
-    if (typeof arg.codexId === "string") return provider.findCodex(arg.codexId);
-    if (typeof arg.conversationId === "string") return provider.findComposer(arg.conversationId);
+    provider.setTerminalPids(pids);
+  };
+  void syncTerminalPids();
+  context.subscriptions.push(
+    vscode.window.onDidOpenTerminal(() => void syncTerminalPids()),
+    vscode.window.onDidCloseTerminal(() => void syncTerminalPids())
+  );
+  health.run(
+    "process table",
+    "where-a-session-runs updates",
+    () => {
+      const table = procTable();
+      if (table !== undefined) context.subscriptions.push(table.onUpdate(() => refresh()));
+    },
+    undefined
+  );
+
+  // Move into Editor: a session running outside the editor (not in an editor
+  // terminal or tab, not in tmux) is stopped there and resumed here. Only rows the
+  // tree marked "outside" qualify; everything is re-checked at click time.
+  // Stop Session: the same subject for any session whose place is known (outside,
+  // an editor terminal or tab, tmux); `where` is then the whole place phrase.
+  const sessionSubjectOf = (
+    node: SessionNode | CursorNode | ComposerNode | CodexNode | RemoteSessionNode | undefined,
+    mode: "move" | "stop"
+  ): MoveSubject | undefined => {
+    if (node === undefined) return undefined;
+    const place = (loc: LocationVerdict, tab: boolean): string | undefined => {
+      if (mode === "move") return loc.location === "outside" ? loc.where ?? "a terminal" : undefined;
+      if (loc.location === "outside") return `outside the editor, in ${loc.where ?? "a terminal"}`;
+      if (loc.location === "tmux") return "in tmux";
+      if (loc.location === "editor") return tab ? "in a Claude Code tab in the editor" : "in the editor";
+      return undefined;
+    };
+    if (node.kind === "session") {
+      const { row } = node;
+      const loc = provider.locationOf(row);
+      const where = place(loc, row.meta.entrypoint === "claude-vscode");
+      if (where === undefined) return undefined;
+      const regStatus = registryStatus(row.homeDir, row.meta.pid);
+      return {
+        tool: "claude",
+        id: row.meta.sessionId,
+        title: provider.sessionTitle(row),
+        cwd: row.meta.cwd,
+        pid: row.meta.pid,
+        // Only a start time the session's own registry entry vouches for (same
+        // session id, same namespace, same live start) is carried; else refused.
+        start: verifiedClaudeStart({ pid: row.meta.pid, sessionId: row.meta.sessionId, homeDir: row.homeDir }, identitySources()).start,
+        // The registry's live status is exact (busy/waiting = a turn is open);
+        // without it, fall back to the transcript reading.
+        working: regStatus !== undefined ? regStatus === "busy" || regStatus === "waiting" : row.status !== "idle" || row.pendingQuestion,
+        background: regStatus === "shell",
+        owner: loc.owner,
+        where,
+        homeDir: row.homeDir,
+        ...(mode === "stop" && loc.location === "editor" && row.meta.entrypoint === "claude-vscode" ? { claudeTab: true } : {}),
+      };
+    }
+    if (node.kind === "codex") {
+      const { row } = node;
+      const loc = provider.codexLocationOf(row);
+      const where = place(loc, false);
+      if (where === undefined || row.pid === undefined) return undefined;
+      // The census matched this pid to the rollout by cwd; confirm it is still a
+      // codex process before offering to stop it.
+      if (basename(pidCmdline(row.pid)?.[0] ?? "") !== "codex") return undefined;
+      // Uncached: the process may have closed this session's file since it was listed.
+      if (!pidHasOpen(row.pid, row.rolloutPath, true)) return undefined;
+      const pid = row.pid;
+      const protectedPid = pid <= 1 || pid === process.pid || pid === process.ppid;
+      return {
+        tool: "codex",
+        id: row.id,
+        title: row.name,
+        cwd: row.cwd,
+        pid,
+        start: protectedPid ? undefined : pidStartTime(pid),
+        rolloutPath: row.rolloutPath,
+        working: row.status === "working",
+        owner: loc.owner,
+        where,
+        codexHome: codexHomeOf(row.rolloutPath),
+      };
+    }
     return undefined;
+  };
+  const moveSubjectOf = (node: Parameters<typeof sessionSubjectOf>[0]): MoveSubject | undefined => sessionSubjectOf(node, "move");
+
+  // Every way into a move (the command, a click's offer, a click relayed from
+  // another host, which arrives as openSession/openCodex) passes these two.
+  const moveUnavailable = (): boolean => {
+    const failed = health.blockedBy(MOVE_NEEDS);
+    if (failed !== undefined) tellUnavailable(failed);
+    return failed !== undefined;
+  };
+  const claimDir = (): string => join(context.globalStorageUri.fsPath, "claims");
+  const runMove = async (subject: MoveSubject): Promise<void> => {
+    if (moveUnavailable()) return;
+    const outcome = await moveSession(subject, claimDir());
+    if (outcome === "cancelled") return;
+    registryChanged = true;
+    refresh();
+    // The resumed session registers a moment later: rescan again so its row shows
+    // up without anyone having to refresh (the registry watcher usually beats this).
+    if (outcome === "resumed" || outcome === "unconfirmed") {
+      for (const ms of [3_000, 10_000]) {
+        setTimeout(() => {
+          registryChanged = true;
+          refresh();
+        }, ms);
+      }
+    }
+  };
+
+  /** Stop a session here (this host): the confirmation, the verified stop, no
+   *  resume. The row goes when its registry entry does; rescan to hurry that. */
+  const runStop = async (subject: MoveSubject): Promise<Awaited<ReturnType<typeof stopSession>> | undefined> => {
+    if (moveUnavailable()) return undefined;
+    const r = await stopSession(subject, claimDir());
+    logLine(`stop: pid ${subject.pid} ${r.outcome}`);
+    if (r.outcome !== "cancelled") {
+      registryChanged = true;
+      refresh();
+    }
+    return r;
+  };
+
+  /** Stop a session that runs on another host: the SessionDeck window there
+   *  that has its folder shows the confirmation and stops it (a "stop" action
+   *  through the bridge, routed like a focus click); this window says what
+   *  happened. */
+  /** The status-bar note of the last relayed stop (replaced by the next click's). */
+  let stopNote: vscode.Disposable | undefined;
+  const stopRemote = async (node: RemoteSessionNode): Promise<void> => {
+    const s = node.session;
+    const title = shortTitle(s.title !== undefined && s.title.length > 0 ? s.title : s.id.slice(0, 8));
+    const host = remoteHostLabel(node.hostId);
+    // Each note replaces the one before (a late answer replaces "no answer yet").
+    // A later remote-row click owns the status bar: this click's late notes are
+    // dropped, as a focus click's are.
+    const click = focusClicks.begin();
+    focusNote?.dispose();
+    stopNote?.dispose();
+    stopNote = undefined;
+    const tell = (n: { level: "status" | "info" | "warning"; text: string }): void => {
+      if (n.level === "status") {
+        if (!focusClicks.isLatest(click)) return;
+        stopNote?.dispose();
+        stopNote = vscode.window.setStatusBarMessage(`$(radio-tower) ${n.text}`, STOP_ANSWER_WAIT_MS);
+        return;
+      }
+      else if (n.level === "info") void vscode.window.showInformationMessage(n.text);
+      else void vscode.window.showWarningMessage(n.text);
+    };
+    logLine(`stop command: remote-session ${s.tool}`);
+    if (node.stale || s.stoppable !== true || s.tool === "cursor") {
+      void vscode.window.showInformationMessage(`"${title}" runs on ${host}. Stop it from a SessionDeck window on that host.`);
+      return;
+    }
+    const post =
+      crossHostEnabled() && hostIdentity !== undefined
+        ? await bridge.postFocus({ targetHostId: node.hostId, sessionId: s.id, tool: s.tool, cwd: s.cwd }, "stop")
+        : { posted: false as const };
+    if (!post.posted || post.id === undefined) return tell(stopNotice("old" in post && post.old === true ? "old" : "not-posted", title, host));
+    const id = post.id;
+    const waiting = vscode.window.setStatusBarMessage(`$(sync~spin) Asking ${host} to stop "${title}"…`);
+    try {
+      await followStop(
+        () => bridge.takeFocusResult(id),
+        (answer) => {
+          waiting.dispose();
+          tell(stopNotice(answer, title, host));
+        }
+      );
+    } finally {
+      waiting.dispose();
+    }
+  };
+
+  // A stop asked from another host: the same confirmation and stop as a local
+  // one, in this window, answered under the action's id ("asking" first).
+  remoteStop = async (a, deadline) => {
+    const id = a.id;
+    if (id === undefined) return;
+    const node = a.tool === "claude" ? provider.findSession(a.sessionId) : a.tool === "codex" ? provider.findCodex(a.sessionId) : undefined;
+    await actOnRemoteStop(deadline, {
+      find: () => (node === undefined ? undefined : { pid: node.kind === "session" ? node.row.meta.pid : node.row.pid }),
+      subject: () => sessionSubjectOf(node, "stop"),
+      alive: pidAlive,
+      post: (r) => bridge.postFocusResult({ id, ...r }),
+      run: runStop,
+      now: Date.now,
+    });
+  };
+
+  /** Non-modal offer shown with the preview when an outside row is clicked. */
+  const offerMove = async (node: SessionNode | CodexNode, subject: MoveSubject): Promise<void> => {
+    if (moveUnavailable()) return;
+    const action = "Move into Editor";
+    const stop = "Stop Session";
+    const pick = await vscode.window.showInformationMessage(
+      `"${subject.title}" runs outside the editor, in ${subject.where}.`,
+      action,
+      stop
+    );
+    if (pick === action) await runMove(subject);
+    if (pick === stop) {
+      // Looked up again: the offer may have sat open while the session ended.
+      const s = sessionSubjectOf(node, "stop");
+      if (s === undefined) void vscode.window.showInformationMessage(`"${shortTitle(subject.title)}" has already stopped.`);
+      else await runStop(s);
+    }
   };
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("sessionDeck.refresh", refresh),
+    registerCommand("sessionDeck.refresh", refresh),
 
-    vscode.commands.registerCommand("sessionDeck.doctor", runDoctor),
+    registerCommand("sessionDeck.moveSession", async (arg: RowContextArg) => {
+      const node = resolveRowNode(arg);
+      const subject = moveSubjectOf(node);
+      // One line per invocation (Output > SessionDeck): tells a click that never
+      // reached the command apart from one the command turned down. Row kind and
+      // pid only, never a title or message.
+      logLine(`move command: ${node?.kind ?? "no row"}${subject !== undefined ? ` pid ${subject.pid}` : " (not movable)"}`);
+      if (subject === undefined) {
+        void vscode.window.showInformationMessage(
+          "This session can't be moved: SessionDeck only moves sessions it can see running outside the editor."
+        );
+        return;
+      }
+      await runMove(subject);
+    }),
 
-    vscode.commands.registerCommand("sessionDeck.captureDriftFixture", runCaptureDriftFixture),
+    registerCommand("sessionDeck.stopSession", async (arg: RowContextArg | RemoteSessionNode) => {
+      const node = resolveRowNode(arg as RowContextArg);
+      if (node?.kind === "remote-session") {
+        await stopRemote(node);
+        return;
+      }
+      const subject = sessionSubjectOf(node, "stop");
+      logLine(`stop command: ${node?.kind ?? "no row"}${subject !== undefined ? ` pid ${subject.pid}` : " (not stoppable)"}`);
+      if (subject === undefined) {
+        const pid = node?.kind === "session" ? node.row.meta.pid : node?.kind === "codex" ? node.row.pid : undefined;
+        void vscode.window.showInformationMessage(
+          pid === undefined || !pidAlive(pid)
+            ? "That session has already stopped."
+            : "SessionDeck can't stop this session: it stops a session only when it can tell where it runs and which process runs it."
+        );
+        return;
+      }
+      await runStop(subject);
+    }),
 
-    vscode.commands.registerCommand("sessionDeck.copyDebugReport", copyDebugReport),
+    registerCommand("sessionDeck.doctor", runDoctor),
 
-    vscode.commands.registerCommand("sessionDeck.openFloatingWindow", async () => {
+    registerCommand("sessionDeck.captureDriftFixture", runCaptureDriftFixture),
+
+    registerCommand("sessionDeck.copyDebugReport", copyDebugReport),
+
+    registerCommand("sessionDeck.openFloatingWindow", async () => {
       overviewPanel.update(buildPanelModel());
       await overviewPanel.reveal();
     }),
@@ -1835,7 +2502,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // Two ids drive one action so the title bar can show a checked-state icon
     // (list-tree when off, list-flat when on) via the activityTree context.
     ...["sessionDeck.toggleActivityTree", "sessionDeck.toggleActivityTreeActive"].map((id) =>
-      vscode.commands.registerCommand(id, async () => {
+      registerCommand(id, async () => {
         // Global setting flip; the onDidChangeConfiguration handler repaints the
         // tree + panel and re-syncs the toolbar checked-state context.
         await vscode.workspace
@@ -1850,7 +2517,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // The onDidChangeConfiguration handler repaints the tree + panel and re-syncs
     // the context; the flip is a single repaint (provider.refreshDensity).
     ...["sessionDeck.toggleDensity", "sessionDeck.toggleDensityActive"].map((id) =>
-      vscode.commands.registerCommand(id, async () => {
+      registerCommand(id, async () => {
         await vscode.workspace
           .getConfiguration("sessionDeck")
           .update(
@@ -1866,7 +2533,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // sessionDeck.columns context. The config handler repaints tree + panel and
     // re-syncs the context (provider.refreshLayout).
     ...["sessionDeck.toggleLayout", "sessionDeck.toggleLayoutActive"].map((id) =>
-      vscode.commands.registerCommand(id, async () => {
+      registerCommand(id, async () => {
         await vscode.workspace
           .getConfiguration("sessionDeck")
           .update(
@@ -1877,23 +2544,39 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       })
     ),
 
-    vscode.commands.registerCommand("sessionDeck.markAllRead", async () => {
+    registerCommand("sessionDeck.markAllRead", async () => {
       await provider.markAllRead();
       refresh();
     }),
 
-    vscode.commands.registerCommand("sessionDeck.openSession", async (node: SessionNode) => {
+    registerCommand("sessionDeck.openSession", async (node: SessionNode) => {
       provider.noteFocus({ kind: "session", id: node.row.meta.sessionId });
       await provider.markRead(node);
       refresh();
-      const navigated = navigator !== undefined && (await navigator.navigate(node.row));
+      // An outside session has no window or tab to jump to: show its last message
+      // and offer to move it here.
+      const outside = moveSubjectOf(node);
+      if (outside !== undefined) {
+        await showPreview(node);
+        void offerMove(node, outside);
+        return;
+      }
+      const navigated = navigator !== undefined && (await navigator.navigate(node.row)).ok;
       if (!navigated) await showPreview(node);
     }),
 
-    vscode.commands.registerCommand("sessionDeck.showLastMessage", async (arg: RowContextArg) => {
+    registerCommand("sessionDeck.showLastMessage", async (arg: RowContextArg) => {
       // Resolve the tree node / inbox reference / table context object to the real
       // session (the inbox is a view; the table passes a context object with the id).
       const node = resolveRowNode(arg);
+      if (node?.kind === "codex") {
+        // A Codex row's click opens the same preview: offer it here too.
+        provider.noteFocus({ kind: "codex", id: node.row.id });
+        await provider.markCodexRead(node);
+        refresh();
+        await showCodexPreview(node.row.id);
+        return;
+      }
       if (node === undefined || node.kind !== "session") return;
       provider.noteFocus({ kind: "session", id: node.row.meta.sessionId });
       await provider.markRead(node);
@@ -1901,7 +2584,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await showPreview(node);
     }),
 
-    vscode.commands.registerCommand("sessionDeck.sessionProperties", async (arg: RowContextArg) => {
+    registerCommand("sessionDeck.sessionProperties", async (arg: RowContextArg) => {
       const node = resolveRowNode(arg);
       if (node === undefined) return;
       let path: string;
@@ -1919,35 +2602,48 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // to its host via the bridge, then shows a transient status-bar note. Falls
     // back to the last-message preview when cross-host is off, we have no identity,
     // or the companion can't relay it (absent / too old to have postAction).
-    vscode.commands.registerCommand(
+    registerCommand(
       "sessionDeck.focusRemoteSession",
       async (node: RemoteSessionNode) => {
         provider.noteFocus({ kind: "remote-session", hostId: node.hostId, id: node.session.id });
-        const posted =
-          crossHostEnabled() &&
-          hostIdentity !== undefined &&
-          (await bridge.postFocus({
-            targetHostId: node.hostId,
-            sessionId: node.session.id,
-            tool: node.session.tool,
-            cwd: node.session.cwd,
-          }));
-        if (posted) {
-          const s = node.session;
-          const title = s.title !== undefined && s.title.length > 0 ? s.title : s.id.slice(0, 8);
-          vscode.window.setStatusBarMessage(
-            `$(radio-tower) Focusing ${title} on ${remoteHostLabel(node.hostId)}…`,
-            3000
-          );
-        } else {
+        const s = node.session;
+        const title = s.title !== undefined && s.title.length > 0 ? s.title : s.id.slice(0, 8);
+        const host = remoteHostLabel(node.hostId);
+        focusNote?.dispose(); // a new click replaces the last click's note
+        stopNote?.dispose(); // and a relayed stop's
+        const click = focusClicks.begin();
+        const tell = async (n: FocusNotice): Promise<void> => {
+          // A slow earlier click's note never replaces a later click's.
+          if (n.level === "status") {
+            if (focusClicks.isLatest(click)) focusNote = vscode.window.setStatusBarMessage(`$(radio-tower) ${n.text}`, FOCUS_NOTE_MS);
+          } else if (n.level === "info") void vscode.window.showInformationMessage(n.text);
+          else void vscode.window.showWarningMessage(n.text);
+          if (n.preview) await vscode.commands.executeCommand("sessionDeck.showRemoteLastMessage", node);
+        };
+        const pre = remoteFocusPrecheck(node, title, host);
+        if (pre !== undefined) return tell(pre);
+        const post =
+          crossHostEnabled() && hostIdentity !== undefined
+            ? await bridge.postFocus({ targetHostId: node.hostId, sessionId: s.id, tool: s.tool, cwd: s.cwd })
+            : { posted: false };
+        if (!post.posted) {
           await vscode.commands.executeCommand("sessionDeck.showRemoteLastMessage", node);
+          return;
+        }
+        if (post.id === undefined) return tell(focusNotice("unconfirmed", title, host));
+        const id = post.id;
+        const waiting = vscode.window.setStatusBarMessage(`$(sync~spin) Asking ${host} to show "${title}"…`);
+        try {
+          await tell(focusNotice(await waitForFocusResult(() => bridge.takeFocusResult(id)), title, host));
+        } finally {
+          waiting.dispose();
         }
       }
     ),
 
     // Cursor Agent CLI session click: focus its terminal when the live pid is
     // known and lives in this window; otherwise just surface its last activity.
-    vscode.commands.registerCommand("sessionDeck.openCursor", async (node: CursorNode) => {
+    registerCommand("sessionDeck.openCursor", async (node: CursorNode) => {
       const { row } = node;
       provider.noteFocus({ kind: "cursor", id: row.chatId });
       await provider.markCursorRead(node);
@@ -1957,15 +2653,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // launched from a subdirectory of the workspace. Only if no local terminal
       // owns the pid do we relay cross-window (which also raises the owning window),
       // then fall back to a last-activity note.
-      if (row.pid !== undefined && (await focusLocalTerminal(row.pid))) return;
-      if (navigator !== undefined && (await navigator.navigateCursor({ cwd: row.cwd, kind: "cli", pid: row.pid }))) return;
+      // The result tells a remote request's report what actually happened.
+      if (row.pid !== undefined && (await focusLocalTerminal(row.pid))) return "shown";
+      if (navigator !== undefined && (await navigator.navigateCursor({ cwd: row.cwd, kind: "cli", pid: row.pid }))) return "handed-off";
       const pidNote = row.pid !== undefined ? ` (pid ${row.pid})` : "";
       void vscode.window.showInformationMessage(
         `${row.name} — Cursor Agent, last activity ${fmtAge(row.ageSec)} ago${pidNote}.`
       );
+      return "preview";
     }),
 
-    vscode.commands.registerCommand("sessionDeck.openComposer", async (node: ComposerNode) => {
+    registerCommand("sessionDeck.openComposer", async (node: ComposerNode) => {
       if (node === undefined) return;
       await provider.markComposerRead(node);
       const { row } = node;
@@ -1979,19 +2677,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     // Codex CLI session click: focus its terminal when the live pid is known and
     // lives in this window; otherwise just surface its last activity.
-    vscode.commands.registerCommand("sessionDeck.openCodex", async (node: CodexNode) => {
+    registerCommand("sessionDeck.openCodex", async (node: CodexNode) => {
       const { row } = node;
       provider.noteFocus({ kind: "codex", id: row.id });
       await provider.markCodexRead(node);
       refresh();
-      if (row.pid !== undefined && (await focusLocalTerminal(row.pid))) return;
-      const pidNote = row.pid !== undefined ? ` (pid ${row.pid})` : "";
-      void vscode.window.showInformationMessage(
-        `${row.name} — ${row.kind}, last activity ${fmtAge(row.ageSec)} ago${pidNote}.`
-      );
+      if (row.pid !== undefined && (await focusLocalTerminal(row.pid))) return "shown";
+      // The last reply, as a Claude row's click shows it, plus the Move offer
+      // for a run outside the editor.
+      await showCodexPreview(row.id);
+      const outside = moveSubjectOf(node);
+      if (outside !== undefined) {
+        await offerMove(node, outside);
+        return "outside";
+      }
+      return "preview";
     }),
 
-    vscode.commands.registerCommand(
+    registerCommand(
       "sessionDeck.openProject",
       async (node: ProjectNode | { cwd?: string }) => {
         // The table view passes a { cwd } context object; the tree passes a ProjectNode
@@ -2004,7 +2707,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     ),
 
-    vscode.commands.registerCommand("sessionDeck.setSort", async () => {
+    registerCommand("sessionDeck.setSort", async () => {
       const items: Array<vscode.QuickPickItem & { id: SortMode }> = [
         { id: "activity", label: "Last activity", description: "most recently active first" },
         { id: "heat", label: "Heat", description: "projects with the most attention pressure first" },
@@ -2018,22 +2721,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
 
-    vscode.commands.registerCommand("sessionDeck.setFilter", pickFilter),
-    vscode.commands.registerCommand("sessionDeck.setFilterFilled", pickFilter),
+    registerCommand("sessionDeck.setFilter", pickFilter),
+    registerCommand("sessionDeck.setFilterFilled", pickFilter),
 
     // Pin / unpin a project (context menu, contextValue-gated) and hide a LOCAL
     // session row. Show Hidden opens the unhide picker.
-    vscode.commands.registerCommand("sessionDeck.pinProject", async (node: ProjectNode) => {
+    registerCommand("sessionDeck.pinProject", async (node: ProjectNode) => {
       if (node?.cwd === undefined) return;
       await provider.pinProject(node.cwd);
       refresh();
     }),
-    vscode.commands.registerCommand("sessionDeck.unpinProject", async (node: ProjectNode) => {
+    registerCommand("sessionDeck.unpinProject", async (node: ProjectNode) => {
       if (node?.cwd === undefined) return;
       await provider.unpinProject(node.cwd);
       refresh();
     }),
-    vscode.commands.registerCommand(
+    registerCommand(
       "sessionDeck.hideSession",
       async (arg: RowContextArg) => {
         // Tree node, inbox reference (hides the REAL row), or table context object.
@@ -2043,15 +2746,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         refresh();
       }
     ),
-    vscode.commands.registerCommand("sessionDeck.dismissOrphans", async () => {
+    registerCommand("sessionDeck.dismissOrphans", async () => {
       await provider.hideOrphans();
       refresh();
     }),
-    vscode.commands.registerCommand("sessionDeck.showHidden", pickHidden),
+    registerCommand("sessionDeck.showHidden", pickHidden),
 
     // Status-bar chip click: reveal SessionDeck and filter to attention so
     // the sessions needing you are all that's left in the tree.
-    vscode.commands.registerCommand("sessionDeck.triage", async () => {
+    registerCommand("sessionDeck.triage", async () => {
       await vscode.commands.executeCommand("workbench.view.extension.sessionDeck");
       await provider.setFilterMode("attention");
       refresh();
@@ -2059,14 +2762,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     // Keyboard triage: step to the next / previous session needing you (default
     // ctrl+alt+] / ctrl+alt+[), open it, and reveal the row — no mouse required.
-    vscode.commands.registerCommand("sessionDeck.nextAttention", () => triageStep(1)),
-    vscode.commands.registerCommand("sessionDeck.prevAttention", () => triageStep(-1)),
+    registerCommand("sessionDeck.nextAttention", () => triageStep(1)),
+    registerCommand("sessionDeck.prevAttention", () => triageStep(-1)),
 
     // Return to the last session you focused (survives re-sorts / density flips
     // that rotate tree-item ids and drop VS Code's own selection).
-    vscode.commands.registerCommand("sessionDeck.returnToFocus", returnToFocus),
+    registerCommand("sessionDeck.returnToFocus", returnToFocus),
 
-    vscode.commands.registerCommand("sessionDeck.collapseAll", () => {
+    registerCommand("sessionDeck.collapseAll", () => {
       // The columns TABLE view owns its own webview collapse state; the list view is
       // the sidebar tree. They are mutually exclusive (sessionDeck.columns gates
       // which one shows), so route to whichever is live.
@@ -2075,18 +2778,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       void vscode.commands.executeCommand("setContext", "sessionDeck.collapsed", true);
     }),
 
-    vscode.commands.registerCommand("sessionDeck.expandAll", () => {
+    registerCommand("sessionDeck.expandAll", () => {
       if (collapseTarget(layoutOf()) === "table") tableView.setAllCollapsed(false);
       else provider.setAllCollapsed(false);
       void vscode.commands.executeCommand("setContext", "sessionDeck.collapsed", false);
     }),
 
-    vscode.commands.registerCommand("sessionDeck.clearFilter", async () => {
+    registerCommand("sessionDeck.clearFilter", async () => {
       await provider.setFilterMode("all");
       refresh();
     }),
 
-    vscode.commands.registerCommand("sessionDeck.installHooks", () => {
+    registerCommand("sessionDeck.installHooks", () => {
       try {
         installHooks(computeHomes());
         eventsWatcher?.close();
@@ -2103,7 +2806,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
 
-    vscode.commands.registerCommand("sessionDeck.removeHooks", () => {
+    registerCommand("sessionDeck.removeHooks", () => {
       try {
         removeHooks(computeHomes());
         syncHooksContext();
@@ -2116,7 +2819,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
 
-    vscode.commands.registerCommand("sessionDeck.enableCursorMonitoring", () => {
+    registerCommand("sessionDeck.enableCursorMonitoring", () => {
       try {
         enableCursorMonitoring();
         syncTopologyContext();
@@ -2127,7 +2830,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
 
-    vscode.commands.registerCommand("sessionDeck.disableCursorMonitoring", () => {
+    registerCommand("sessionDeck.disableCursorMonitoring", () => {
       try {
         disableCursorMonitoring();
         syncTopologyContext();
@@ -2138,7 +2841,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
     }),
 
-    vscode.commands.registerCommand("sessionDeck.removeAllIntegrations", () => {
+    registerCommand("sessionDeck.removeAllIntegrations", () => {
       const results: string[] = [];
       let failed = false;
       try { removeHooks(computeHomes()); results.push("Claude hooks: removed"); }
@@ -2155,7 +2858,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     // Enter a license key: InputBox with LIVE validation (shape + modulo + expiry
     // feedback). On success the key is saved to settings and the tree re-renders.
-    vscode.commands.registerCommand("sessionDeck.enterLicenseKey", async () => {
+    registerCommand("sessionDeck.enterLicenseKey", async () => {
       const cfg = vscode.workspace.getConfiguration("sessionDeck");
       const value = await vscode.window.showInputBox({
         title: "Enter License Key",
@@ -2169,7 +2872,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // Arm before the repaint is requested, then confirm only once the Sessions
       // tree and the Control Panel have fetched the new state (or a hidden view's
       // timeout passed), so the toast never runs ahead of what the views show.
-      const repainted = Promise.all([provider.rootFetch.wait(1500), controlPanel.rootFetch.wait(1500)]);
+      const repainted = Promise.all([provider.rootFetch.wait(1500), controlPanel?.rootFetch.wait(1500)]);
       provider.forceReload();
       if (overviewPanel.isOpen()) overviewPanel.update(buildPanelModel());
       refresh();
@@ -2188,12 +2891,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // src/license.ts (the sessiondeck.dev checkout anchor). Internal callers pass
     // an entry-point tag (utm_content); menu invocations pass a tree element, so
     // only a string counts.
-    vscode.commands.registerCommand("sessionDeck.buyLicense", (content?: unknown) => {
+    registerCommand("sessionDeck.buyLicense", (content?: unknown) => {
       void vscode.env.openExternal(vscode.Uri.parse(buyUrl(typeof content === "string" ? content : undefined)));
+    }),
+    // The Control Panel's Buy row: argument-free (tree rows must be), same page,
+    // tagged as coming from the panel.
+    registerCommand("sessionDeck.buyLicenseFromPanel", () => {
+      void vscode.env.openExternal(vscode.Uri.parse(buyUrl("panel")));
     }),
 
     // Free-tier status-bar item click → QuickPick.
-    vscode.commands.registerCommand("sessionDeck.licenseMenu", async () => {
+    registerCommand("sessionDeck.licenseMenu", async () => {
       const pick = await vscode.window.showQuickPick(
         [
           { label: "$(key) Enter License Key", id: "enter" as const },
@@ -2212,25 +2920,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     // Open the full, never-truncated "What's included" feature list as a rendered
     // markdown document (replaces the truncated showInformationMessage path).
-    vscode.commands.registerCommand("sessionDeck.whatsIncluded", async () => {
+    registerCommand("sessionDeck.whatsIncluded", async () => {
       const uri = vscode.Uri.from({ scheme: LICENSE_SCHEME, path: "/What's included.md" });
       await vscode.commands.executeCommand("markdown.showPreview", uri);
     }),
 
-    registerLicenseDebugCommand({
-      context,
-      suspendTrialMerge: () => {
-        trialMergeSuspended = true;
-      },
-      provider,
-      refresh,
-      refreshPanel: () => {
-        if (overviewPanel.isOpen()) overviewPanel.update(buildPanelModel());
-      },
-    })
+    health.run(
+      "license debug command",
+      "the license debug command",
+      () =>
+        registerLicenseDebugCommand({
+          context,
+          suspendTrialMerge: () => {
+            trialMergeSuspended = true;
+          },
+          provider,
+          refresh,
+          refreshPanel: () => {
+            if (overviewPanel.isOpen()) overviewPanel.update(buildPanelModel());
+          },
+        }),
+      { dispose: () => undefined }
+    )
   );
 
-  refresh();
+  // The first session scan. A throw here leaves the tree empty until the 3 s
+  // refresh succeeds; every command is registered by now.
+  health.run("first refresh", "the first session scan", refresh, undefined);
 }
 
-export function deactivate(): void {}
+export function deactivate(): void {
+  logChannel?.dispose();
+  logChannel = undefined;
+}

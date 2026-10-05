@@ -297,6 +297,9 @@ export interface DoctorProbes {
   /** Age of the shared /proc census cache in seconds (one probe feeds all three
    *  liveness scans); undefined before the first census runs. */
   procCensusAgeSec?: number;
+  /** Did the start time Claude Code records for each running session match this
+   *  OS's process table? (Confirms the macOS/Windows formats in the field.) */
+  procStartMatch?: { matched: number; mismatched: number; unchecked: number; noStart?: number };
   // 8 — editor CLI
   editorCli: string;
   editorCliSource: "editorCliPath" | "cursorCliPath" | "default";
@@ -327,6 +330,115 @@ export interface DoctorProbes {
   licenseKeyExpiredThrough?: string;
   // 14 — refresh tick watchdog (ring-buffer of per-phase tick timings + latch)
   watchdog: WatchdogSummary;
+  // 15 — startup steps that failed this activation (see StartupHealth)
+  startupFailures?: readonly StartupFailure[];
+  // 16 — settings keys whose save failed in this window (names only, never values)
+  unsavedKeys?: readonly string[];
+}
+
+// ============================================================================
+// Startup health: activation runs a long list of setup steps, and a throw in any
+// of them used to abort activate() before most commands were registered, so every
+// click ended in "command not found". Each optional step now runs through
+// StartupHealth.run(): a throw is recorded with the feature it costs, logged, and
+// the step's fallback is used so activation carries on. Pure (no vscode); the
+// extension shows the notice, gates the commands that need a failed step, and
+// lists the failures in Diagnostics through startupCheck(). Lives here (module
+// freeze) because its only reader besides extension.ts is the Diagnostics report.
+
+/** Step name for a throw no step caught: activation stopped where it was. */
+export const ACTIVATION_STEP = "activation";
+
+export interface StartupFailure {
+  /** Step name, as passed to run() (also the fault-injection key in tests). */
+  step: string;
+  /** What the user loses, in plain words ("the cross-host bridge"). */
+  feature: string;
+  error: string;
+}
+
+export class StartupHealth {
+  readonly failures: StartupFailure[] = [];
+
+  /** `inject`: step names that throw on purpose (activation tests only). */
+  constructor(
+    private readonly log: (line: string) => void = () => undefined,
+    private readonly inject: ReadonlySet<string> = new Set()
+  ) {}
+
+  /** Run one startup step. A throw is recorded and `fallback` returned instead. */
+  run<T>(step: string, feature: string, fn: () => T, fallback: T): T {
+    try {
+      if (this.inject.has(step)) throw new Error(`injected failure in ${step}`);
+      return fn();
+    } catch (err) {
+      this.record(step, feature, err);
+      return fallback;
+    }
+  }
+
+  /** run() for a step that awaits: a rejection is recorded like a throw. */
+  async runAsync<T>(step: string, feature: string, fn: () => Promise<T>, fallback: T): Promise<T> {
+    try {
+      if (this.inject.has(step)) throw new Error(`injected failure in ${step}`);
+      return await fn();
+    } catch (err) {
+      this.record(step, feature, err);
+      return fallback;
+    }
+  }
+
+  record(step: string, feature: string, err: unknown): void {
+    const error = err instanceof Error ? err.message : String(err);
+    this.failures.push({ step, feature, error });
+    const stack = err instanceof Error && err.stack !== undefined ? `\n${err.stack}` : "";
+    // The recorder must never fail: activation's last-resort path calls it too.
+    try {
+      this.log(`startup: ${step} failed, ${feature} unavailable: ${error}${stack}`);
+    } catch {
+      // no output channel; the failure is still recorded for the notice and Diagnostics
+    }
+  }
+
+  /** The first recorded failure among `steps`, if any. */
+  blockedBy(steps: readonly string[]): StartupFailure | undefined {
+    return this.failures.find((f) => steps.includes(f.step));
+  }
+
+  /** The one notice shown after activation, or undefined when nothing failed. */
+  notice(): string | undefined {
+    if (this.failures.length === 0) return undefined;
+    const aborted = this.blockedBy([ACTIVATION_STEP]);
+    if (aborted !== undefined) {
+      // Fixed text only: an error message can carry a home path or a username.
+      // The error itself goes to the output channel (record()).
+      return "SessionDeck could not finish starting. Its commands will say so instead of running. Details are in Output > SessionDeck.";
+    }
+    const features = [...new Set(this.failures.map((f) => f.feature))];
+    return `SessionDeck started without ${features.join(", ")}. Everything else works. Details are in Output > SessionDeck and in Diagnostics.`;
+  }
+}
+
+/** Diagnostics line for saved state: key names only, never their values. */
+export function storageCheck(keys: readonly string[]): DoctorCheck {
+  if (keys.length === 0) return { mark: "ok", title: "Storage", detail: "settings save normally" };
+  return {
+    mark: "problem",
+    title: "Storage",
+    detail: `some settings could not be saved: ${keys.join(", ")}`,
+    fix: "check free disk space and permissions on the editor's user data folder, then reload the window",
+  };
+}
+
+/** Diagnostics line for the startup steps: one problem line naming each failure. */
+export function startupCheck(failures: readonly StartupFailure[]): DoctorCheck {
+  if (failures.length === 0) return { mark: "ok", title: "Startup", detail: "every subsystem started" };
+  return {
+    mark: "problem",
+    title: "Startup",
+    detail: failures.map((f) => `${f.step} failed (${f.feature} unavailable): ${f.error}`).join("; "),
+    fix: "reload the window ('Developer: Reload Window'); if it keeps failing, run 'SessionDeck: Copy Debug Report' and file it",
+  };
 }
 
 const GLYPH: Record<DoctorMark, string> = { problem: "✗", info: "–", ok: "✓" };
@@ -556,6 +668,41 @@ function procsCheck(p: DoctorProbes): DoctorCheck {
   };
 }
 
+/** One line: did the registry's procStart match the process table on this OS. */
+export function procStartCheck(p: DoctorProbes): DoctorCheck | undefined {
+  const m = p.procStartMatch;
+  if (m === undefined) return undefined;
+  const title = "Session start times";
+  const compared = m.matched + m.mismatched;
+  const noStart = m.noStart ?? 0;
+  const notes = [
+    ...(m.unchecked > 0 ? [`${m.unchecked} could not be read`] : []),
+    ...(noStart > 0 ? [`${noStart} more ${noStart === 1 ? "has" : "have"} no start time recorded, so could not be compared`] : []),
+  ];
+  const unread = notes.length > 0 ? ` (${notes.join("; ")})` : "";
+  if (compared === 0) {
+    if (noStart > 0) {
+      const n = noStart === 1 ? "1 running session has" : `${noStart} running sessions have`;
+      const read = m.unchecked > 0 ? ` (${m.unchecked} more could not be read)` : "";
+      return { mark: "ok", title, detail: `on ${p.procPlatform}, ${n} no start time recorded, so nothing could be compared${read}` };
+    }
+    return { mark: "ok", title, detail: `on ${p.procPlatform}, no running sessions to compare yet${unread}` };
+  }
+  if (m.mismatched === 0) {
+    return {
+      mark: "ok",
+      title,
+      detail: `on ${p.procPlatform}, the start time Claude Code records matched the process table for ${m.matched} of ${compared} running sessions${unread}`,
+    };
+  }
+  return {
+    mark: "info",
+    title,
+    detail: `on ${p.procPlatform}, the start time Claude Code records did not match the process table for ${m.mismatched} of ${compared} running sessions${unread}. Move into Editor and Stop Session will not stop these sessions`,
+    fix: "please report this line with your OS version",
+  };
+}
+
 function editorCliCheck(p: DoctorProbes): DoctorCheck {
   const src =
     p.editorCliSource === "default"
@@ -702,6 +849,8 @@ function licenseCheck(p: DoctorProbes): DoctorCheck {
 export function doctorChecks(p: DoctorProbes): DoctorCheck[] {
   const fh = p.formatHealth;
   return [
+    ...(p.startupFailures !== undefined ? [startupCheck(p.startupFailures)] : []),
+    ...(p.unsavedKeys !== undefined ? [storageCheck(p.unsavedKeys)] : []),
     homesCheck(p),
     hooksCheck(p),
     cursorMonitoringCheck(p),
@@ -711,6 +860,7 @@ export function doctorChecks(p: DoctorProbes): DoctorCheck[] {
     titlesCheck(p),
     sqliteCheck(p),
     procsCheck(p),
+    ...(procStartCheck(p) !== undefined ? [procStartCheck(p)!] : []),
     editorCliCheck(p),
     notificationsCheck(p),
     unfocusedAlertsCheck(p),

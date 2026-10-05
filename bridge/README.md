@@ -12,7 +12,7 @@ this companion on your desktop automatically. If you installed SessionDeck from 
 ## What it does
 
 It has no UI, no views, no settings of its own, and does no network I/O. It
-registers ten commands that SessionDeck windows call across extension hosts,
+registers twelve commands that SessionDeck windows call across extension hosts,
 and owns a small aggregation store:
 
 - `sessionDeckBridge.hello()` — availability and version handshake.
@@ -38,6 +38,10 @@ and owns a small aggregation store:
   — a click on a session that lives on another host is queued here and picked up
   by that host's window, which then focuses the session. Queued clicks expire
   after one minute.
+- `sessionDeckBridge.postFocusResult(result)` / `sessionDeckBridge.takeFocusResult(id)`
+  — the window that acted on a click reports what happened (shown, runs outside
+  the editor, not found, or failed and why), and the window you clicked in tells
+  you. Unread reports are deleted after two minutes.
 
 ## Where data is stored
 

@@ -6,6 +6,7 @@ import {
   ReuseHint,
   fmtAge,
   sessionHasDetails,
+  withSubMinuteAgesMasked,
   sessionDetails,
   promptFallbackTitle,
   sessionBirthMs,
@@ -23,15 +24,21 @@ import {
 import { ConfigHome } from "./homes";
 import { CursorRow, ComposerRow } from "./cursor";
 import { CodexRow } from "./codex";
-import { sessionResourceUri, dimResourceUri } from "./decorations";
+import { editorFamilyRoots, LocationVerdict, pidHasOpen, sessionLocation } from "./procs";
+import { sessionResourceUri, dimResourceUri, outsideResourceUri, PreviewDocs } from "./decorations";
 import {
   glyphParts,
+  outsideSentence,
+  cliKindWord,
   ageBucket,
+  previewDocPath,
   statusKind,
   fleetHeatScore,
   projectExpanded,
   compareProjectNames,
   projectDisplayName,
+  normalizeDriveLetter,
+  normalizePinKeys,
   RootFetchSignal,
   hiddenDescription,
   localNeedsYou,
@@ -119,6 +126,7 @@ import {
   buildTriageSet,
   buildInbox,
   INBOX_ID_PREFIX,
+  type InboxRef,
   advanceTriageCursor,
   TriageTarget,
   FocusRef,
@@ -171,6 +179,48 @@ export class InboxRefNode {
     /** The real tree node the reference points at (click/menu/focus act on this). */
     readonly target: TriageNode
   ) {}
+}
+
+/** Live-node lookups by id (the provider's find* methods). */
+export interface RowFinders {
+  session(id: string): SessionNode | undefined;
+  cursor(id: string): CursorNode | undefined;
+  codex(id: string): CodexNode | undefined;
+  composer(id: string): ComposerNode | undefined;
+}
+
+/** The live row a row command acts on. A tree command receives the node object
+ *  VS Code rendered, which a refresh since may have replaced (an inline action
+ *  clicked on a row rendered a tick earlier): it is looked up again by id so
+ *  the command sees the current row, falling back to the object it got. An
+ *  inbox reference acts on the row it mirrors; a table context object carries
+ *  only an id. */
+export function resolveRowArg(
+  arg: unknown,
+  find: RowFinders
+): SessionNode | CursorNode | ComposerNode | CodexNode | RemoteSessionNode | undefined {
+  if (arg === null || typeof arg !== "object") return undefined;
+  const a = arg as {
+    kind?: string;
+    target?: unknown;
+    row?: { meta?: { sessionId?: string }; chatId?: string; id?: string; conversationId?: string };
+    sessionId?: unknown;
+    chatId?: unknown;
+    codexId?: unknown;
+    conversationId?: unknown;
+  };
+  if (a.kind === "inbox-ref") return resolveRowArg(a.target, find);
+  if (a.kind === "session") return (a.row?.meta?.sessionId !== undefined ? find.session(a.row.meta.sessionId) : undefined) ?? (arg as SessionNode);
+  if (a.kind === "cursor") return (a.row?.chatId !== undefined ? find.cursor(a.row.chatId) : undefined) ?? (arg as CursorNode);
+  if (a.kind === "codex") return (a.row?.id !== undefined ? find.codex(a.row.id) : undefined) ?? (arg as CodexNode);
+  if (a.kind === "composer") return (a.row?.conversationId !== undefined ? find.composer(a.row.conversationId) : undefined) ?? (arg as ComposerNode);
+  if (a.kind === "remote-session") return arg as RemoteSessionNode;
+  if (a.kind !== undefined) return undefined;
+  if (typeof a.sessionId === "string") return find.session(a.sessionId);
+  if (typeof a.chatId === "string") return find.cursor(a.chatId);
+  if (typeof a.codexId === "string") return find.codex(a.codexId);
+  if (typeof a.conversationId === "string") return find.composer(a.conversationId);
+  return undefined;
 }
 
 /** The collapsible "Needs you (N)" command-center section rendered FIRST at root
@@ -418,6 +468,153 @@ type Node =
   | LicenseNoteNode
   | CollisionNoteNode;
 
+// ---- Row identity across refreshes -----------------------------------------
+// VS Code's extension host maps each rendered row's handle (its TreeItem id) to the
+// element object it was given. A full refresh (onDidChangeTreeData with no element)
+// clears that map at once (ExtHostTreeView._addAllToClear) and it fills again only
+// when the window asks for the rows (a round trip, slow over SSH); a click or an
+// inline action in that gap resolves to nothing. An element refresh re-reads that
+// one row in place (_refreshNode) and keeps every other row resolvable, but it only
+// works on the SAME object the host already holds. So each row object lives as long
+// as its row does, keyed by `rowKey`, and every reload updates it in place.
+
+/** The stable identity of a row: what it shows, never where it sits. Two rows never
+ *  share a key in one render (reload drops a repeat); a row's TreeItem id is derived
+ *  from its key, so a handle can only ever name this row. */
+export function rowKey(n: Node): string {
+  switch (n.kind) {
+    case "inbox":
+      return "inbox";
+    case "inbox-ref":
+      return n.refId;
+    case "project":
+      return (n.synthetic ? "wtparent:" : "project:") + n.cwd;
+    case "session":
+      return "session:" + n.row.meta.sessionId;
+    case "cursor":
+      return "cursor:" + n.row.chatId;
+    case "composer":
+      return "composer:" + n.row.conversationId;
+    case "codex":
+      return "codex:" + n.row.id;
+    case "orphan":
+      return "orphan";
+    case "host":
+      return "host:" + n.snapshot.host.id;
+    case "remote-project":
+      return `remote-project:${n.hostId}:${n.cwd}`;
+    case "remote-session":
+      return `remote-session:${n.hostId}:${n.session.id}`;
+    case "remote-child":
+      return n.id;
+    case "workflow":
+      return "workflow:" + n.detail.path;
+    case "agent":
+      return `agent:${n.parent}:${n.detail.path}`;
+    case "task":
+      return `task:${n.detail.path}:${n.detail.id}`;
+    case "capability-note":
+    case "hidden-note":
+    case "license-note":
+    case "collision-note":
+      return n.kind;
+  }
+}
+
+/** The child lists a row keeps across reloads (the lazily built activity children of
+ *  a session or remote session are rebuilt on every fetch and are not listed). */
+const KEPT_CHILDREN: Partial<Record<Node["kind"], readonly string[]>> = {
+  inbox: ["refs"],
+  project: ["sessions", "cursors", "codexes", "composers", "worktrees"],
+  session: ["codexChildren", "cursorChildren"],
+  orphan: ["cursors", "codexes"],
+  host: ["projects"],
+  "remote-project": ["sessions"],
+};
+
+/** How long "Needs you" keeps a row that stopped needing you (see
+ *  SessionsProvider.settleInbox), and how long any group keeps its old order after
+ *  its rows last changed (holdOrder): five 3 s ticks. A session turning over
+ *  every tick then re-fetches its group at most about once every 15 s instead of
+ *  every tick; a row lingers, or sits out of order, for at most 15 s. */
+export const SETTLE_MS = 15_000;
+
+/** Rows that only group other rows: their own line summarises the rows under them
+ *  (see SessionsProvider.groupOpen). */
+const GROUP_KINDS: ReadonlySet<string> = new Set(["inbox", "project", "orphan", "host", "remote-project"]);
+
+/** Rows whose open/folded state is tracked: groups, and sessions with activity rows. */
+const FOLDABLE_KINDS: ReadonlySet<string> = new Set([...GROUP_KINDS, "session", "remote-session"]);
+
+function keptChildren(n: Node): Node[] {
+  const out: Node[] = [];
+  for (const f of KEPT_CHILDREN[n.kind] ?? []) out.push(...((n as unknown as Record<string, Node[]>)[f] ?? []));
+  return out;
+}
+
+/** What a row shows, as one comparable string: everything VS Code renders,
+ *  hover text included, except the command's arguments (the row object itself).
+ *  Build `item` under withSubMinuteAgesMasked: sub-minute ages ("45s") then
+ *  compare equal, as the old whole-tree signature did, so a young row repaints at
+ *  the minute rollover, not every 3 s, while a "1s" inside a message still counts.
+ *
+ *  The hover is compared rather than produced on demand (resolveTreeItem): the
+ *  window resolves a row's hover once and keeps it until that row is refreshed
+ *  (ResolvableTreeItem.resolved), so on-demand hovers would still go stale after
+ *  the first look. Refreshing a row keeps it and every other row clickable; only
+ *  rows under it are dropped for a round trip, and an open group's hover holds
+ *  nothing that changes without its rows (see SessionsProvider.groupOpen). */
+export function renderSignature(item: vscode.TreeItem): string {
+  const cmd = item.command;
+  const tip = item.tooltip;
+  return JSON.stringify([
+      typeof tip === "string" || tip === undefined ? tip ?? null : tip.value,
+      item.label,
+      item.description ?? null,
+      item.iconPath ?? null,
+      item.resourceUri?.toString() ?? null,
+      item.contextValue ?? null,
+      item.collapsibleState ?? null,
+      cmd === undefined ? null : [cmd.command, cmd.title, cmd.tooltip ?? null],
+      item.accessibilityInformation ?? null,
+    ]);
+}
+
+/** How recent a row is, in coarse tiers: under 2 minutes, 10 minutes, an hour, a
+ *  day, older. Recency sorts compare tiers and keep the previous order within one,
+ *  so busy rows don't trade places on every write: a reorder re-fetches the whole
+ *  group, and at the root the whole tree (see fireTreeChanges). A row that becomes
+ *  active still moves up past every row in an older tier, within SETTLE_MS (see
+ *  holdOrder). */
+export function recencyTier(ageMs: number): number {
+  if (!Number.isFinite(ageMs)) return 5;
+  const min = Math.max(0, ageMs) / 60_000;
+  return min < 2 ? 0 : min < 10 ? 1 : min < 60 ? 2 : min < 1440 ? 3 : 4;
+}
+
+/** One refreshed-tree event, counted for the refresh tests and Diagnostics. */
+export interface TreeEventCounts {
+  /** Full refreshes (every row cleared until the window fetches again). */
+  full: number;
+  /** Element refreshes fired, and how many rows they named. */
+  partial: number;
+  rows: number;
+}
+
+interface RenderedRow {
+  node: Node;
+  parent: string | undefined;
+  id: string;
+  sig: string;
+  /** The children's ids, in order: a change re-fetches the group. */
+  kids: string;
+  /** The kept children's keys, in order (see holdOrder). */
+  childKeys: string[];
+}
+
+/** The key holdOrder uses for the root's own list. */
+const ROOT_KEY = "";
+
 // The lists live in bridgeSchema so the remote legacy-state import accepts every mode.
 export type SortMode = (typeof SORT_MODES)[number];
 export type FilterMode = (typeof FILTER_MODES)[number];
@@ -437,6 +634,113 @@ const BASELINE_KEY = "unreadBaseline";
 /** First-ever-activation stamp for the 3-day free evaluation. Set ONCE and never
  *  moved, so the trial can't be reset by clearing/re-adding a key. */
 export const TRIAL_START_KEY = "licenseTrialStart";
+
+/** When this install first started while its trial origin was still unknown
+ *  (a rename migration that failed). The trial clock runs from here meanwhile. */
+export const FIRST_SEEN_KEY = "trialFirstSeenAt";
+/** Starts in a row whose rename migration failed before a trial start was saved. */
+export const MIGRATION_FAILURES_KEY = "renameMigrationFailures";
+
+/** The trial origin to count from: the saved start, else the first start this
+ *  install recorded while waiting for the former extension's state, else now
+ *  (only before anything was ever saved, i.e. the first activation). */
+export function trialOrigin(state: vscode.Memento, now: number): number {
+  return state.get<number>(TRIAL_START_KEY) ?? state.get<number>(FIRST_SEEN_KEY) ?? now;
+}
+
+export interface TrialStartInput {
+  saved?: number;
+  firstSeen?: number;
+  failures: number;
+  migrationFailed: boolean;
+  /** A trial-ended latch is set: the trial is known to have ended. */
+  endedLatch: boolean;
+  /** When this install last saw the trial running (trialSeenAt). */
+  seenAt?: number;
+  now: number;
+  maxAttempts: number;
+  trialMs: number;
+}
+
+export interface TrialStartDecision {
+  /** Trial start to save now. */
+  stamp?: number;
+  /** First-seen time to save (the first failed start). */
+  firstSeen?: number;
+  /** Failed-migration count to save. */
+  failures?: number;
+  /** The trial origin is final for this activation. */
+  settled: boolean;
+}
+
+/** Which trial start to save at activation. The former extension's state can hold
+ *  an older (maybe ended) trial start; the migration copies only missing keys, so
+ *  stamping one while that state is unread would block the older one for good.
+ *  So while the migration fails nothing is stamped, for at most `maxAttempts`
+ *  starts; the clock meanwhile runs from the first of them (trialOrigin). At the
+ *  cap, or once the migration works, the start saved is never later than that
+ *  first start, nor than the trial was last seen running, and when a latch says
+ *  the trial already ended it is at least `trialMs` back. */
+export function decideTrialStart(i: TrialStartInput): TrialStartDecision {
+  // Failures are counted even with a start saved: the count also caps how long an
+  // unreadable state database keeps being reported.
+  if (i.saved !== undefined) return i.migrationFailed ? { failures: i.failures + 1, settled: true } : { settled: true };
+  const earliest = (first: number): number => {
+    let t = first;
+    if (i.seenAt !== undefined && Number.isFinite(i.seenAt) && i.seenAt < t) t = i.seenAt;
+    if (i.endedLatch) t = Math.min(t, i.now - i.trialMs);
+    return t;
+  };
+  if (!i.migrationFailed) return { stamp: earliest(i.firstSeen ?? i.now), settled: true };
+  const firstSeen = i.firstSeen ?? i.now;
+  const failures = i.failures + 1;
+  const out: TrialStartDecision = { failures, settled: false };
+  if (i.firstSeen === undefined) out.firstSeen = firstSeen;
+  if (failures >= i.maxAttempts) {
+    out.stamp = earliest(firstSeen);
+    out.settled = true;
+  }
+  return out;
+}
+
+// Keys whose save failed in this window (this extension host), each reported once.
+const unsavedKeys = new Set<string>();
+let reportFailedSave: (key: string, err: unknown) => void = () => undefined;
+
+/** Who hears about a failed save (once per key per window): the extension logs
+ *  it and, for state that matters across restarts, adds it to the startup notice. */
+export function onFailedSave(report: (key: string, err: unknown) => void): void {
+  reportFailedSave = report;
+  unsavedKeys.clear(); // a new activation: report afresh
+}
+
+/** Keys that could not be saved in this window, for Diagnostics. Read marks are
+ *  per session; they are folded into one entry so no session id is listed. */
+export function unsavedSettingKeys(): string[] {
+  return [...unsavedKeys];
+}
+
+function noteFailedSave(key: string, err: unknown): void {
+  try {
+    const shown = key.startsWith(LAST_SEEN_PREFIX) ? `${LAST_SEEN_PREFIX}*` : key;
+    if (unsavedKeys.has(shown)) return;
+    unsavedKeys.add(shown);
+    reportFailedSave(shown, err);
+  } catch {
+    // reporting must never fail the caller
+  }
+}
+
+/** Save one value without waiting. Never throws or rejects: a failed write
+ *  (broken state storage) is reported once per key (onFailedSave) and dropped;
+ *  the value is written again the next time it changes or on the next activation. */
+export function saveQuietly(state: vscode.Memento, key: string, value: unknown): void {
+  try {
+    Promise.resolve(state.update(key, value)).catch((err: unknown) => noteFailedSave(key, err));
+  } catch (err) {
+    noteFailedSave(key, err);
+  }
+}
 const SORT_KEY = "sortMode";
 const FILTER_KEY = "filterMode";
 const HIDDEN_TYPES_KEY = "hiddenAgentTypes";
@@ -579,8 +883,29 @@ function childHover(title: string, path: string, lines: string[]): string {
 }
 
 export class SessionsProvider implements vscode.TreeDataProvider<Node> {
-  private readonly emitter = new vscode.EventEmitter<void>();
+  private readonly emitter = new vscode.EventEmitter<Node[] | undefined>();
   readonly onDidChangeTreeData = this.emitter.event;
+
+  /** Row objects by rowKey, kept across reloads (see "Row identity across refreshes"). */
+  private rowCache = new Map<string, Node>();
+  /** Each row as the last reload rendered it, by rowKey. */
+  private rendered = new Map<string, RenderedRow>();
+  /** The root rows' ids from the last reload, in order. */
+  private renderedRootIds = "";
+  /** The root rows, built by reload (getChildren(root) only hands them out). */
+  private rootChildren: Node[] = [];
+  /** Each row's position in its group at the last reload, the tie-break that keeps
+   *  same-minute rows in place. */
+  private lastOrder = new Map<string, number>();
+  /** The next reload redraws the whole tree (first render, or a view setting changed). */
+  private fullRefreshDue = true;
+  /** Groups the view folded (true) or opened (false), by rowKey (see groupOpen). */
+  private readonly folded = new Map<string, boolean>();
+  /** Tree events fired so far (tests and Diagnostics). */
+  readonly treeEvents: TreeEventCounts = { full: 0, partial: 0, rows: 0 };
+  /** sessionHasDetails per session, re-read only when the session's activity moves,
+   *  so rendering a row for comparison costs no directory reads. */
+  private readonly detailsMemo = new Map<string, { at: string; has: boolean }>();
 
   private projects: ProjectNode[] = [];
   /** The worktree-GROUPED top level rendered at the tree root: real projects plus
@@ -601,9 +926,10 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
   private readonly cwdExists = new Map<string, boolean>();
   private signature = "";
 
-  /** The change-signature from the last reload() — the exact string whose change
-   *  fires onDidChangeTreeData (the sidebar tree's repaint). refresh() reads it to
-   *  gate the per-tick panel/publish build: it skips buildPanelModel() on a tick
+  /** The change-signature from the last reload(): every status / structure field
+   *  the views show. (The sidebar tree no longer fires on it; it compares row by
+   *  row, see fireTreeChanges.) refresh() reads it to gate the per-tick
+   *  panel/publish build: it skips buildPanelModel() on a tick
    *  whose signature matches the one the last-built model carried, so the panel and
    *  the published snapshot inherit the sidebar tree's freshness rather than being
    *  rebuilt every quiet tick. Empty until the first reload. */
@@ -696,6 +1022,16 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
   /** True when the snapshot spans more than one config home: only then do we
    *  surface which account each session belongs to. */
   private multiHome = false;
+  /** Install roots of this editor family (a process under one = "in the editor"). */
+  private readonly familyRoots = editorFamilyRoots(vscode.env.appRoot ?? "", process.execPath);
+  /** Shell pids of this window's integrated terminals (kept by the extension),
+   *  plus this extension host: a session it runs is in the editor whatever its
+   *  install path looks like. */
+  private terminalPids: ReadonlySet<number> = new Set([process.pid]);
+
+  setTerminalPids(pids: ReadonlySet<number>): void {
+    this.terminalPids = new Set([...pids, process.pid]);
+  }
   unreadCount = 0;
   /** Last needs-you row the keyboard triage cursor visited (in-memory, session-
    *  scoped). The set is recomputed every step; this is the only state kept. */
@@ -750,28 +1086,29 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
   ) {
     // sessions finished before install shouldn't all light up as unread
     if (state.get<number>(BASELINE_KEY) === undefined) {
-      void state.update(BASELINE_KEY, Date.now());
+      saveQuietly(state, BASELINE_KEY, Date.now());
     }
-    // Stamp the trial start on first-ever activation (once, never reset).
-    if (state.get<number>(TRIAL_START_KEY) === undefined) {
-      void state.update(TRIAL_START_KEY, Date.now());
-    }
-
     this.pruneLastSeen();
 
     // Remote session rows preview their in-memory lastText through a virtual
     // document (the on-disk preview path in extension.ts only knows self rows).
-    this.disposables.push(
-      vscode.commands.registerCommand(REMOTE_LAST_MSG_CMD, (arg: RemoteSessionNode | InboxRefNode) => {
-        // An inbox reference row unwraps to the real remote session (view semantics).
-        const node = arg.kind === "inbox-ref" ? arg.target : arg;
-        if (node.kind === "remote-session") this.showRemotePreview(node);
-      }),
-      vscode.workspace.registerTextDocumentContentProvider(REMOTE_PREVIEW_SCHEME, {
-        onDidChange: this.remotePreviewEmitter.event,
-        provideTextDocumentContent: (uri) => this.remotePreviewContent(uri),
-      })
-    );
+    // One at a time, and undone if a later one throws: the caller never gets this
+    // object to dispose, so nothing registered here may outlive a failed build.
+    try {
+      this.disposables.push(
+        vscode.commands.registerCommand(REMOTE_LAST_MSG_CMD, (arg: RemoteSessionNode | InboxRefNode) => {
+          // An inbox reference row unwraps to the real remote session (view semantics).
+          const node = arg.kind === "inbox-ref" ? arg.target : arg;
+          if (node.kind === "remote-session") this.showRemotePreview(node);
+        })
+      );
+      this.disposables.push(
+        PreviewDocs.register(REMOTE_PREVIEW_SCHEME, (uri) => this.remotePreviewContent(uri), this.remotePreviewEmitter.event)
+      );
+    } catch (err) {
+      this.dispose();
+      throw err;
+    }
   }
 
   dispose(): void {
@@ -788,7 +1125,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     for (const key of this.state.keys()) {
       if (!key.startsWith(LAST_SEEN_PREFIX)) continue;
       const ts = this.state.get<number>(key);
-      if (typeof ts === "number" && ts < cutoff) void this.state.update(key, undefined);
+      if (typeof ts === "number" && ts < cutoff) saveQuietly(this.state, key, undefined);
     }
   }
 
@@ -796,6 +1133,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     this.collapseOverride = collapsed;
     this.generation++;
     this.signature = "";
+    this.fullRefreshDue = true;
     this.reload();
   }
 
@@ -808,6 +1146,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     this.collapseOverride = undefined;
     this.generation++;
     this.signature = "";
+    this.fullRefreshDue = true;
     this.reload();
   }
 
@@ -832,18 +1171,44 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     ).length;
   }
 
-  /** In compact mode the auto-expand decision must re-apply when it changes (a
-   *  project coming to / ceasing to need you), so it rides the item id — otherwise
-   *  VS Code keeps its remembered state and a fresh needs-you row would stay buried.
-   *  Comfortable adds nothing (stable ids, unchanged behavior).
-   *
-   *  Semantics (intended): the state force-applies ONCE per onset — a project that
-   *  comes to need you re-expands even if manually collapsed; between onsets the
-   *  user's manual expand/collapse is respected (id stable); and on RESOLUTION the
-   *  id reverts to the quiet default (collapsed), which is the correct remembered
-   *  state, not a bug. */
-  private densitySuffix(expanded: boolean): string {
-    return this.density() === "compact" ? (expanded ? ":e" : ":c") : "";
+  /** A group that comes to need you opens, even if it was folded: the "needs-you
+   *  is never buried" covenant. The group's id stays the same (an id change is a
+   *  redraw of the whole level, and at the root of the whole tree), so the opening
+   *  goes through the view instead: extension.ts sets this to TreeView.reveal
+   *  with expand. Once per onset; between onsets the user's own fold holds, and a
+   *  resolved group keeps whatever state it has. */
+  expandRow: (node: Node) => void = () => undefined;
+  /** Is this the row object the tree holds now (not one gone since)? */
+  isCurrent(node: Node): boolean {
+    return this.rowCache.get(rowKey(node)) === node;
+  }
+  /** Groups whose needs-you opening was requested at the last reload, by rowKey. */
+  private wantsOpen = new Set<string>();
+
+  /** Ask the view to open each group that just came to need you (see expandRow). */
+  private openNeedsYouGroups(): void {
+    const density = this.density();
+    const now = new Set<string>();
+    const wants = (needsYou: number): boolean =>
+      projectExpanded(density, this.collapseOverride, needsYou) && !projectExpanded(density, this.collapseOverride, 0);
+    for (const p of this.projects) {
+      if (p.synthetic) continue;
+      if (wants(this.projectNeedsYou(p) + p.worktrees.reduce((n, w) => n + this.projectNeedsYou(w), 0))) now.add(rowKey(p));
+    }
+    for (const h of this.hostNodes) {
+      let hostNeeds = 0;
+      for (const rp of h.projects) {
+        const n = this.remoteProjectNeedsYou(rp);
+        hostNeeds += n;
+        if (wants(n)) now.add(rowKey(rp));
+      }
+      if (wants(hostNeeds)) now.add(rowKey(h));
+    }
+    for (const key of now) {
+      const node = this.rowCache.get(key);
+      if (!this.wantsOpen.has(key) && node !== undefined) this.expandRow(node);
+    }
+    this.wantsOpen = now;
   }
 
   /** Layout (sessionDeck.layout) flipped between "list" and "columns": every
@@ -852,8 +1217,29 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
    *  signature (which now folds layout) is enough to force the repaint once; quiet
    *  ticks after stay quiet (layout only changes on the config toggle). */
   refreshLayout(): void {
+    // No generation bump: new ids would reapply every group's default open state
+    // and undo the user's folds. The stale replay after Column View is prevented
+    // by sending only whole-tree refreshes while the view is hidden (setViewVisible).
     this.signature = "";
+    this.fullRefreshDue = true;
     this.reload();
+  }
+
+  /** Is the Sessions tree on screen? Column View hides it (its `when` clause) and
+   *  shows the table instead. A hidden tree view queues every element refresh it
+   *  is sent and replays them, stale rows and all, after the root fetch when it
+   *  shows again; with the row-level refresh that drew a second, stale list over
+   *  the live one after Column View was switched off. So while hidden only whole-
+   *  tree refreshes are sent (each one resets that queue), and showing again
+   *  sends one more. */
+  private viewVisible = true;
+  setViewVisible(visible: boolean): void {
+    if (visible === this.viewVisible) return;
+    this.viewVisible = visible;
+    if (!visible) return;
+    this.treeEvents.full++;
+    this.groupChangedAt.set(ROOT_KEY, Date.now());
+    this.emitter.fire(undefined);
   }
 
   /** Signals each root fetch, so a toast about a state change can wait until the
@@ -862,6 +1248,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
 
   forceReload(): void {
     this.signature = "";
+    this.fullRefreshDue = true;
     this.reload();
   }
 
@@ -871,6 +1258,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
   refreshActivityTree(): void {
     this.generation++;
     this.signature = "";
+    this.fullRefreshDue = true;
     this.reload();
   }
 
@@ -898,12 +1286,14 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
   async setSortMode(mode: SortMode): Promise<void> {
     await this.state.update(SORT_KEY, mode);
     this.signature = "";
+    this.fullRefreshDue = true;
     this.reload();
   }
 
   async setFilterMode(mode: FilterMode): Promise<void> {
     await this.state.update(FILTER_KEY, mode);
     this.signature = "";
+    this.fullRefreshDue = true;
     this.reload();
   }
 
@@ -912,32 +1302,42 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     const next = clean.length >= AGENT_FAMILIES.length ? [] : clean;
     await this.state.update(HIDDEN_TYPES_KEY, next);
     this.signature = "";
+    this.fullRefreshDue = true;
     this.reload();
   }
 
   // ---- Pin projects ---------------------------------------------------------
 
-  /** The persisted pin map (cwd → last-observed activity ms). */
-  private pins(): Record<string, number> {
+  /** The pin map as stored (cwd → last-observed activity ms). Older builds stored
+   *  a Windows cwd with whatever drive-letter case it was seen with. */
+  private storedPins(): Record<string, number> {
     return this.state.get<Record<string, number>>(PIN_KEY) ?? {};
   }
 
+  /** The pin map keyed the way project groups are (drive letter upper-cased), so a
+   *  pin stored as `s:\work` still matches the `S:\work` group. Two stored spellings
+   *  of one folder merge, keeping the newer time. The next pin write stores this form. */
+  private pins(): Record<string, number> {
+    return normalizePinKeys(this.storedPins());
+  }
+
   isPinned(cwd: string): boolean {
-    return this.pins()[cwd] !== undefined;
+    return this.pins()[normalizeDriveLetter(cwd)] !== undefined;
   }
 
   async pinProject(cwd: string): Promise<void> {
-    const pins = { ...this.pins() };
-    pins[cwd] = Date.now();
+    const pins = this.pins();
+    pins[normalizeDriveLetter(cwd)] = Date.now();
     await this.state.update(PIN_KEY, capNewest(pins, MAX_PINS));
     this.signature = "";
     this.reload();
   }
 
   async unpinProject(cwd: string): Promise<void> {
-    const pins = { ...this.pins() };
-    if (pins[cwd] === undefined) return;
-    delete pins[cwd];
+    const pins = this.pins();
+    const key = normalizeDriveLetter(cwd);
+    if (pins[key] === undefined) return;
+    delete pins[key];
     await this.state.update(PIN_KEY, pins);
     this.signature = "";
     this.reload();
@@ -1086,7 +1486,9 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       );
     }
     Object.assign(next, prunePins(absent, Date.now() - PINHIDE_TTL_MS));
-    if (stableJson(next) !== stableJson(current)) void this.state.update(PIN_KEY, next);
+    // Compared with the map as STORED, so pins kept under an old drive-letter case
+    // are rewritten once in the normalised form.
+    if (stableJson(next) !== stableJson(this.storedPins())) saveQuietly(this.state, PIN_KEY, next);
   }
 
   /** Apply the auto-unhides earned this pass and prune vanished-and-stale hidden
@@ -1102,7 +1504,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       else vanished[k] = rec;
     }
     Object.assign(kept, pruneHidden(vanished, Date.now() - PINHIDE_TTL_MS));
-    if (stableJson(kept) !== stableJson(this.hidden)) void this.state.update(HIDE_KEY, kept);
+    if (stableJson(kept) !== stableJson(this.hidden)) saveQuietly(this.state, HIDE_KEY, kept);
   }
 
   private passesFilter(node: SessionNode): boolean {
@@ -1319,9 +1721,10 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
         continue;
       }
       if (isUnread) unread++;
-      const list = cursorByProject.get(row.cwd) ?? [];
+      const key = normalizeDriveLetter(row.cwd);
+      const list = cursorByProject.get(key) ?? [];
       list.push(node);
-      cursorByProject.set(row.cwd, list);
+      cursorByProject.set(key, list);
     }
     const composerByProject = new Map<string, ComposerNode[]>();
     for (const row of this.composerSessions()) {
@@ -1331,9 +1734,10 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       if (!this.passesComposerNode(node)) continue;
       // Composer unread is a row affordance only: no approval signal exists, so it
       // never contributes to the attention badge/status chip.
-      const list = composerByProject.get(row.cwd) ?? [];
+      const key = normalizeDriveLetter(row.cwd);
+      const list = composerByProject.get(key) ?? [];
       list.push(node);
-      composerByProject.set(row.cwd, list);
+      composerByProject.set(key, list);
     }
     // Codex CLI sessions, grouped by cwd (empty when the setting is off).
     // Finished-unread: a session whose last turn completed (endedTurn) after the
@@ -1357,10 +1761,17 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
         continue;
       }
       if (isUnread) unread++;
-      const list = codexByProject.get(row.cwd) ?? [];
+      const key = normalizeDriveLetter(row.cwd);
+      const list = codexByProject.get(key) ?? [];
       list.push(node);
-      codexByProject.set(row.cwd, list);
+      codexByProject.set(key, list);
     }
+    // Recency sorts compare tiers and keep the last order within one (see
+    // recencyTier), so two busy rows don't trade places every tick.
+    const sortNow = Date.now();
+    const rank = (n: Node): number => this.lastOrder.get(rowKey(n)) ?? -1;
+    const byRecency = <T extends Node>(ms: (n: T) => number) => (a: T, b: T): number =>
+      recencyTier(sortNow - ms(a)) - recencyTier(sortNow - ms(b)) || rank(a) - rank(b) || ms(b) - ms(a);
     // Union of cwds with Claude, Cursor and/or Codex sessions.
     const cwds = new Set<string>([...byProject.keys(), ...cursorByProject.keys(), ...codexByProject.keys(), ...composerByProject.keys()]);
     let projects: ProjectNode[] = [...cwds]
@@ -1397,15 +1808,14 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
         if (this.sortMode === "name") {
           nodes.sort((a, b) => (a.row.meta.name ?? "").localeCompare(b.row.meta.name ?? ""));
         } else {
-          nodes.sort(
-            (a, b) => Number(b.attention) - Number(a.attention) || b.row.mtimeMs - a.row.mtimeMs
-          );
+          const recent = byRecency<SessionNode>((n) => n.row.mtimeMs);
+          nodes.sort((a, b) => Number(b.attention) - Number(a.attention) || recent(a, b));
         }
         const cursors = [...(cursorByProject.get(cwd) ?? [])];
         if (this.sortMode === "name") {
           cursors.sort((a, b) => a.row.name.localeCompare(b.row.name));
         } else {
-          cursors.sort((a, b) => b.row.updatedMs - a.row.updatedMs);
+          cursors.sort(byRecency<CursorNode>((n) => n.row.updatedMs));
         }
         const codexes = [...(codexByProject.get(cwd) ?? [])];
         if (this.sortMode === "name") {
@@ -1414,12 +1824,11 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
               Number(a.demoted) - Number(b.demoted) || a.row.name.localeCompare(b.row.name)
           );
         } else {
-          codexes.sort(
-            (a, b) => Number(a.demoted) - Number(b.demoted) || b.row.updatedMs - a.row.updatedMs
-          );
+          const recent = byRecency<CodexNode>((n) => n.row.updatedMs);
+          codexes.sort((a, b) => Number(a.demoted) - Number(b.demoted) || recent(a, b));
         }
         const composers = [...(composerByProject.get(cwd) ?? [])];
-        composers.sort(this.sortMode === "name" ? (a, b) => a.row.name.localeCompare(b.row.name) : (a, b) => b.row.updatedMs - a.row.updatedMs);
+        composers.sort(this.sortMode === "name" ? (a, b) => a.row.name.localeCompare(b.row.name) : byRecency<ComposerNode>((n) => n.row.updatedMs));
         return new ProjectNode(cwd, nodes, cursors, codexes, composers);
       })
       .filter((p) => p.sessions.length > 0 || p.cursors.length > 0 || p.codexes.length > 0 || p.composers.length > 0);
@@ -1465,14 +1874,14 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
         p.cursors.push(...keepCursors);
       }
       for (const s of sessionByPid.values()) {
-        s.codexChildren.sort((a, b) => b.row.updatedMs - a.row.updatedMs);
-        s.cursorChildren.sort((a, b) => b.row.updatedMs - a.row.updatedMs);
+        s.codexChildren.sort(byRecency<CodexNode>((n) => n.row.updatedMs));
+        s.cursorChildren.sort(byRecency<CursorNode>((n) => n.row.updatedMs));
       }
     }
     // The one global orphan bucket (cursor + codex runs whose folder was deleted).
     // Newest first within each kind; rebuilt every reload, undefined when empty.
-    orphanCursors.sort((a, b) => b.row.updatedMs - a.row.updatedMs);
-    orphanCodexes.sort((a, b) => b.row.updatedMs - a.row.updatedMs);
+    orphanCursors.sort(byRecency<CursorNode>((n) => n.row.updatedMs));
+    orphanCodexes.sort(byRecency<CodexNode>((n) => n.row.updatedMs));
     this.orphanNode =
       orphanCursors.length > 0 || orphanCodexes.length > 0
         ? new OrphanNode(orphanCursors, orphanCodexes)
@@ -1494,7 +1903,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
           Number.NEGATIVE_INFINITY
         );
       // Base order for both "activity" and "heat": most-recent activity first.
-      projects.sort((a, b) => newest(b) - newest(a));
+      projects.sort(byRecency<ProjectNode>(newest));
       if (this.sortMode === "heat") {
         // Layer attention-pressure on top: highest heat floats up, and because
         // Array.sort is stable, equal scores keep the recency order established
@@ -1529,7 +1938,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     // Remote hosts never count toward the caps (v1), so this runs on local projects
     // only, before the remote loop. Subagents/workflow children never count.
     const licenseNow = Date.now();
-    const trialStart = this.state.get<number>(TRIAL_START_KEY) ?? licenseNow;
+    const trialStart = trialOrigin(this.state, licenseNow);
     const lstate = licenseState(this.licenseKey(), licenseNow, trialStart);
     this.currentLicenseState = lstate;
     const free = lstate === "free";
@@ -1669,23 +2078,32 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
         const rUnread = !stale && s.attention === true && this.remoteUnread(snap, s);
         if (rUnread) unread++;
         const node = new RemoteSessionNode(snap.host.id, s, s.ageSec + elapsedSec, rUnread, stale);
-        const list = byCwd.get(s.cwd) ?? [];
+        // Grouped by the drive-normalised cwd; the session keeps its raw cwd, which
+        // is what a focus or stop action carries back to its host.
+        const key = normalizeDriveLetter(s.cwd);
+        const list = byCwd.get(key) ?? [];
         list.push(node);
-        byCwd.set(s.cwd, list);
+        byCwd.set(key, list);
       }
       const rprojects = [...byCwd.entries()]
         .map(([cwd, sessions]) => {
           if (this.sortMode === "name") {
             sessions.sort((a, b) => (a.session.title ?? a.session.id).localeCompare(b.session.title ?? b.session.id));
           } else {
-            sessions.sort((a, b) => a.ageSec - b.ageSec); // most recently active first
+            // most recently active first, by tier (as the local rows)
+            sessions.sort(
+              (a, b) => recencyTier(a.ageSec * 1000) - recencyTier(b.ageSec * 1000) || rank(a) - rank(b) || a.ageSec - b.ageSec
+            );
           }
           return new RemoteProjectNode(snap.host.id, cwd, sessions);
         })
         .sort((a, b) =>
           this.sortMode === "name"
             ? compareProjectNames(a.cwd, b.cwd)
-            : Math.min(...a.sessions.map((s) => s.ageSec)) - Math.min(...b.sessions.map((s) => s.ageSec))
+            : recencyTier(Math.min(...a.sessions.map((s) => s.ageSec)) * 1000) -
+                recencyTier(Math.min(...b.sessions.map((s) => s.ageSec)) * 1000) ||
+              rank(a) - rank(b) ||
+              Math.min(...a.sessions.map((s) => s.ageSec)) - Math.min(...b.sessions.map((s) => s.ageSec))
         );
       hostNodes.push(new HostNode(snap, stale, Math.round(sinceMs / 1000), rprojects));
     }
@@ -1710,10 +2128,11 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     // by the `.git`/HEAD mtimes, so a quiet tick is stats-only.
     const topProjects = this.groupWorktrees(projects);
 
-    // Change-signature drives onDidChangeTreeData: it carries every status /
-    // structure field that must repaint immediately, but ages ride ageBucket (not
-    // fmtAge) so a sub-minute session's per-tick "Ns" drift can't fire a full tree
-    // rebuild every 3s. Sub-minute ages shown may lag a bucket; statuses never do.
+    // Change-signature, which gates the panel/bridge rebuild (changeSignature): it
+    // carries every status / structure field that must repaint immediately, but
+    // ages ride ageBucket (not fmtAge) so a sub-minute session's per-tick "Ns"
+    // drift can't force a rebuild every 3s. Sub-minute ages shown may lag a
+    // bucket; statuses never do.
     const sig = JSON.stringify([
       this.sortMode,
       this.filterMode,
@@ -1912,13 +2331,309 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     for (const [token, ref] of this.remotePreviewTokens)
       if (!liveRemoteKeys.has(ref.hostId + SEEN_SEP + ref.sessionId)) this.remotePreviewTokens.delete(token);
 
-    this.projects = projects;
-    this.topProjects = topProjects;
+    pruneToLive(this.detailsMemo, liveSessionIds);
+
     this.unreadCount = unread;
-    if (sig !== this.signature) {
-      this.signature = sig;
-      this.emitter.fire();
+    // The panel and the bridge snapshot gate on this (changeSignature); the tree no
+    // longer does: it compares row by row (fireTreeChanges).
+    this.signature = sig;
+    this.keepRows(projects, topProjects);
+    this.fireTreeChanges();
+    this.openNeedsYouGroups();
+  }
+
+  /** The "Needs you" rows on screen and when that list last changed. */
+  private inboxShown: { refIds: string[]; at: number } | undefined;
+  /** Since when "Needs you" has been shown out of its urgency order (settleInbox). */
+  private inboxReorderDueAt: number | undefined;
+  /** Since when each row still shown in "Needs you" has stopped needing you. */
+  private readonly inboxOutSince = new Map<string, number>();
+
+  /** What "Needs you" shows this reload. A row entering it shows at once: that is
+   *  the alert. A row that stops needing you stays until it has been out for
+   *  SETTLE_MS, and a change of order waits until the list has been
+   *  unchanged that long: every change of the list re-fetches the whole section
+   *  and leaves its rows unclickable for a round trip, and a session that turns
+   *  over every few seconds would otherwise do that on every tick. A row
+   *  lingering after it stopped needing you is harmless: its own icon and text
+   *  show its real state, and a click still opens it. A row whose session is gone
+   *  leaves at once. */
+  private settleInbox(desired: InboxRef<TriageNode>[], projects: ProjectNode[]): InboxRef<TriageNode>[] {
+    const now = Date.now();
+    const prev = this.inboxShown;
+    const wanted = new Map(desired.map((r) => [r.refId, r]));
+    const shownBefore = new Set(prev?.refIds ?? []);
+    for (const id of [...this.inboxOutSince.keys()]) if (!shownBefore.has(id) || wanted.has(id)) this.inboxOutSince.delete(id);
+    // Rows still shown that stopped needing you, with their current node, while
+    // they are within the settle time and their session still exists.
+    const lingering: InboxRef<TriageNode>[] = [];
+    let leavingDue = false;
+    for (const refId of prev?.refIds ?? []) {
+      if (wanted.has(refId)) continue;
+      const since = this.inboxOutSince.get(refId) ?? now;
+      this.inboxOutSince.set(refId, since);
+      const anchorId = refId.slice(INBOX_ID_PREFIX.length);
+      const node = this.triageNodeById(anchorId, projects);
+      if (node === undefined || now - since >= SETTLE_MS) {
+        leavingDue = true;
+        this.inboxOutSince.delete(refId);
+      } else lingering.push({ refId, anchorId, node });
     }
+    // Fresh order: by urgency, the lingering rows after the rows that need you.
+    const rebuilt = [...desired, ...lingering];
+    const asShown = (prev?.refIds ?? []).map((id) => wanted.get(id) ?? lingering.find((r) => r.refId === id)).filter((r): r is InboxRef<TriageNode> => r !== undefined);
+    const entering = desired.some((r) => !shownBefore.has(r.refId));
+    const sameOrder = rebuilt.length === asShown.length && rebuilt.every((r, k) => r.refId === asShown[k].refId);
+    const settled = prev === undefined || now - prev.at >= SETTLE_MS;
+    // When the shown order first stopped matching the order by urgency. An
+    // arrival resets `prev.at` but not this, so rows that keep arriving less than
+    // SETTLE_MS apart can't keep an earlier row out of its place.
+    if (sameOrder) this.inboxReorderDueAt = undefined;
+    else this.inboxReorderDueAt ??= now;
+    const reorderDue = this.inboxReorderDueAt !== undefined && now - this.inboxReorderDueAt >= SETTLE_MS;
+    // A row entering shows at once, but after the rows already shown: putting it
+    // on top pushed every row down under the pointer, and an inline click landed
+    // on the next row's Stop. It moves to its place by urgency once the list has
+    // settled, within SETTLE_MS.
+    const refs =
+      prev === undefined || leavingDue || reorderDue
+        ? rebuilt
+        : entering
+          ? [...asShown, ...desired.filter((r) => !shownBefore.has(r.refId))]
+          : settled && !sameOrder
+            ? rebuilt
+            : asShown;
+    if (refs === rebuilt) this.inboxReorderDueAt = undefined;
+    const changed = prev === undefined || refs.length !== prev.refIds.length || refs.some((r, k) => r.refId !== prev.refIds[k]);
+    this.inboxShown = { refIds: refs.map((r) => r.refId), at: changed || prev === undefined ? now : prev.at };
+    return refs;
+  }
+
+  /** The current node for a triage id ("session:<id>", "remote:<host>:<id>", …). */
+  private triageNodeById(id: string, projects: ProjectNode[]): TriageNode | undefined {
+    for (const p of projects) {
+      for (const s of p.sessions) if (`session:${s.row.meta.sessionId}` === id) return s;
+      for (const c of p.cursors) if (`cursor:${c.row.chatId}` === id) return c;
+      for (const x of p.codexes) if (`codex:${x.row.id}` === id) return x;
+    }
+    for (const h of this.hostNodes)
+      for (const rp of h.projects) for (const s of rp.sessions) if (`remote:${s.hostId}:${s.session.id}` === id) return s;
+    return undefined;
+  }
+
+  /** The root rows for this reload, from freshly built nodes, in display order. */
+  private rootRows(topProjects: ProjectNode[], projects: ProjectNode[]): Node[] {
+    const inbox: Node[] = [];
+    if (this.inboxLane()) {
+      const refs = this.settleInbox(buildInbox(buildTriageSet(projects, this.hostNodes), true), projects);
+      if (refs.length > 0) inbox.push(new InboxNode(refs.map((r) => new InboxRefNode(r.refId, r.anchorId, r.node))));
+    } else this.inboxShown = undefined;
+    const all = this.filterMode === "all";
+    return [
+      // The needs-you inbox is the command center: first, above all project grouping.
+      ...inbox,
+      // topProjects is the worktree-grouped top level (worktree rows nest under their
+      // main repo, synthetic parents included).
+      ...topProjects,
+      ...this.hostNodes,
+      // The orphan bucket is a low-noise meta row after the projects and hosts.
+      ...(this.orphanNode !== undefined ? [this.orphanNode] : []),
+      // Then the meta notes, lowest priority last: capability, "N hidden" (only in
+      // the "all" filter, so hidden rows are never silently lost), the free-tier
+      // note, and the same-path collision note.
+      ...(this.capabilityNote !== undefined ? [new CapabilityNoteNode(this.capabilityNote)] : []),
+      ...(all && this.hiddenPresent.size > 0 ? [new HiddenNoteNode(this.hiddenPresent.size)] : []),
+      ...(all && this.licenseNote !== undefined ? [new LicenseNoteNode(this.licenseNote.covered, this.licenseNote.total)] : []),
+      ...(all && this.collisionNote !== undefined ? [new CollisionNoteNode(this.collisionNote)] : []),
+    ];
+  }
+
+  /** Swap this reload's freshly built nodes for the row objects VS Code already
+   *  holds: a row seen before keeps its object, updated in place with the new
+   *  data, so the extension host's handle → element map stays valid across ticks.
+   *  A second row with a key already taken in this render is dropped (two rows
+   *  must never answer to one handle). */
+  private keepRows(projects: ProjectNode[], topProjects: ProjectNode[]): void {
+    const next = new Map<string, Node>();
+    const keep = (fresh: Node): Node | undefined => {
+      const key = rowKey(fresh);
+      if (next.has(key)) return undefined;
+      next.set(key, fresh);
+      for (const field of KEPT_CHILDREN[fresh.kind] ?? []) {
+        const list = (fresh as unknown as Record<string, Node[]>)[field];
+        const kept = list.map(keep).filter((n): n is Node => n !== undefined);
+        list.splice(0, list.length, ...kept);
+      }
+      const prev = this.rowCache.get(key);
+      const row = prev !== undefined && prev.kind === fresh.kind ? Object.assign(prev, fresh) : fresh;
+      next.set(key, row);
+      return row;
+    };
+    this.rootChildren = this.rootRows(topProjects, projects)
+      .map(keep)
+      .filter((n): n is Node => n !== undefined);
+    // An inbox reference points at the real row, which is kept further down.
+    for (const n of next.values()) {
+      if (n.kind !== "inbox-ref") continue;
+      const target = next.get(rowKey(n.target));
+      if (target !== undefined) (n as { target: Node }).target = target;
+    }
+    this.rowCache = next;
+    for (const key of this.folded.keys()) if (!next.has(key)) this.folded.delete(key);
+    for (const key of this.groupChangedAt.keys()) if (key !== ROOT_KEY && !next.has(key)) this.groupChangedAt.delete(key);
+    for (const key of this.reorderSince.keys()) if (key !== ROOT_KEY && !next.has(key)) this.reorderSince.delete(key);
+    // Ids are owned only by rows still on the list (a lazily built activity row
+    // never holds one against another row, see uniqueItemId), so the map stays
+    // the size of the tree between full redraws.
+    for (const [id, owner] of this.idOwner) if (next.get(rowKey(owner)) !== owner) this.idOwner.delete(id);
+    const kept = (p: ProjectNode): ProjectNode | undefined => {
+      const n = next.get(rowKey(p));
+      return n?.kind === "project" ? n : undefined;
+    };
+    this.projects = [...new Set(projects.map(kept).filter((p): p is ProjectNode => p !== undefined))];
+    this.topProjects = this.rootChildren.filter((n): n is ProjectNode => n.kind === "project");
+    this.hostNodes = this.rootChildren.filter((n): n is HostNode => n.kind === "host");
+    this.orphanNode = this.rootChildren.find((n): n is OrphanNode => n.kind === "orphan");
+  }
+
+  /** The root rows' keys from the last reload, in order (see holdOrder). */
+  private renderedRootKeys: string[] = [];
+  /** When each group's rows (ROOT_KEY: the root's) last changed on screen. */
+  private readonly groupChangedAt = new Map<string, number>();
+
+  /** Keep a group's rows in their last order while its rows changed less than
+   *  SETTLE_MS ago and the same rows are still there. A change of order alone
+   *  re-fetches the group (at the root, the whole tree) and leaves its rows
+   *  unclickable for a round trip, so rows that keep trading places (a session
+   *  needing you, then not) would do that on every tick. The new order shows
+   *  once the group has been unchanged that long, or with its next change of
+   *  rows. Rows joining or leaving are never held. */
+  private holdOrder(key: string, lists: Node[][], holdPending = true): void {
+    const before = key === ROOT_KEY ? this.renderedRootKeys : this.rendered.get(key)?.childKeys;
+    const now = lists.flat().map(rowKey);
+    const pos = new Map((before ?? []).map((k, i) => [k, i]));
+    if (before === undefined || before.length !== now.length || !now.every((k) => pos.has(k))) {
+      this.reorderSince.delete(key);
+      return;
+    }
+    if (now.every((k, i) => before[i] === k)) {
+      this.reorderSince.delete(key);
+      return;
+    }
+    // A change of order alone also waits SETTLE_MS from when it was first due,
+    // even after a quiet spell: a row turning busy or needing you used to jump
+    // to the top at once, at the moment the change drew the pointer, and an
+    // inline click landed on another row. Its own line shows the change at once.
+    const t = Date.now();
+    const since = this.reorderSince.get(key) ?? t;
+    this.reorderSince.set(key, since);
+    const at = this.groupChangedAt.get(key);
+    const changedLately = at !== undefined && t - at < SETTLE_MS;
+    if (!changedLately && (!holdPending || t - since >= SETTLE_MS)) {
+      this.reorderSince.delete(key);
+      return;
+    }
+    for (const list of lists) list.sort((a, b) => (pos.get(rowKey(a)) ?? 0) - (pos.get(rowKey(b)) ?? 0));
+  }
+  /** Since when each group has wanted a new order it was not yet shown (holdOrder). */
+  private readonly reorderSince = new Map<string, number>();
+
+  /** The view folded or unfolded a row (TreeView.onDidCollapseElement /
+   *  onDidExpandElement). The group's line switches between its two forms on
+   *  the next tick (see groupOpen). */
+  noteOpen(element: Node, open: boolean): void {
+    if (!FOLDABLE_KINDS.has(element.kind)) return;
+    this.folded.set(rowKey(element), !open);
+  }
+
+  /** Is this group open in the view? What the view did last (a fold or unfold, or
+   *  a fetch of its rows) wins; until then, the state the row asks for. An open
+   *  group's line leaves out its working/unread counts and its newest age: they
+   *  change without its rows changing, and refreshing the line would make every
+   *  row under it unclickable for a round trip, so they would go stale; the rows
+   *  show them anyway. A folded group has no rows on screen to drop, so it shows
+   *  the full summary and is refreshed whenever that changes. Guessing "open" for
+   *  a folded group only shows less; it never shows something untrue. */
+  private groupOpen(node: Node, requestedExpanded: boolean): boolean {
+    const f = this.folded.get(rowKey(node));
+    return f === undefined ? requestedExpanded : !f;
+  }
+
+  /** Tell VS Code which rows changed since the last reload, as narrowly as it can
+   *  take it:
+   *  - nothing visible changed: no event at all;
+   *  - a row's own rendering changed: that row alone (the extension host re-reads
+   *    it in place, every other row stays clickable). An open group's own line
+   *    shows only facts that change with its rows (see groupOpen), so it changes
+   *    together with them;
+   *  - a group's children changed (added, removed, reordered, or re-keyed): that
+   *    group (the host drops the group's children until the window fetches them
+   *    again, so only that group's rows are briefly unclickable);
+   *  - the root rows changed, or a view setting changed: the whole tree.
+   *  Rows are compared through the same TreeItem VS Code is given, minus the hover,
+   *  so a relative age that reads the same ("2m") is not a change. */
+  private fireTreeChanges(): void {
+    const now = new Map<string, RenderedRow>();
+    const order = new Map<string, number>();
+    const visit = (n: Node, parent: string | undefined, index: number): string => {
+      const key = rowKey(n);
+      order.set(key, index);
+      const item = withSubMinuteAgesMasked(() => this.buildTreeItem(n));
+      const id = item.id ?? key;
+      // "Needs you" settles its own order (settleInbox); holding it here too
+      // would double the wait.
+      this.holdOrder(key, (KEPT_CHILDREN[n.kind] ?? []).map((f) => (n as unknown as Record<string, Node[]>)[f]), n.kind !== "inbox");
+      const kept = keptChildren(n);
+      const kids = kept.map((c, i) => visit(c, key, i)).join("\n") + "\n~" + this.activitySignature(n);
+      now.set(key, { node: n, parent, id, sig: renderSignature(item), kids, childKeys: kept.map(rowKey) });
+      return id;
+    };
+    this.holdOrder(ROOT_KEY, [this.rootChildren]);
+    const rootIds = this.rootChildren.map((n, i) => visit(n, undefined, i)).join("\n");
+    const rootKeys = this.rootChildren.map(rowKey);
+    const prev = this.rendered;
+    this.rendered = now;
+    this.lastOrder = order;
+    const full = this.fullRefreshDue || this.rootFetch.waiting || rootIds !== this.renderedRootIds;
+    this.renderedRootIds = rootIds;
+    this.renderedRootKeys = rootKeys;
+    this.fullRefreshDue = false;
+    if (full) {
+      this.groupChangedAt.set(ROOT_KEY, Date.now());
+      this.treeEvents.full++;
+      this.emitter.fire(undefined);
+      return;
+    }
+    const changed: string[] = [];
+    if (!this.viewVisible) {
+      // Hidden: never an element refresh (see setViewVisible).
+      let any = false;
+      for (const [key, r] of now) {
+        const before = prev.get(key);
+        if (before === undefined || before.kids !== r.kids || before.sig !== r.sig) any = true;
+      }
+      if (!any && prev.size === now.size) return;
+      this.treeEvents.full++;
+      this.emitter.fire(undefined);
+      return;
+    }
+    for (const [key, r] of now) {
+      const before = prev.get(key);
+      // A new row has no element in VS Code yet: its group's children changed.
+      if (before === undefined) continue;
+      if (before.kids !== r.kids) this.groupChangedAt.set(key, Date.now());
+      if (before.kids !== r.kids || before.sig !== r.sig) changed.push(key);
+    }
+    if (changed.length === 0) return;
+    // A refreshed group re-fetches everything under it, so name only the topmost.
+    const named = new Set(changed);
+    const top = changed.filter((key) => {
+      for (let p = now.get(key)?.parent; p !== undefined; p = now.get(p)?.parent) if (named.has(p)) return false;
+      return true;
+    });
+    this.treeEvents.partial++;
+    this.treeEvents.rows += top.length;
+    this.emitter.fire(top.map((key) => now.get(key)!.node));
   }
 
   /** Build the worktree-grouped top level from the flat, already-sorted `projects`.
@@ -2057,7 +2772,8 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     }
     const uri = vscode.Uri.from({
       scheme: REMOTE_PREVIEW_SCHEME,
-      path: `/${encodeURIComponent(name)}.md`,
+      // Uri.from takes the path as is: an encoded name showed as "%20" in the tab.
+      path: previewDocPath(name, s.id.slice(0, 8)),
       query: token,
     });
     this.remotePreviewEmitter.fire(uri);
@@ -2101,23 +2817,6 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
    *  focus-return digest to snapshot at defocus and diff at refocus. */
   needsYouIds(): string[] {
     return buildTriageSet(this.projects, this.hostNodes).map((t) => t.id);
-  }
-
-  /** The needs-you inbox section for this reload, or undefined when the lane is off
-   *  or nothing needs you (so getChildren renders it only when present). Membership
-   *  AND order are exactly the triage set (same as the chip + the ]/[ walk); each
-   *  child is a reference row wrapping the real node — the inbox is a view, so no
-   *  count/focus path ever sees these nodes as originals. Built lazily in getChildren
-   *  (like the meta notes). The ORDER is not fully implied by the other signature
-   *  fields (two same-tier rows in one age bucket can swap by onset without any of
-   *  them changing), so reload() folds the ranked triage-id list into the change
-   *  signature explicitly — a real reorder repaints, a quiet 3s tick does not (the
-   *  id order is stable across sub-bucket age drift). */
-  private inboxSection(): InboxNode | undefined {
-    if (!this.inboxLane()) return undefined;
-    const refs = buildInbox(buildTriageSet(this.projects, this.hostNodes), true);
-    if (refs.length === 0) return undefined;
-    return new InboxNode(refs.map((r) => new InboxRefNode(r.refId, r.anchorId, r.node)));
   }
 
   // ---- Focus anchor (return-to-focus across re-sorts / triage) --------------
@@ -2561,8 +3260,10 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
           spin: p.spin,
           hover: p.hover,
           sessionId: p.sessionId,
+          ...(p.stoppable === true ? { stoppable: true as const } : {}),
           homeLabel: p.homeLabel,
           homeColor: p.homeColor,
+          ...(p.outside === true ? { outside: true as const } : {}),
         };
       }
       if (node.kind === "cursor") {
@@ -2596,7 +3297,9 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
           spin: p.spin,
           brand: p.brand,
           hover: p.hover,
+          ...(p.stoppable === true ? { stoppable: true as const } : {}),
           codexId: p.id,
+          ...(p.outside === true ? { outside: true as const } : {}),
         };
       }
       const p = this.panelRemoteSession(node, false);
@@ -2685,6 +3388,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       ...visual(v),
       hover: this.remoteHoverText(node),
       children,
+      ...(s.outside === true && !node.stale ? { outside: true as const } : {}),
     };
   }
 
@@ -2752,6 +3456,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       workingTrailing(kind, row.activity.currentTask, row.pendingToolName, row.ageSec) ??
       doneCaption(kind === "unread", row.lastText);
     const collision = this.collisions.get(row.meta.sessionId);
+    const outside = this.locationOf(row).location === "outside";
     const baseParts = [fmtAge(row.ageSec), ...glyphParts(row, terminal)];
     if (collision !== undefined) {
       baseParts.push(`⚠ same file (${sanitizeReason(collapseCollisionPath(collision.path), 56)})`);
@@ -2777,7 +3482,9 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       icon: v.icon,
       iconColor: v.color,
       spin: v.spin,
+      stoppable: this.locationOf(row).location !== "unknown" ? true : undefined,
       terminal,
+      outside: outside || undefined,
       homeLabel: row.homeLabel,
       homeColor: this.multiHome ? colorFor(row.homeLabel) : undefined,
       children,
@@ -2896,15 +3603,20 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     const statusKind = terminalStatusKind(working, node.unread);
     const status = statusKind === "working" ? "working" : statusKind === "unread" ? "done, unread" : "done";
     const caption = doneCaption(node.unread, row.lastAgentMessage);
+    const loc = node.demoted ? undefined : this.codexLocationOf(row);
+    const outside = loc?.location === "outside";
+    const hover = this.codexHover(row, outside);
     return {
       id: row.id,
       title: row.name,
       statusKind,
+      stoppable: loc !== undefined && loc.location !== "unknown" ? true : undefined,
       columns: { time: fmtAge(row.ageSec), status, model: undefined, tokens: undefined },
       description: `${node.unread ? "● " : ""}${fmtAge(row.ageSec)} ❯${caption !== undefined ? ` · ${caption}` : ""}`,
+      outside: outside || undefined,
       ...visual(v),
       unread: node.unread,
-      hover: this.codexHover(row),
+      hover: outside && loc !== undefined ? `${hover}\n${outsideSentence(loc)}` : hover,
       freeTier: node.dimmed,
       demoted: node.demoted,
       provenance: codexProvenanceLabel(row.subagentRole, row.kind),
@@ -2919,12 +3631,12 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
 
   /** Plain-text hover for a Codex CLI session (name, kind, model provider, cwd,
    *  last activity, pid when live), shared by the tree tooltip and the panel row. */
-  private codexHover(row: CodexRow): string {
+  private codexHover(row: CodexRow, outside = false): string {
     const lines: string[] = [`${row.name} — ${row.kind} (${row.status})`];
     if (row.originator !== "") lines.push(`originator: ${row.originator}`);
     if (row.model !== "") lines.push(`model: ${shortModel(row.model)}`);
     if (row.modelProvider !== "") lines.push(`provider: ${row.modelProvider}`);
-    lines.push(`terminal · last activity ${fmtAge(row.ageSec)} ago`);
+    lines.push(`${cliKindWord(outside)} · last activity ${fmtAge(row.ageSec)} ago`);
     if (row.startedMs > 0) lines.push(`started ${fmtClock(row.startedMs)}`);
     if (row.pid !== undefined) lines.push(`pid ${row.pid}`);
     lines.push(`session ${row.id}`);
@@ -3013,8 +3725,10 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     const { row } = node;
     const act = row.activity;
     const lines: string[] = [`${title} — ${this.statusPhrase(node)}`];
-    const kind = terminal ? "terminal" : "IDE";
+    const loc = this.locationOf(row);
+    const kind = loc.location === "outside" ? "outside" : terminal ? "terminal" : "IDE";
     lines.push(`${row.homeLabel} · ${kind} · last activity ${fmtAge(row.ageSec)} ago`);
+    if (loc.location === "outside") lines.push(outsideSentence(loc));
     const times = sessionTimeFacts(
       sessionBirthMs(row.meta, row.homeDir, row.mainMtimeMs),
       row.meta.startedAt
@@ -3066,42 +3780,13 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     // degraded-capability note, when present, is the very last leaf.
     if (element === undefined) {
       this.rootFetch.fetched();
-      // Root of a full render: start a fresh TreeItem-id uniqueness scope so the
-      // duplicate-id backstop is bounded to this render (see uniqueItemId).
+      // Root of a full render: start a fresh TreeItem-id scope (see uniqueItemId).
       this.beginItemIdScope();
-      const note = this.capabilityNote !== undefined ? [new CapabilityNoteNode(this.capabilityNote)] : [];
-      // The "N hidden" note is the lowest-priority leaf (below the capability
-      // note): only in the "all" filter, only when something hidden is present, so
-      // hidden rows are never silently lost.
-      const hiddenNote =
-        this.filterMode === "all" && this.hiddenPresent.size > 0
-          ? [new HiddenNoteNode(this.hiddenPresent.size)]
-          : [];
-      // The free-tier note is a low-priority leaf (below capability + hidden): only
-      // in the "all" filter, only when rows are actually excluded by the caps.
-      const licenseNote =
-        this.filterMode === "all" && this.licenseNote !== undefined
-          ? [new LicenseNoteNode(this.licenseNote.covered, this.licenseNote.total)]
-          : [];
-      // The same-path collision note is the LOWEST-priority leaf (below all the
-      // others): only in the "all" filter, only when a collision is present. It
-      // coexists with the other meta notes rather than replacing them.
-      const collisionNote =
-        this.filterMode === "all" && this.collisionNote !== undefined
-          ? [new CollisionNoteNode(this.collisionNote)]
-          : [];
-      // The needs-you inbox is the command center: rendered FIRST, above all project
-      // grouping, when the lane is on and something needs you.
-      const inbox = this.inboxSection();
-      const inboxNode = inbox !== undefined ? [inbox] : [];
-      // topProjects is the worktree-grouped top level (worktree rows nest under their
-      // main repo, synthetic parents included). Identical to `projects` when no
-      // worktrees are present, so the single-repo view is byte-for-byte unchanged.
-      // The orphan bucket is a low-noise meta row: after the projects/hosts, before
-      // the capability/hidden/license/collision notes.
-      const orphan = this.orphanNode !== undefined ? [this.orphanNode] : [];
-      return [...inboxNode, ...this.topProjects, ...this.hostNodes, ...orphan, ...note, ...hiddenNote, ...licenseNote, ...collisionNote];
+      // Built by reload (rootRows/keepRows), so the root rows are the same objects
+      // every fetch until they change.
+      return this.rootChildren;
     }
+    if (FOLDABLE_KINDS.has(element.kind)) this.folded.set(rowKey(element), false);
     // Inbox reference rows are flat leaves (the always-visible command center).
     if (element.kind === "inbox") return element.refs;
     // Cursor then Codex sessions, then any nested worktree projects, render after the
@@ -3122,12 +3807,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     }
     if (element.kind === "host") return element.projects;
     if (element.kind === "remote-project") return element.sessions;
-    if (element.kind === "remote-session") {
-      if (!this.activityTree()) return [];
-      return (element.session.children ?? []).map(
-        (c, i) => new RemoteChildNode(`remote-child:${element.hostId}:${element.session.id}:${i}`, c, element.stale)
-      );
-    }
+    if (element.kind === "remote-session") return this.remoteChildren(element);
     return [];
   }
 
@@ -3176,7 +3856,30 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     }
   }
 
-  /** Lazily derived on expand only (never during the 3s poll). The active age
+  private remoteChildren(node: RemoteSessionNode): Node[] {
+    if (!this.activityTree()) return [];
+    return (node.session.children ?? []).map(
+      (c, i) => new RemoteChildNode(`remote-child:${node.hostId}:${node.session.id}:${i}`, c, node.stale)
+    );
+  }
+
+  /** The activity rows (subagents, workflows, tasks; a remote session's children)
+   *  under a session the view has open, as one comparable string: they are built
+   *  afresh on each fetch, so a change among them re-fetches that session's rows.
+   *  Folded or never opened: "" (nothing on screen, and no reads for it). */
+  private activitySignature(n: Node): string {
+    if ((n.kind !== "session" && n.kind !== "remote-session") || this.folded.get(rowKey(n)) !== false) return "";
+    const rows = n.kind === "session" ? (n.dimmed ? [] : this.sessionChildren(n)) : this.remoteChildren(n);
+    return rows
+      .map((c) => {
+        const item = withSubMinuteAgesMasked(() => this.buildTreeItem(c));
+        return `${item.id ?? ""} ${renderSignature(item)}`;
+      })
+      .join("\n");
+  }
+
+  /** Lazily derived on expand only (and, for a session open in the view, by
+   *  activitySignature each tick: sessionDetails caches its directory walk). The active age
    *  filter applies to children too, so a 1h filter hides work that finished
    *  hours ago while keeping running items and pending/in-progress tasks. */
   private sessionChildren(node: SessionNode): Node[] {
@@ -3197,39 +3900,35 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     const item = this.buildTreeItem(element);
     // Final backstop: a duplicate TreeItem id makes VS Code hard-throw ("Element
     // with id … is already registered") and render NOTHING — one collision blanks
-    // the whole tree. Upstream ids are already unique, but uniquify here too so a
-    // future collision degrades to a `~dupN`-suffixed row instead of an empty view.
+    // the whole tree. Upstream ids are already unique (reload drops a repeated row
+    // key), but uniquify here too so a future collision degrades to a suffixed row.
     item.id = this.uniqueItemId(element, item.id);
     return item;
   }
 
-  /** Per-render guard that guarantees no two rendered items share an id. Within one
-   *  render an element keeps a STABLE id (so reveal/collapse state holds); a genuine
-   *  collision gets a `~dupN` suffix rather than aborting the tree. The scope is
-   *  reset at the root of each full render (getChildren(undefined)) — NOT on the
-   *  structural `generation`, which ordinary refreshes do not bump: resetting on
-   *  generation would treat a fresh render's ids (which repeat, since `generation`
-   *  is unchanged) as duplicates and ratchet `~dupN` suffixes across refreshes. */
-  private usedItemIds = new Set<string>();
-  private itemIdByNode = new WeakMap<object, string>();
+  /** Which row renders each id in the current render, so a collision is caught. The
+   *  scope resets at each full render (getChildren(undefined)). */
+  private idOwner = new Map<string, Node>();
 
-  /** Begin a fresh id-uniqueness scope for one render. VS Code always re-queries
-   *  from the root (getChildren(undefined)) on refresh, and this provider only ever
-   *  fires full refreshes, so that call is the correct per-render boundary. */
   private beginItemIdScope(): void {
-    this.usedItemIds = new Set();
-    this.itemIdByNode = new WeakMap();
+    this.idOwner = new Map();
   }
 
+  /** The id VS Code gets for a row. A kept row (see keepRows) owns its id outright:
+   *  its id comes from its rowKey, which no other kept row shares. A lazily built
+   *  activity row re-fetched under a refreshed parent takes over the id of its own
+   *  previous object. A genuine collision gets a suffix derived from the row's own
+   *  key, never from render order, so a handle names the same row on every render:
+   *  a click can resolve to nothing, never to a different row. */
   private uniqueItemId(element: Node, rawId: string | undefined): string | undefined {
     if (rawId === undefined) return rawId;
-    const prior = this.itemIdByNode.get(element);
-    if (prior !== undefined) return prior; // same element within a render → same id
-    let id = rawId;
-    for (let n = 2; this.usedItemIds.has(id); n++) id = `${rawId}~dup${n}`;
-    this.usedItemIds.add(id);
-    this.itemIdByNode.set(element, id);
-    return id;
+    const owner = this.idOwner.get(rawId);
+    const ownerKept = owner !== undefined && owner !== element && this.rowCache.get(rowKey(owner)) === owner;
+    if (!ownerKept) {
+      this.idOwner.set(rawId, element);
+      return rawId;
+    }
+    return `${rawId}~dup:${opaqueId(rowKey(element))}`;
   }
 
   private buildTreeItem(element: Node): vscode.TreeItem {
@@ -3355,19 +4054,25 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
   }
 
   private hostItem(node: HostNode): vscode.TreeItem {
-    const needsYou = node.projects.reduce((n, p) => n + this.remoteProjectNeedsYou(p), 0);
-    const expanded = projectExpanded(this.density(), this.collapseOverride, needsYou);
+    // The density default, never the needs-you state: opening a group that comes
+    // to need you goes through the view (expandRow), and a collapsibleState that
+    // followed needs-you would redraw the group, dropping its rows, each time it
+    // changed.
+    const expanded = projectExpanded(this.density(), this.collapseOverride, 0);
     const item = new vscode.TreeItem(
       hostDisplayLabel(node.snapshot.host),
       expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed
     );
-    item.id = `host:${node.snapshot.host.id}#g${this.generation}${this.densitySuffix(expanded)}`;
+    item.id = `host:${node.snapshot.host.id}#g${this.generation}`;
     item.contextValue = "host-remote";
     const count = node.projects.reduce((n, p) => n + p.sessions.length, 0);
     // Staleness lives in the (naturally dim) description; a stale host also mutes
     // its icon color — the dimming conventions this file already uses.
     if (node.stale) {
-      item.description = `${count} · last seen ${fmtAge(node.lastSeenSec)} ago`;
+      // Liveness always shows and is never held back: going stale or coming back
+      // redraws the host at once, even though that drops its rows for a round
+      // trip. Open, without the "last seen" age, which would go stale (groupOpen).
+      item.description = this.groupOpen(node, expanded) ? `${count} · offline` : `${count} · last seen ${fmtAge(node.lastSeenSec)} ago`;
       item.iconPath = new vscode.ThemeIcon("server-environment", new vscode.ThemeColor("disabledForeground"));
     } else {
       item.description = String(count);
@@ -3390,13 +4095,20 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     const counts = tallyRemoteSessions(
       node.projects.flatMap((p) => p.sessions.map((s) => s.session))
     );
-    const facts = hostFactLines({
+    const allFacts = hostFactLines({
       platform: h.platform,
       counts,
       lastSeenSec: node.lastSeenSec,
       stale: node.stale,
       skewVersion: skew.skew ? skew.version : undefined,
     });
+    // Open: no status tally and no snapshot age, which change without the host's
+    // rows changing (see groupOpen); the rows below show them.
+    const facts = this.groupOpen(node, expanded)
+      ? allFacts
+          .filter((l) => !l.startsWith("received "))
+          .map((l, i) => (i === 1 ? `${h.platform} · ${plural(count, "session")}` : l))
+      : allFacts;
     // First fact line is the liveness tri-state — lead it with a colored dot; the
     // rest are own-side enums/numbers/version, all escaped via mdText under supportHtml.
     facts.forEach((line, i) => {
@@ -3412,15 +4124,22 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
 
   private remoteProjectItem(node: RemoteProjectNode): vscode.TreeItem {
     const needsYou = this.remoteProjectNeedsYou(node);
-    const expanded = projectExpanded(this.density(), this.collapseOverride, needsYou);
+    // The density default, never the needs-you state: opening a group that comes
+    // to need you goes through the view (expandRow), and a collapsibleState that
+    // followed needs-you would redraw the group, dropping its rows, each time it
+    // changed.
+    const expanded = projectExpanded(this.density(), this.collapseOverride, 0);
     const item = new vscode.TreeItem(
       projectDisplayName(node.cwd),
       expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed
     );
-    item.id = `remote-project:${node.hostId}:${node.cwd}#g${this.generation}${this.densitySuffix(expanded)}`;
+    item.id = `remote-project:${node.hostId}:${node.cwd}#g${this.generation}`;
     item.contextValue = "remote-project";
     const newestAge = Math.min(...node.sessions.map((s) => s.ageSec), Number.POSITIVE_INFINITY);
-    if (this.density() === "compact") {
+    if (this.groupOpen(node, expanded)) {
+      // Open: only what changes with its rows (see groupOpen).
+      item.description = String(node.sessions.length);
+    } else if (this.density() === "compact") {
       const working = node.sessions.filter((s) => !s.stale && s.session.status === "working").length;
       const unread = node.sessions.filter((s) => s.unread).length;
       item.description = compactProjectDescription({
@@ -3451,11 +4170,14 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     // `remoteSession` (not `session-remote`): the showLastMessage menu matches
     // `viewItem =~ /^session/`, which `session-remote` would trip — this value
     // avoids every existing session/project menu so remote rows stay read-only.
-    item.contextValue = "remoteSession";
+    // "remoteSession-stop": its host says it can stop it (Stop Session, relayed).
+    item.contextValue = s.stoppable === true && !node.stale && s.tool !== "cursor" ? "remoteSession-stop" : "remoteSession";
     const running = (s.children ?? []).filter((c) => remoteChildRunning(c.status)).length;
     const parts: string[] = [fmtAge(node.ageSec)];
     if (running > 0) parts.push(`⚙${running}`);
     if (s.tool !== "claude") parts.push("❯");
+    // Outside: a small badge after the label (see OUTSIDE_GLYPH), not a word in it.
+    if (s.outside === true && !node.stale) item.resourceUri = outsideResourceUri(`remote:${node.hostId}:${s.id}`);
     item.description = parts.join(" ");
     if (s.tool === "cursor") item.iconPath = this.brandIcon("cursor");
     else if (s.tool === "codex") item.iconPath = this.brandIcon("codex");
@@ -3481,6 +4203,14 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     md.appendMarkdown(`** — `);
     this.mdText(md, s.status);
     md.appendMarkdown(`\n\n---\n\n$(watch) ${rStale ? "last known" : "live"} · ${fmtAge(node.ageSec)} ago\n\n`);
+    if (s.outside === true && !rStale) {
+      // Stop only when that host says it can (an older host's window offers Move only).
+      md.appendMarkdown(
+        s.stoppable === true
+          ? `$(link-external) Runs outside the editor on that host. Clicking it offers Move into Editor and Stop Session in the window attached to that host; Stop Session here asks that window to stop it.\n\n`
+          : `$(link-external) Runs outside the editor on that host. Clicking it offers Move into Editor in the window attached to that host.\n\n`
+      );
+    }
     if (s.lastText !== undefined && s.lastText !== "") {
       md.appendMarkdown("---\n\n");
       this.mdText(md, s.lastText);
@@ -3522,7 +4252,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       `Needs you (${n})`,
       expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed
     );
-    item.id = `inbox#g${this.generation}${this.densitySuffix(expanded)}`;
+    item.id = `inbox#g${this.generation}`;
     item.contextValue = "inbox";
     item.iconPath = new vscode.ThemeIcon("bell-dot", new vscode.ThemeColor("charts.red"));
     item.tooltip = new vscode.MarkdownString(
@@ -3572,21 +4302,20 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       return item;
     }
     const needsYou = this.projectNeedsYou(node);
-    // Auto-expand must never bury a nested worktree that needs you (the "needs-you is
-    // never buried" covenant): fold the worktree children's needs-you into the expand
-    // decision so a real main-repo parent opens when a child worktree is blocked, even
-    // if the parent's own rows are quiet. The row's own count/description stays its own.
-    const expandNeedsYou =
-      needsYou + node.worktrees.reduce((n, w) => n + this.projectNeedsYou(w), 0);
-    const expanded = projectExpanded(this.density(), this.collapseOverride, expandNeedsYou);
+    // A main-repo parent whose worktree comes to need you is opened by
+    // openNeedsYouGroups, which counts the worktrees' needs-you too.
+    // The density default, never the needs-you state: opening a group that comes
+    // to need you goes through the view (expandRow), and a collapsibleState that
+    // followed needs-you would redraw the group, dropping its rows, each time it
+    // changed.
+    const expanded = projectExpanded(this.density(), this.collapseOverride, 0);
     const item = new vscode.TreeItem(
       projectDisplayName(node.cwd),
       expanded ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed
     );
-    // The density suffix rides the auto-expand decision so a project that comes to
-    // (or ceases to) need you re-applies its collapsibleState instead of keeping
-    // VS Code's remembered one — the "needs-you is never buried" covenant.
-    item.id = `${node.cwd}#g${this.generation}${this.densitySuffix(expanded)}`;
+    // A stable id: a project that comes to need you is opened through the view
+    // (expandRow), not by changing its id — the "needs-you is never buried" covenant.
+    item.id = `${node.cwd}#g${this.generation}`;
     // contextValue gates the Pin/Unpin menu items; the two variants let the menu
     // show exactly one of them per row.
     const pinned = this.isPinned(node.cwd);
@@ -3608,7 +4337,11 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       ...node.codexes.filter((c) => !c.dimmed).map((c) => c.row.ageSec),
       Number.POSITIVE_INFINITY
     );
-    if (this.density() === "compact") {
+    const open = this.groupOpen(node, expanded);
+    if (open) {
+      // Open: only what changes with its rows (see groupOpen).
+      item.description = pinned ? `📌 · ${total}` : String(total);
+    } else if (this.density() === "compact") {
       // Pressure summary (🔔needs-you · count · ↻working · ●unread · age) so a
       // folded project still says how loudly it wants you. 📌 stays first for pins.
       const summary = compactProjectDescription({
@@ -3634,13 +4367,13 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     if (node.branch !== undefined && node.branch !== "") {
       item.description = `⑂ ${node.branch} · ${item.description}`;
     }
-    item.tooltip = this.projectTooltip(node, working, unread);
+    item.tooltip = this.projectTooltip(node, working, unread, open);
     // no icon on group rows: leaf children don't reserve chevron space, so any
     // parent icon would sit misaligned to the right of the session icons
     return item;
   }
 
-  private projectTooltip(node: ProjectNode, working: number, unread: number): vscode.MarkdownString {
+  private projectTooltip(node: ProjectNode, working: number, unread: number, open = false): vscode.MarkdownString {
     const md = new vscode.MarkdownString(undefined, true);
     md.supportHtml = true;
     // ── Header: project name + a compact roll-up (N sessions · W working · U unread).
@@ -3649,6 +4382,16 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     md.appendMarkdown(
       `** — ${plural(node.sessions.length + node.cursors.length + node.codexes.length, "session")}`
     );
+    if (open) {
+      // Open: the rows below say how each session is doing (see groupOpen).
+      if (node.branch !== undefined && node.branch !== "") {
+        md.appendMarkdown(`\n\n$(git-branch) worktree · branch `);
+        this.mdText(md, node.branch);
+      }
+      md.appendMarkdown(`\n\n---\n\n$(folder) `);
+      this.mdText(md, node.cwd);
+      return md;
+    }
     if (working > 0) md.appendMarkdown(` · ${working} working`);
     if (unread > 0) md.appendMarkdown(` · ${unread} unread`);
     if (node.branch !== undefined && node.branch !== "") {
@@ -3784,6 +4527,16 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     return item;
   }
 
+  /** sessionHasDetails, read again only when the session's activity moved. */
+  private hasDetails(row: SessionRow): boolean {
+    const at = `${row.mtimeMs}|${row.activity.newestMs}`;
+    const hit = this.detailsMemo.get(row.meta.sessionId);
+    if (hit !== undefined && hit.at === at) return hit.has;
+    const has = sessionHasDetails(row.meta, row.homeDir);
+    this.detailsMemo.set(row.meta.sessionId, { at, has });
+    return has;
+  }
+
   private sessionItem(node: SessionNode): vscode.TreeItem {
     if (node.dimmed) return this.lockedItem("session:" + node.row.meta.sessionId);
     const { row } = node;
@@ -3791,14 +4544,19 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     // Expandable only when the setting is on AND there's something to show; the id
     // carries the generation so toggling the setting re-applies collapsibleState.
     const expandable =
-      (this.activityTree() && sessionHasDetails(row.meta, row.homeDir)) ||
+      (this.activityTree() && this.hasDetails(row)) ||
       node.codexChildren.length > 0;
     const item = new vscode.TreeItem(
       this.titleWithFallback(row, fallback),
       expandable ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None
     );
     item.id = `${row.meta.sessionId}#g${this.generation}`;
-    item.contextValue = row.meta.entrypoint === "claude-vscode" ? "session" : "session-terminal";
+    const loc = this.locationOf(row);
+    const outside = loc.location === "outside";
+    // Outside first: an app can claim the extension's entrypoint (see classifyLocation).
+    item.contextValue = outside
+      ? "session-outside"
+      : (row.meta.entrypoint === "claude-vscode" ? "session" : "session-terminal") + (loc.location !== "unknown" ? "-stop" : "");
 
     const act = row.activity;
     const terminal = row.meta.entrypoint !== "claude-vscode";
@@ -3848,7 +4606,9 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     // badge) when more than one account is present, so single-account rows are
     // rendered exactly as before. (A free-tier-locked row never reaches here — it
     // early-returns as a placeholder above.)
-    if (this.multiHome) item.resourceUri = sessionResourceUri(row.homeLabel, row.meta.sessionId);
+    // An outside row adds its badge to the same URI (one resourceUri per row).
+    if (this.multiHome) item.resourceUri = sessionResourceUri(row.homeLabel, row.meta.sessionId, outside);
+    else if (outside) item.resourceUri = outsideResourceUri("session:" + row.meta.sessionId);
 
     const orchestrating = act.agents > 0 || act.workflows > 0;
     const vis = sessionVisual(kind, orchestrating);
@@ -3866,10 +4626,15 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     this.mdText(md, title);
     md.appendMarkdown(`** — ${this.statusPhrase(node)}\n\n---\n\n`);
     // ── Identity & metrics group.
-    const kindLabel = terminal ? "$(terminal) terminal" : "$(window) IDE";
+    const kindLabel = outside ? "$(link-external) outside" : terminal ? "$(terminal) terminal" : "$(window) IDE";
     md.appendMarkdown(`$(account) `);
     this.mdText(md, row.homeLabel);
     md.appendMarkdown(` · ${kindLabel} · $(watch) ${fmtAge(row.ageSec)} ago\n\n`);
+    if (outside) {
+      md.appendMarkdown(`$(link-external) `);
+      this.mdText(md, outsideSentence(loc));
+      md.appendMarkdown(`\n\n`);
+    }
     const times = sessionTimeFacts(
       sessionBirthMs(row.meta, row.homeDir, row.mainMtimeMs),
       row.meta.startedAt
@@ -4050,6 +4815,30 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     return item;
   }
 
+  /** The row's display title (same as the tree label), for dialogs. */
+  sessionTitle(row: SessionRow): string {
+    return sanitizeReason(this.titleWithFallback(row, row.meta.name ?? row.meta.sessionId.slice(0, 8)), 80);
+  }
+
+  /** Where a Claude session's process runs (editor / tmux / outside / unknown). */
+  locationOf(row: SessionRow): LocationVerdict {
+    return sessionLocation(row.meta.pid, row.meta.procStart, row.meta.entrypoint, this.familyRoots, {
+      editorPids: this.terminalPids,
+      startedAt: row.meta.startedAt,
+    });
+  }
+
+  /** Where a Codex session runs. Only a live, interactive, user-run session gets a
+   *  verdict: exec runs and agent-spawned runs end on their own and are not moved. */
+  codexLocationOf(row: CodexRow): LocationVerdict {
+    if (!row.live || row.pid === undefined || row.external || row.kind !== "codex") return { location: "unknown" };
+    if (row.parentClaudePid !== undefined) return { location: "unknown" };
+    // The census pairs pid and rollout by folder; only a pid that holds this
+    // rollout open is provably this session.
+    if (!pidHasOpen(row.pid, row.rolloutPath)) return { location: "unknown" };
+    return sessionLocation(row.pid, undefined, undefined, this.familyRoots, { editorPids: this.terminalPids });
+  }
+
   private codexItem(node: CodexNode): vscode.TreeItem {
     if (node.dimmed) return this.lockedItem("codex:" + node.row.id);
     const { row } = node;
@@ -4057,10 +4846,16 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     item.id = `codex:${row.id}#g${this.generation}`;
     // Orphan + demoted rows keep the normal "codex" contextValue so they inherit the
     // existing hide (= dismiss) and Session Properties menu actions (#53).
-    item.contextValue = "codex";
+    // An outside interactive run gets "codex-outside" (menus match /^codex/), which
+    // adds the move action.
+    const loc = node.demoted ? { location: "unknown" as const } : this.codexLocationOf(row);
+    const outside = loc.location === "outside";
+    // A run whose place is known gets "codex-stop": Stop Session.
+    item.contextValue = outside ? "codex-outside" : loc.location !== "unknown" ? "codex-stop" : "codex";
     // age glyphs: ●(unread) + age + ❯ (Codex sessions are always terminal-run). A
     // finished-unread row also says WHAT it finished (last_agent_message snippet).
     const codexCaption = doneCaption(node.unread, row.lastAgentMessage);
+    if (outside) item.resourceUri = outsideResourceUri("codex:" + row.id);
     item.description = `${node.unread ? "● " : ""}${fmtAge(row.ageSec)} ❯${codexCaption !== undefined ? ` · ${codexCaption}` : ""}`;
     item.iconPath = this.brandIcon("codex");
     const md = new vscode.MarkdownString(undefined, true);
@@ -4098,8 +4893,13 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       this.mdText(md, parts.join(" · "));
       md.appendMarkdown(`\n\n`);
     }
-    md.appendMarkdown(`$(terminal) terminal · $(watch) ${fmtAge(row.ageSec)} ago`);
+    // Outside: say so, not "terminal" (the next line says where it runs).
+    md.appendMarkdown(`${outside ? "$(link-external)" : "$(terminal)"} ${cliKindWord(outside)} · $(watch) ${fmtAge(row.ageSec)} ago`);
     if (row.pid !== undefined) md.appendMarkdown(` · pid ${row.pid}`);
+    if (outside) {
+      md.appendMarkdown(`\n\n$(link-external) `);
+      this.mdText(md, outsideSentence(loc));
+    }
     md.appendMarkdown(`\n\n$(key) `);
     this.mdText(md, `session ${row.id}`);
     md.appendMarkdown(`\n\n$(folder) `);
@@ -4194,4 +4994,111 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     item.tooltip = this.hover(t.subject, t.path, lines);
     return item;
   }
+}
+
+// ---- row clicks that survive a refresh ----------------------------------------
+// Row clicks that survive a tree refresh.
+//
+// VS Code keeps a tree item's command arguments in the extension host under a
+// per-render id ("sessionDeck.focusRemoteSession /36") and drops them the moment
+// the provider fires a full refresh, before the window has fetched the new rows.
+// A click on a row still on screen in that gap fails inside VS Code with "Actual
+// command not found, wanted to execute …" and never reaches us. In a remote
+// window the gap is a network round trip per refresh, and on a busy host the tree
+// refreshes every few seconds, so clicks failed often.
+//
+// The fix: rows carry an argument-free command (nothing for VS Code to drop), and
+// the handler finds the row through the view's selection, which VS Code sends
+// before running a click's command and resolves by item id against the CURRENT
+// render. The real command and arguments are kept here per element.
+
+/** The slice of TreeView that revealWhenVisible uses. */
+export interface RevealView<T> {
+  readonly visible: boolean;
+  reveal(element: T, options: { expand: boolean; select: boolean; focus: boolean }): Thenable<void>;
+  onDidChangeVisibility(listener: (e: { visible: boolean }) => void): vscode.Disposable;
+}
+
+/** Open groups through `view.reveal(expand)`, but only while the view is visible:
+ *  the editor's reveal opens the view first ($reveal → openView), so revealing
+ *  while it is hidden would bring the Sessions view back over whatever the user
+ *  is looking at. A request made while hidden, or a reveal that failed, waits and
+ *  is replayed when the view next becomes visible; a row gone by then is dropped. */
+export function revealWhenVisible<T>(
+  view: RevealView<T>,
+  stillThere: (element: T) => boolean
+): { expand: (element: T) => void; dispose: () => void } {
+  const pending = new Set<T>();
+  const flush = (): void => {
+    if (!view.visible) return;
+    for (const el of [...pending]) {
+      pending.delete(el);
+      if (!stillThere(el)) continue;
+      Promise.resolve(view.reveal(el, { expand: true, select: false, focus: false })).catch(() => pending.add(el));
+    }
+  };
+  const sub = view.onDidChangeVisibility(() => flush());
+  return {
+    expand: (el) => {
+      pending.add(el);
+      flush();
+    },
+    dispose: () => sub.dispose(),
+  };
+}
+
+export const ROW_CLICK_CMD = "sessionDeck.rowClick";
+
+export class RowClickIndex<T extends object> {
+  private byElement = new WeakMap<T, vscode.Command>();
+
+  /** Swap an argument-bearing row command for the argument-free one, keeping the
+   *  original for `commandFor`. Only `vscode.open` is left alone: VS Code passes an
+   *  API command's arguments inline instead of caching them. */
+  wrap(item: vscode.TreeItem, element: T): vscode.TreeItem {
+    const cmd = item.command;
+    if (cmd === undefined || cmd.arguments === undefined || cmd.arguments.length === 0) return item;
+    if (cmd.command === "vscode.open") return item; // an API command: arguments travel inline
+    this.byElement.set(element, cmd);
+    item.command = { command: ROW_CLICK_CMD, title: cmd.title, tooltip: cmd.tooltip };
+    return item;
+  }
+
+  commandFor(element: T | undefined): vscode.Command | undefined {
+    return element === undefined ? undefined : this.byElement.get(element);
+  }
+}
+
+/** The provider the view is given: the same rows, with click commands wrapped. */
+export function clickSafeProvider<T extends object>(
+  inner: vscode.TreeDataProvider<T>,
+  index: RowClickIndex<T>
+): vscode.TreeDataProvider<T> {
+  const out: vscode.TreeDataProvider<T> = {
+    onDidChangeTreeData: inner.onDidChangeTreeData,
+    getChildren: (element?: T) => inner.getChildren(element),
+    getTreeItem: (element: T) => {
+      const item = inner.getTreeItem(element);
+      if (typeof (item as Thenable<vscode.TreeItem>).then === "function") {
+        return Promise.resolve(item).then((i) => index.wrap(i, element));
+      }
+      return index.wrap(item as vscode.TreeItem, element);
+    },
+  };
+  if (inner.getParent !== undefined) {
+    const getParent = inner.getParent.bind(inner);
+    out.getParent = (element: T) => getParent(element);
+  }
+  return out;
+}
+
+/** What a click on the row should run, or the message to show when the row the
+ *  user clicked is gone from the current render (it was redrawn mid-click). */
+export function rowClickTarget<T extends object>(
+  selection: readonly T[],
+  index: RowClickIndex<T>
+): { command: vscode.Command } | { message: string } {
+  const cmd = selection.length === 1 ? index.commandFor(selection[0]) : undefined;
+  if (cmd !== undefined) return { command: cmd };
+  return { message: "SessionDeck: the list was redrawn as you clicked, so that click was lost. Click the row again." };
 }

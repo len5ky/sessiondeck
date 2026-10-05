@@ -348,6 +348,26 @@ export function projectDisplayName(cwd: string): string {
   return cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? cwd;
 }
 
+/** A Windows path with its drive letter upper-cased (`s:\\work` → `S:\\work`), so one
+ *  drive never shows as two project groups. Decided by the path's shape, not by
+ *  `process.platform`: a WSL or Linux window shows Windows hosts' paths too. Anything
+ *  else (POSIX paths such as `/mnt/c/...`, UNC paths) comes back unchanged. */
+export function normalizeDriveLetter(cwd: string): string {
+  return /^[a-z]:[\\/]/.test(cwd) ? cwd[0].toUpperCase() + cwd.slice(1) : cwd;
+}
+
+/** A stored pin map (cwd → ms) re-keyed by {@link normalizeDriveLetter}, so a pin
+ *  saved as `s:\\work` matches the `S:\\work` group. Two spellings of one folder
+ *  merge, keeping the newer time. Returns a fresh object. */
+export function normalizePinKeys(stored: Readonly<Record<string, number>>): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [cwd, ms] of Object.entries(stored)) {
+    const key = normalizeDriveLetter(cwd);
+    out[key] = Math.max(out[key] ?? ms, ms);
+  }
+  return out;
+}
+
 /** Sort: Name order for project rows. Rows show projectDisplayName(cwd), so that is
  *  what sorts (case-insensitively), with the full path only as a tiebreak. Sorting
  *  on the full cwd put worktrees in another parent folder out of visible order. */
@@ -554,6 +574,47 @@ export function glyphParts(row: SessionRow, terminal: boolean): string[] {
   return parts;
 }
 
+/** Mark on a session that runs outside the editor (not in an editor terminal or
+ *  tab, not in tmux). A word, not a glyph: it must read at a glance. */
+export const OUTSIDE_MARK = "outside";
+
+/** The preview a click on a Codex row opens: the same header as a Claude
+ *  session's preview, then the rollout's last agent message (read with the
+ *  turn-end scan, so no extra parsing), or a plain line when the current turn
+ *  has not finished. */
+export function codexPreviewMarkdown(row: { name: string; cwd: string; pid?: number; kind: string; lastAgentMessage?: string }): string {
+  const header = `# ${row.name}\n\n\`${row.cwd}\`${row.pid !== undefined ? ` · pid ${row.pid}` : ""} · ${row.kind}\n\n---\n\n`;
+  const msg = row.lastAgentMessage;
+  return header + (msg !== undefined && msg !== "" ? msg : "_No finished reply to show yet: Codex records the last message when a turn ends._");
+}
+
+/** The kind word in a terminal CLI's hover (Codex): "outside" for a run outside
+ *  the editor, never "terminal" next to the sentence saying where it runs. */
+export function cliKindWord(outside: boolean): string {
+  return outside ? OUTSIDE_MARK : "terminal";
+}
+
+/** The small badge on an outside row: at the end of a tree row (a file
+ *  decoration, drawn after the label so a long title can't truncate it) and of a
+ *  column-view row. An arrow out of the box reads as "elsewhere" at badge size and
+ *  is in the fonts VS Code ships on every platform. */
+export const OUTSIDE_GLYPH = "↗";
+/** The badge's tooltip. The row's hover still says where it runs. */
+export const OUTSIDE_TOOLTIP = "Runs outside the editor";
+
+/** The hover sentence on an outside row: where it runs, who started it, and what
+ *  the move action does. */
+export function outsideSentence(v: { where?: string; owner?: "sdk" | "agent" }): string {
+  const where = v.where !== undefined && v.where !== "" ? `, in ${v.where}` : "";
+  const owner =
+    v.owner === "sdk"
+      ? " It was started by another app through the Agent SDK; moving it takes it away from that app."
+      : v.owner === "agent"
+        ? " It was started by another agent; moving it takes it away from that agent."
+        : "";
+  return `Runs outside the editor${where}.${owner} Use Move into Editor to continue it here, or Stop Session to end it.`;
+}
+
 // ---- Icon visuals: single source of truth for the codicon + color a row shows,
 // used by both the sidebar tree (as ThemeIcon) and the webview panel (as a
 // codicon-font glyph), so the two surfaces are pixel-faithful. `icon` is the
@@ -726,9 +787,15 @@ export interface PanelSession {
   columns: SessionColumnFields;
   /** Session status icon (codicon id + color + spin). */
   icon: string;
+  /** Where it runs is known (outside, an editor terminal or tab, tmux): the row
+   *  offers Stop Session. */
+  stoppable?: true;
   iconColor?: string;
   spin: boolean;
   terminal: boolean;
+  /** Runs outside the editor (not an editor terminal/tab, not tmux): the row offers
+   *  Move into Editor. Local rows only; never sent to other hosts. */
+  outside?: boolean;
   homeLabel: string;
   /** VS Code theme color name for the account badge (e.g. "charts.purple"); only
    *  set for multi-home, non-primary accounts. */
@@ -929,9 +996,14 @@ export interface PanelCursor {
  *  attention — just status, age, kind and unread. */
 export interface PanelCodex {
   id: string;
+  /** Runs outside the editor: the row offers Move into Editor (see PanelSession). */
+  outside?: boolean;
   /** Free-tier LOCKED placeholder (see PanelSession.locked). */
   locked?: boolean;
   title: string;
+  /** Where it runs is known (outside, an editor terminal or tab, tmux): the row
+   *  offers Stop Session. */
+  stoppable?: true;
   statusKind: StatusKind;
   columns: SessionColumnFields;
   /** Dim inline description: age plus the ❯ terminal glyph (● prefix when unread). */
@@ -1049,6 +1121,8 @@ export interface PanelRemoteSession {
   hover: string;
   /** Activity-tree children (present only when the setting is on). */
   children: PanelRemoteChild[];
+  /** Runs outside the editor on its host (live snapshot only). */
+  outside?: true;
 }
 
 /** One cwd group inside a host section. */
@@ -1167,6 +1241,8 @@ export interface PanelInboxRow {
   spin: boolean;
   /** Brand mark (cursor/codex rows); undefined otherwise. */
   brand?: BrandIcon;
+  /** Offers Stop Session, as the real row does. */
+  stoppable?: true;
   hover: string;
   /** Exactly one of these is set for a local row (routes the click); remote → none. */
   sessionId?: string;
@@ -1176,6 +1252,8 @@ export interface PanelInboxRow {
    *  only when more than one account is present) — mirrors the real session row. */
   homeLabel?: string;
   homeColor?: string;
+  /** Runs outside the editor: the same badge as the real row. */
+  outside?: true;
 }
 
 // ---- Table view native context menus (webview/context) ---------------------
@@ -1202,16 +1280,23 @@ export const TABLE_CONTEXT_MENU: Readonly<Record<string, readonly string[]>> = {
   // Projects mirror the tree's project-pinned / project-unpinned contextValue.
   "project-unpinned": ["sessionDeck.pinProject", "sessionDeck.openProject"],
   "project-pinned": ["sessionDeck.unpinProject", "sessionDeck.openProject"],
-  // Claude session rows: hide + show-last-message + properties.
+  // Claude session rows: hide + show-last-message + properties, plus Move into
+  // Editor on rows that run outside the editor (gated on the `outside` context key,
+  // as the tree gates it on viewItem == session-outside).
   session: [
+    "sessionDeck.moveSession",
+    "sessionDeck.stopSession",
     "sessionDeck.hideSession",
     "sessionDeck.showLastMessage",
     "sessionDeck.sessionProperties",
   ],
-  // Cursor / Codex / Composer rows: hide + properties (no last-message),
-  // exactly as the tree gates them (viewItem == cursor|codex|composerSession).
+  // Cursor / Composer rows: hide + properties (no last-message preview exists),
+  // exactly as the tree gates them (viewItem == cursor|composerSession). Codex
+  // rows have a last-message preview (their click opens it), so they offer it too,
+  // and Move into Editor when they run outside the editor.
   cursor: ["sessionDeck.hideSession", "sessionDeck.sessionProperties"],
-  codex: ["sessionDeck.hideSession", "sessionDeck.sessionProperties"],
+  // Stop Session on Claude and Codex rows whose place is known (`stoppable` key).
+  codex: ["sessionDeck.moveSession", "sessionDeck.stopSession", "sessionDeck.hideSession", "sessionDeck.showLastMessage", "sessionDeck.sessionProperties"],
   composer: ["sessionDeck.hideSession", "sessionDeck.sessionProperties"],
 } as const;
 
@@ -1297,6 +1382,19 @@ export function ageBucket(sec: number | null): string {
   if (sec === null) return "new";
   if (sec < 60) return "<1m";
   return fmtAge(sec);
+}
+
+/** The path of a preview document, which its tab is titled after: the session's
+ *  title made safe for a file name ("Fix the login bug.md"), or `fallback` when
+ *  nothing is left. Identity travels in the uri's query, never in this path. */
+export function previewDocPath(title: string, fallback: string): string {
+  const clean = title
+    .replace(/[\\/:*?"<>|\u0000-\u001f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 60)
+    .trim();
+  return `/${clean !== "" ? clean : fallback}.md`;
 }
 
 /** Normalize sub-minute age tokens ("3s", "45s") inside a rendered string so a
@@ -1827,6 +1925,12 @@ export class RootFetchSignal {
       const timer = setTimeout(() => finish("timeout"), timeoutMs);
       this.waiters.push(() => setTimeout(() => finish("fetched"), settleMs));
     });
+  }
+
+  /** Someone is waiting for the next root fetch: the provider redraws the whole
+   *  tree rather than only the changed rows, so that fetch happens. */
+  get waiting(): boolean {
+    return this.waiters.length > 0;
   }
 
   /** Called by the provider from getChildren(root). */

@@ -2,7 +2,7 @@
   "name": "sessiondeck",
   "displayName": "SessionDeck",
   "description": "Every Claude Code, Codex and Cursor agent session on your machine in one tree, grouped by project. See which are working, finished or waiting on you, and click to jump to any of them.",
-  "version": "0.42.5",
+  "version": "0.42.6",
   "icon": "media/icon.png",
   "publisher": "len5ky",
   "license": "SEE LICENSE IN LICENSE",
@@ -211,6 +211,18 @@
         "category": "SessionDeck"
       },
       {
+        "command": "sessionDeck.moveSession",
+        "title": "Move into Editor",
+        "category": "SessionDeck",
+        "icon": "$(move)"
+      },
+      {
+        "command": "sessionDeck.stopSession",
+        "title": "Stop Session",
+        "category": "SessionDeck",
+        "icon": "$(debug-stop)"
+      },
+      {
         "command": "sessionDeck.sessionProperties",
         "title": "Session Properties",
         "category": "SessionDeck"
@@ -223,6 +235,16 @@
       {
         "command": "sessionDeck.focusRemoteSession",
         "title": "Focus Session on Host",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.rowClick",
+        "title": "Open Row",
+        "category": "SessionDeck"
+      },
+      {
+        "command": "sessionDeck.buyLicenseFromPanel",
+        "title": "Buy License",
         "category": "SessionDeck"
       },
       {
@@ -408,18 +430,36 @@
           "default": true,
           "description": "When opening SessionDeck as a floating window, pin it always-on-top. Ignored on hosts/platforms where always-on-top is unavailable."
         },
+        "sessionDeck.moveTarget": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "claudeTab",
+            "terminal"
+          ],
+          "enumDescriptions": [
+            "A Claude Code tab when the Claude Code extension is installed and the session's folder is open in this window; otherwise a terminal.",
+            "A Claude Code tab (needs the Claude Code extension; Codex sessions always use a terminal).",
+            "A terminal in this window running `claude --resume` (or `codex resume` for Codex)."
+          ],
+          "default": "auto",
+          "markdownDescription": "Where **Move into Editor** continues a session that was running outside the editor. The outside process is stopped first, then the session resumes here."
+        },
         "sessionDeck.editorCliPath": {
           "type": "string",
+          "scope": "machine",
           "default": "",
           "description": "Explicit path or name of the editor CLI used to focus other windows (e.g. 'code', 'code-insiders', 'codium', 'cursor', 'windsurf'). Auto-detected from the running editor when empty."
         },
         "sessionDeck.cursorCliPath": {
           "type": "string",
+          "scope": "machine",
           "default": "",
           "description": "(Deprecated — use editorCliPath) Path to the editor CLI used to focus other windows. Leave empty to auto-detect from the running editor."
         },
         "sessionDeck.extraConfigDirs": {
           "type": "array",
+          "scope": "machine",
           "items": {
             "type": "string"
           },
@@ -658,8 +698,18 @@
           "group": "1_hide@1"
         },
         {
+          "command": "sessionDeck.moveSession",
+          "when": "webviewId == sessionDeck.table && (webviewSection == session || webviewSection == codex) && outside",
+          "group": "0_move@1"
+        },
+        {
+          "command": "sessionDeck.stopSession",
+          "when": "webviewId == sessionDeck.table && (webviewSection == session || webviewSection == codex) && stoppable",
+          "group": "0_move@2"
+        },
+        {
           "command": "sessionDeck.showLastMessage",
-          "when": "webviewId == sessionDeck.table && webviewSection == session",
+          "when": "webviewId == sessionDeck.table && (webviewSection == session || webviewSection == codex)",
           "group": "9_open@1"
         },
         {
@@ -704,29 +754,65 @@
         },
         {
           "command": "sessionDeck.hideSession",
-          "when": "view == sessionDeck.sessions && (viewItem =~ /^session/ || viewItem == cursor || viewItem == composerSession || viewItem == codex)",
+          "when": "view == sessionDeck.sessions && (viewItem =~ /^session/ || viewItem == cursor || viewItem == composerSession || viewItem =~ /^codex/)",
           "group": "1_hide@1"
         },
         {
+          "command": "sessionDeck.moveSession",
+          "when": "view == sessionDeck.sessions && (viewItem == session-outside || viewItem == codex-outside)",
+          "group": "inline"
+        },
+        {
+          "command": "sessionDeck.moveSession",
+          "when": "view == sessionDeck.sessions && (viewItem == session-outside || viewItem == codex-outside)",
+          "group": "0_move@1"
+        },
+        {
+          "command": "sessionDeck.stopSession",
+          "when": "view == sessionDeck.sessions && (viewItem == session-outside || viewItem == codex-outside || viewItem =~ /-stop$/)",
+          "group": "inline"
+        },
+        {
+          "command": "sessionDeck.stopSession",
+          "when": "view == sessionDeck.sessions && (viewItem == session-outside || viewItem == codex-outside || viewItem =~ /-stop$/)",
+          "group": "0_move@2"
+        },
+        {
           "command": "sessionDeck.showLastMessage",
-          "when": "view == sessionDeck.sessions && viewItem =~ /^session/"
+          "when": "view == sessionDeck.sessions && (viewItem =~ /^session/ || viewItem =~ /^codex/)"
         },
         {
           "command": "sessionDeck.sessionProperties",
-          "when": "view == sessionDeck.sessions && (viewItem =~ /^session/ || viewItem == cursor || viewItem == composerSession || viewItem == codex)"
+          "when": "view == sessionDeck.sessions && (viewItem =~ /^session/ || viewItem == cursor || viewItem == composerSession || viewItem =~ /^codex/)"
         },
         {
           "command": "sessionDeck.showRemoteLastMessage",
-          "when": "view == sessionDeck.sessions && viewItem == remoteSession"
+          "when": "view == sessionDeck.sessions && (viewItem == remoteSession || viewItem == remoteSession-stop)"
         }
       ],
       "commandPalette": [
+        {
+          "command": "sessionDeck.rowClick",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.buyLicenseFromPanel",
+          "when": "false"
+        },
         {
           "command": "sessionDeck.openSession",
           "when": "false"
         },
         {
           "command": "sessionDeck.showLastMessage",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.moveSession",
+          "when": "false"
+        },
+        {
+          "command": "sessionDeck.stopSession",
           "when": "false"
         },
         {

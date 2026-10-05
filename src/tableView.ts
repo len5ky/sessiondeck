@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { nonce, brandSvg, stableModelKey } from "./panel";
-import { PanelModel } from "./format";
+import { OUTSIDE_GLYPH, OUTSIDE_TOOLTIP, PanelModel } from "./format";
 
 interface InboundMessage {
   type?: unknown;
@@ -194,6 +194,10 @@ function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   @keyframes tv-brand-spin { 100% { transform: rotate(360deg); } }
 
   .label { flex: 1 1 auto; min-width: 24px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Outside the editor: a small muted glyph after the title (the title truncates, the badge does not). */
+  .mark-outside { flex: 0 0 auto; margin-left: 6px; color: var(--vscode-descriptionForeground); font-size: 0.9em; white-space: nowrap; }
+  /* Account letter, then the glyph, as the tree's badge reads ("S↗"). */
+  .badge-acct + .mark-outside { margin-left: 1px; }
   /* Project / host names keep their real case: upper-casing made them wider and
      harder to read, so a normal sidebar clipped them ("INFRASTRUCTU..."). */
   .section-label { flex: 0 1 auto; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -319,6 +323,13 @@ function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   // breaks out of the attribute, so there is no XSS surface — and native menu labels
   // come from package.json, never from data.
   function ctx(obj) { return ' data-vscode-context="' + esc(JSON.stringify(obj)) + '"'; }
+  // A session or codex row's menu keys: "outside" (Move into Editor) and
+  // "stoppable" (Stop Session), each only when the row has it.
+  function rowCtx(base, r) {
+    if (r.outside) base.outside = true;
+    if (r.stoppable) base.stoppable = true;
+    return base;
+  }
   function colorClass(name) { return name ? "col-" + String(name).split(".").join("-") : ""; }
 
   function densityDefaultOpen(needsYou) {
@@ -412,12 +423,13 @@ function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
     let out =
       '<div class="row session' + (s.freeTier ? " free-tier" : "") + '" data-nav="' + esc(s.sessionId) + '"' +
         (hasKids ? ' data-toggle-session="' + esc(s.sessionId) + '"' : "") +
-        ctx({ webviewSection: "session", sessionId: s.sessionId }) + '>' +
+        ctx(rowCtx({ webviewSection: "session", sessionId: s.sessionId }, s)) + '>' +
         '<div class="mainline" title="' + esc(s.hover) + '">' +
           twistie(open, hasKids) +
           iconHtml(s.icon, s.iconColor, s.spin) +
           '<span class="label ' + a.cls + '">' + esc(s.title) + '</span>' +
           a.badge +
+          (s.outside ? OUTSIDE_BADGE : "") +
           metrics(s.statusKind, s.columns) +
         '</div>' +
         sublineHtml(foldCols(s.columns)) +
@@ -432,6 +444,8 @@ function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
     return out;
   }
 
+  // After the title, outside the truncating label span, so a long title can't hide it.
+  const OUTSIDE_BADGE = ${JSON.stringify(`<span class="mark-outside" title="${OUTSIDE_TOOLTIP}" aria-label="${OUTSIDE_TOOLTIP}">${OUTSIDE_GLYPH}</span>`)};
   function leafRow(opts) {
     // opts: { cls, section, idAttr, dim, nonav, hover, icon, iconColor, spin, brand,
     //         title, kind, columns, subInner }
@@ -443,6 +457,7 @@ function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
           twistie(false, false) +
           iconHtml(opts.icon, opts.iconColor, opts.spin, opts.brand) +
           '<span class="label">' + esc(opts.title) + '</span>' +
+          (opts.outside ? OUTSIDE_BADGE : "") +
           metrics(opts.kind, opts.columns) +
         '</div>' +
         sublineHtml(opts.subInner !== undefined ? opts.subInner : foldCols(opts.columns)) +
@@ -472,11 +487,11 @@ function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
     const prov = opts.child && c.provenance ? '<span class="prov">' + esc(c.provenance) + '</span>' : "";
     const fc = foldCols(c.columns);
     return leafRow({
-      cls: "codex", section: { webviewSection: "codex", codexId: c.id },
+      cls: "codex", section: rowCtx({ webviewSection: "codex", codexId: c.id }, c),
       idAttr: c.demoted ? "" : ' data-codex="' + esc(c.id) + '"',
       dim: dim, nonav: c.demoted,
       hover: c.hover, icon: c.icon, iconColor: c.iconColor, spin: c.spin, brand: c.brand,
-      title: c.title, kind: c.statusKind, columns: c.columns,
+      title: c.title, kind: c.statusKind, columns: c.columns, outside: c.outside,
       subInner: prov + fc,
     });
   }
@@ -526,9 +541,9 @@ function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
     // Inbox rows are a VIEW of the real rows below; hide/props act on the real row
     // (its section carries the real id), matching the tree's inbox-ref semantics.
     const section =
-      r.kind === "session" ? { webviewSection: "session", sessionId: r.sessionId }
+      r.kind === "session" ? rowCtx({ webviewSection: "session", sessionId: r.sessionId }, r)
       : r.kind === "cursor" ? { webviewSection: "cursor", chatId: r.chatId }
-      : r.kind === "codex" ? { webviewSection: "codex", codexId: r.codexId }
+      : r.kind === "codex" ? rowCtx({ webviewSection: "codex", codexId: r.codexId }, r)
       : null;
     const a = acctBadge(multiHome, r.homeColor, r.homeLabel);
     return (
@@ -538,6 +553,7 @@ function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
           iconHtml(r.icon, r.iconColor, r.spin, r.brand) +
           '<span class="label ' + a.cls + '">' + esc(r.title) + '</span>' +
           a.badge +
+          (r.outside ? OUTSIDE_BADGE : "") +
           metrics(r.statusKind, r.columns) +
         '</div>' +
         sublineHtml(foldCols(r.columns)) +
@@ -611,6 +627,7 @@ function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
           twistie(open, hasKids) +
           iconHtml(s.icon, s.iconColor, s.spin, s.brand) +
           '<span class="label">' + esc(s.title) + '</span>' +
+          (s.outside ? OUTSIDE_BADGE : "") +
           metrics(s.statusKind, s.columns) +
         '</div>' +
         sublineHtml(foldCols(s.columns)) +

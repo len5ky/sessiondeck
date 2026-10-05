@@ -21,9 +21,13 @@ import {
   seedTrialStart,
   validateSnapshot,
   validateAction,
+  validateFocusResult,
+  takeActionsFromDir,
+  takeResultFromDir,
+  ACTION_ID_RE,
   HOST_ID_RE,
 } from "../../src/bridgeSchema";
-import type { LegacyStateDoc, StoredHostSnapshot, FocusAction, BridgeLicense, CursorEnumSessionWire, CursorSessionsResult } from "../../src/bridgeSchema";
+import type { FocusResult, LegacyStateDoc, StoredHostSnapshot, FocusAction, BridgeLicense, CursorEnumSessionWire, CursorSessionsResult } from "../../src/bridgeSchema";
 import { extractPanelTitles, readComposerEnumeration } from "../../src/titleExtract";
 import { sqliteSelect } from "../../src/sqliteRead";
 
@@ -36,14 +40,15 @@ import { sqliteSelect } from "../../src/sqliteRead";
 
 const MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000; // 14 days — prune horizon
 const TITLES_TTL_MS = 10_000; // re-extract panel titles at most every 10s
-const ACTION_TTL_MS = 60_000; // a stale click must never fire minutes later
 const ACTION_QUEUE_CAP = 20; // per-host pending-action ceiling (drop oldest)
 
 type IngestResult = { ok: true } | { ok: false; error: string };
 type CacheEntry = { mtimeMs: number; doc: StoredHostSnapshot };
 type TitlesResult = { ok: true; titles: Record<string, string> } | { ok: false; error: string };
 type PostResult = { ok: true } | { ok: false; error: string };
-type TakeResult = { ok: true; actions: FocusAction[] } | { ok: false; error: string };
+type TakeResult = { ok: true; actions: FocusAction[]; remainingMs: Record<string, number> } | { ok: false; error: string };
+type TakeFocusResult = { ok: true; result?: FocusResult } | { ok: false; error: string };
+const RESULT_TTL_MS = 120_000; // an unread focus result is pruned after this
 
 const LICENSE_TRIAL_KEY = "licenseTrialStart";
 
@@ -111,9 +116,26 @@ async function migrateRenameState(context: vscode.ExtensionContext): Promise<Leg
   return mementos;
 }
 
+/** Test seam: startup step names that throw on purpose (test/activationHarness.ts). */
+export const injectedStartupFaults = new Set<string>();
+
+/** One setup step before the commands are registered: a throw is logged and the
+ *  fallback used, so a failing step can never leave the bridge commands
+ *  unregistered (the main extension would then see the companion as absent). */
+function startupStep<T>(name: string, fn: () => T, fallback: T): T {
+  try {
+    if (injectedStartupFaults.has(name)) throw new Error(`injected failure in ${name}`);
+    return fn();
+  } catch (err) {
+    console.warn(`[sessiondeck-bridge] ${name} failed: ${String(err)}`);
+    return fallback;
+  }
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   let legacyRead: LegacyRead = null;
   try {
+    if (injectedStartupFaults.has("rename migration")) throw new Error("injected failure in rename migration");
     legacyRead = await migrateRenameState(context);
   } catch (err) {
     console.warn(`[sessiondeck-bridge] rename migration was incomplete: ${String(err)}`);
@@ -126,6 +148,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // validator, which is what makes it safe as a directory name.
   const actionsDir = join(context.globalStorageUri.fsPath, "actions");
   const claimsDir = join(context.globalStorageUri.fsPath, "claims");
+  // Command rev 4: windows/<hostId>/<window>.json = the folders each window on
+  // that host has open, so an action goes to the window that has its folder.
+  const windowsDir = join(context.globalStorageUri.fsPath, "windows");
+  // Focus results (command rev 3): the host that acted on a focus action writes
+  // results/<action id>.json; the window that posted it takes it. One shared dir
+  // for every window on this desktop, like actions/.
+  const resultsDir = join(context.globalStorageUri.fsPath, "results");
   // Desktop-side Claude panel titles for remote (WSL/SSH) windows: the main
   // extension there can't reach this machine's workspaceStorage, so it asks us.
   // Derive the workspaceStorage root from OUR OWN globalStorage dir — editor- and
@@ -165,7 +194,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       enumWatcher.on("error", rearmEnumWatch);
     } catch { /* pulls remain correct without the optimization */ }
   };
-  armEnumWatch();
+  startupStep("enum watch", armEnumWatch, undefined);
   context.subscriptions.push({ dispose: () => {
     enumWatchDisposed = true;
     enumWatcher?.close();
@@ -254,8 +283,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // caching the last-read doc + mtime so list() only re-reads changed files.
   const store = new Map<string, CacheEntry>();
 
-  const pkg = context.extension.packageJSON as { version?: unknown };
-  const version = typeof pkg.version === "string" ? pkg.version : "0.0.0";
+  const version = startupStep(
+    "package version",
+    () => {
+      const pkg = context.extension.packageJSON as { version?: unknown };
+      return typeof pkg.version === "string" ? pkg.version : "0.0.0";
+    },
+    "0.0.0"
+  );
 
   // Register all commands together once rename migration has settled. VS Code
   // awaits this activation promise before completing a command-triggered probe.
@@ -267,7 +302,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand("sessionDeckBridge.cursorSessions", (arg: unknown) => cursorSessionsRpc(arg)),
     vscode.commands.registerCommand("sessionDeckBridge.license", () => license()),
     vscode.commands.registerCommand("sessionDeckBridge.postAction", (action: unknown) => postAction(action)),
-    vscode.commands.registerCommand("sessionDeckBridge.takeActions", (hostId: unknown) => takeActions(hostId)),
+    vscode.commands.registerCommand("sessionDeckBridge.takeActions", (hostId: unknown, route?: unknown) => takeActions(hostId, route)),
+    // Command rev 3. The acting host reports what it did with a focus action; the
+    // posting window takes that report (once) to tell the user.
+    vscode.commands.registerCommand("sessionDeckBridge.postFocusResult", (r: unknown) => postFocusResult(r)),
+    vscode.commands.registerCommand("sessionDeckBridge.takeFocusResult", (id: unknown) => takeFocusResult(id)),
     // Command rev 2. legacyState: the former extension's pins, filter and sort, read
     // here on the desktop for remote windows that can't see that memento.
     vscode.commands.registerCommand("sessionDeckBridge.legacyState", () => legacyState()),
@@ -400,41 +439,62 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   /** Return + DELETE the pending actions for a host (a poll consumes them). Drops
    *  actions older than the TTL — a stale click must never fire minutes later —
-   *  and keeps at most the newest ACTION_QUEUE_CAP. hostId is HOST_ID_RE-gated
-   *  before any path use. Never throws. */
-  async function takeActions(hostId: unknown): Promise<TakeResult> {
+   *  and keeps at most the newest ACTION_QUEUE_CAP. With a route (command rev 4)
+   *  an action goes to the window whose folders hold its cwd first (see
+   *  routeAction). hostId is HOST_ID_RE-gated before any path use. Never throws. */
+  async function takeActions(hostId: unknown, route?: unknown): Promise<TakeResult> {
     try {
       if (typeof hostId !== "string" || !HOST_ID_RE.test(hostId)) return { ok: false, error: "bad hostId" };
-      const dir = join(actionsDir, hostId);
-      let names: string[];
-      try {
-        names = await readdir(dir);
-      } catch {
-        return { ok: true, actions: [] };
-      }
-      names = names.filter((n) => n.endsWith(".json")).sort(); // chronological (postedAt prefix)
-      const now = Date.now();
-      const valid: FocusAction[] = [];
-      for (const name of names) {
-        const full = join(dir, name);
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(await readFile(full, "utf8"));
-        } catch {
-          await tryUnlink(full);
-          continue;
-        }
-        await tryUnlink(full); // taking consumes the action regardless of validity
-        const res = validateAction(parsed);
-        if (!res.ok) continue;
-        if (now - res.action.postedAt > ACTION_TTL_MS) continue; // stale → dropped
-        valid.push(res.action);
-      }
+      const { actions: valid, remainingMs } = await takeActionsFromDir(actionsDir, windowsDir, hostId, route);
       // Bound the batch: on overflow keep the newest actions.
       const actions = valid.length > ACTION_QUEUE_CAP ? valid.slice(valid.length - ACTION_QUEUE_CAP) : valid;
-      return { ok: true, actions };
+      return { ok: true, actions, remainingMs };
     } catch {
       return { ok: false, error: "take failed" };
+    }
+  }
+
+  /** Store one focus result under its action id (ACTION_ID_RE-gated by the
+   *  validator before any path use) and prune unread ones past the TTL. */
+  async function postFocusResult(input: unknown): Promise<PostResult> {
+    try {
+      const r = validateFocusResult(input);
+      if (r === null) return { ok: false, error: "invalid result" };
+      await mkdir(resultsDir, { recursive: true });
+      await writeAtomic(join(resultsDir, `${r.id}.json`), JSON.stringify(r));
+      await pruneResults();
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "post failed" };
+    }
+  }
+
+  /** Return and delete the result for one action id; no result yet = no `result`. */
+  async function takeFocusResult(id: unknown): Promise<TakeFocusResult> {
+    try {
+      if (typeof id !== "string" || !ACTION_ID_RE.test(id)) return { ok: false, error: "bad id" };
+      // Claimed by rename (takeResultFromDir): a result written while this one
+      // is read is a new file, never deleted unread.
+      const r = await takeResultFromDir(resultsDir, id);
+      return r !== undefined ? { ok: true, result: r } : { ok: true };
+    } catch {
+      return { ok: false, error: "take failed" };
+    }
+  }
+
+  async function pruneResults(): Promise<void> {
+    try {
+      const now = Date.now();
+      for (const name of await readdir(resultsDir)) {
+        const full = join(resultsDir, name);
+        try {
+          if (now - (await stat(full)).mtimeMs > RESULT_TTL_MS) await tryUnlink(full);
+        } catch {
+          // vanished meanwhile
+        }
+      }
+    } catch {
+      // dir missing: nothing to prune
     }
   }
 

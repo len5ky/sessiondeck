@@ -25,8 +25,8 @@ Or search **SessionDeck** in the Extensions view.
 ### Platform support
 
 - **Linux and WSL**: full support; this is what it's built and tested on.
-- **macOS**: works, minus the `/proc` features. Liveness checks, auto-detected config homes and terminal matching degrade, and discovery is limited to config homes it already knows about.
-- **Native Windows**: the tree works on the 3-second poll, without hooks or approval alerts. Install Hooks isn't offered there, and running it from the palette writes a POSIX shell script SessionDeck doesn't support on Windows.
+- **macOS**: works, minus the `/proc` features. Auto-detected config homes degrade, and discovery is limited to config homes it already knows about. Terminal matching, the ↗ badge and Move into Editor read the process table with `ps`.
+- **Native Windows**: the tree works on the 3-second poll, without hooks or approval alerts. Install Hooks isn't offered there, and running it from the palette writes a POSIX shell script SessionDeck doesn't support on Windows. Terminal matching, the ↗ badge and Move into Editor read the process table through PowerShell, so a new session can take a few seconds to get its badge.
 
 **Run Diagnostics** reports what works on your machine. Trust it over this list.
 
@@ -54,6 +54,18 @@ The activity-bar icon and a status-bar chip both show how many sessions need you
 ![Click to navigate: jumps to the session's window and tab](media/click-to-navigate.gif)
 
 Clicking a row opens the session: its Claude tab, even in another editor window, or the integrated terminal it runs in. If there's nothing to focus (a session in tmux, say), you get a rendered copy of its last message instead.
+
+### Sessions outside the editor
+
+A session started in another terminal, over SSH, or by an app through the Agent SDK has no tab or terminal here to jump to. Its row gets a small ↗ badge, and the hover says where it runs. Sessions in tmux and in this editor's own terminals and tabs are not marked, and neither is anything SessionDeck can't place for sure. The mark and the move work on Linux, macOS and Windows; Codex sessions are placed and moved on Linux only.
+
+**Move into Editor**, inline on the row or in its right-click menu, brings it in. After you confirm, SessionDeck stops the outside process, waits for it to exit, and resumes the same session here. It never resumes while the old process is still running. If the process hasn't stopped after 5 seconds you're asked whether to force it, and if it still won't stop, nothing is resumed. Windows has no gentle stop for a terminal program, so there the session and the programs it started are ended at once, and the confirmation says so.
+
+Stopping a session mid-turn cuts that turn off. A session run by another app (one built on the Agent SDK, say) is riskier: the app may start it again the next time a message is sent there, and then two programs write to one session, so stop it in that app first. The confirmation warns about each of these when it applies, and for app-run sessions Cancel is the default.
+
+Where it lands is `sessionDeck.moveTarget`: a Claude Code tab when the Claude Code extension is installed and the session's folder is open in this window, otherwise a new terminal tab in this window's editor area, opened in the session's folder, running `claude --resume <id>`. Codex sessions resume the same way with `codex resume <id>`. It runs the same `claude` or `codex` program the stopped session used, found from that process before it is stopped, so it works even when the CLI isn't on the terminal's PATH. The terminal runs the CLI itself, not a shell, so your shell's startup files play no part, and it closes when you quit the session. Cursor Agent sessions can't be moved.
+
+**Stop Session** ends a session without moving it. It sits inline next to Move and in the right-click menu on any running Claude Code or Codex session SessionDeck can place, whether that's outside the editor, in this editor's terminals and tabs, or in tmux. After you confirm, it stops the process the same way Move does. It checks that the process still belongs to that session, asks it to stop, and offers to force it after 5 seconds. On Windows it ends the session and the programs it started right away, and names any it couldn't end. Nothing is resumed. The conversation is kept, so you can pick it up later. Leave It Running is the default button. For a row from another host, the SessionDeck window on that host asks you to confirm, and this window tells you how it went. That needs this version of SessionDeck on both hosts and of the Bridge on your desktop.
 
 **Show Activity Tree** expands each session into its workflows, subagents and tasks.
 
@@ -175,6 +187,7 @@ To uninstall cleanly, run **SessionDeck: Remove All Integrations** first (Claude
 | Setting | Default | What it does |
 |---|---|---|
 | `sessionDeck.enableNavigation` | `true` | Click focuses the session; off shows the last message instead |
+| `sessionDeck.moveTarget` | `"auto"` | Where Move into Editor resumes a session: `claudeTab`, `terminal`, or `auto` (a Claude tab when possible) |
 | `sessionDeck.activityTree` | `false` | Expand sessions into workflows, subagents and tasks |
 | `sessionDeck.density` | `"comfortable"` | `compact` folds projects to one line, auto-expanding any that need you |
 | `sessionDeck.notifications` | `"urgent"` | Notify when a session needs you; `off` silences them (chip stays) |
@@ -196,7 +209,7 @@ A turn killed before it wrote anything just drops off when its process dies.
 
 ## Pricing
 
-The first 3 days are unlimited. After that, 3 sessions stay free for good; subagents and remote hosts don't count. Neither needs a key or an account. A license ($5.99/month or $18.99 once, per person, any number of machines) lifts the cap. Buy it at [sessiondeck.dev](https://sessiondeck.dev/?utm_source=github&utm_medium=readme), then run **SessionDeck: Enter License Key** or set `sessionDeck.licenseKey`. The key is checked offline. The bridge needs no license of its own.
+The first 3 days are unlimited. After that, 3 sessions stay free for good; subagents and remote hosts don't count. Neither needs a key or an account. A license ($5.99/month or $18.99 once, plus tax where applicable; per person, any number of machines) lifts the cap. Buy it at [sessiondeck.dev](https://sessiondeck.dev/?utm_source=github&utm_medium=readme), then run **SessionDeck: Enter License Key** or set `sessionDeck.licenseKey`. The key is checked offline. The bridge needs no license of its own.
 
 ## License
 

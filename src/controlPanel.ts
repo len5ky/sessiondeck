@@ -49,10 +49,10 @@ export interface ControlRow {
   mark: ControlMark;
   /** Rich markdown tooltip (full detail; never elided). */
   tooltip: string;
-  /** Command id to run on click; omit for a pure status row. */
+  /** Command id to run on click; omit for a pure status row. Never with
+   *  arguments: VS Code drops a tree item's arguments on every refresh, and a
+   *  click in that gap fails with "command not found". */
   command?: string;
-  /** Arguments passed to `command` on click. */
-  args?: string[];
 }
 
 /** The live snapshot the panel renders — a subset of the doctor probes plus the
@@ -289,6 +289,36 @@ function licenseRow(p: ControlPanelInput): ControlRow {
   };
 }
 
+/** What one Control Panel refresh changed. `rows` reuses the previous row objects
+ *  (updated in place) wherever the id is unchanged, so VS Code's handle → row map
+ *  stays valid: a refresh then names only the `changed` rows, which VS Code re-reads
+ *  in place while every other row stays clickable. `structural` (rows added,
+ *  removed or reordered) needs a full redraw, during which no row is clickable
+ *  until the window has fetched them again. */
+export interface ControlRowsUpdate {
+  rows: ControlRow[];
+  changed: ControlRow[];
+  structural: boolean;
+}
+
+export function keepControlRows(prev: readonly ControlRow[], next: readonly ControlRow[]): ControlRowsUpdate {
+  const byId = new Map(prev.map((r) => [r.id, r]));
+  const changed: ControlRow[] = [];
+  const rows = next.map((fresh) => {
+    const old = byId.get(fresh.id);
+    if (old === undefined) return fresh;
+    if (JSON.stringify(old) !== JSON.stringify(fresh)) {
+      // Clear fields the fresh row no longer has (an optional command), then copy.
+      for (const k of Object.keys(old) as (keyof ControlRow)[]) if (!(k in fresh)) delete old[k];
+      Object.assign(old, fresh);
+      changed.push(old);
+    }
+    return old;
+  });
+  const structural = prev.length !== rows.length || prev.some((r, i) => r.id !== rows[i].id);
+  return { rows, changed: structural ? [] : changed, structural };
+}
+
 /** Build the ordered Control Panel rows from a live snapshot. Deterministic and
  *  vscode-free. Order: three status rows (hooks Claude, hooks Cursor, bridge,
  *  license) then the license actions. */
@@ -304,8 +334,7 @@ export function buildControlPanelRows(p: ControlPanelInput): ControlRow[] {
       icon: "link-external",
       mark: "action",
       tooltip: tip("Buy License", "Open the purchase page — monthly or lifetime, per person."),
-      command: "sessionDeck.buyLicense",
-      args: ["panel"],
+      command: "sessionDeck.buyLicenseFromPanel",
     },
     {
       id: "enter-key",

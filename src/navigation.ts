@@ -4,21 +4,48 @@
 // degrades to a no-op on failure — so the extension ships fine without any of it.
 import * as vscode from "vscode";
 import { spawn } from "node:child_process";
-import { FSWatcher, mkdirSync, readdirSync, readFileSync, statSync, watch, writeFileSync } from "node:fs";
-import { delimiter, join, relative, isAbsolute, sep } from "node:path";
+import { FSWatcher, mkdirSync, readdirSync, readFileSync, rmSync, statSync, watch, writeFileSync } from "node:fs";
+import { delimiter, join, posix, sep, win32 } from "node:path";
+import { tmpdir } from "node:os";
 import { SessionRow } from "./discovery";
 import { ConfigHome } from "./homes";
 import { composerFocusPlan } from "./cursor";
-import { focusLocalTerminal, sendViaLocalTerminal, Step } from "./injector";
+import { pidAlive } from "./procs";
+import { CLAUDE_EXTENSION_ID, CLAUDE_OPEN_COMMAND, focusLocalTerminal } from "./injector";
 
-/** Undocumented but stable command of anthropic.claude-code: (sessionId?, initialPrompt?, viewColumn?).
- *  With a sessionId it reveals the existing tab for that session, or opens one resuming it. */
-const OPEN_SESSION_COMMAND = "claude-vscode.editor.open";
-const CLAUDE_EXTENSION_ID = "anthropic.claude-code";
 const REQUEST_FILE = "focus-request.json";
-const INJECT_FILE = "inject-request.json";
 const CURSOR_REQUEST_FILE = "cursor-focus-request.json";
 const REQUEST_TTL_MS = 10_000;
+/** The receiving window's answers to a FocusRequest: first `{ nonce, ack: true }`
+ *  the moment it takes the request, then `{ nonce, shown, raised?, detail? }`
+ *  once it is done. */
+const REPLY_FILE = "focus-reply.json";
+/** One request and one reply file per hand-off (`focus-request-<nonce>.json`,
+ *  `focus-reply-<nonce>.json`), so two hand-offs in flight never overwrite each
+ *  other. The single REQUEST_FILE / REPLY_FILE are still written for windows
+ *  on older builds, which know only those. */
+const NONCE_RE = /^[0-9a-z]{1,32}$/;
+const PER_REQUEST_RE = /^focus-request-([0-9a-z]{1,32})\.json$/;
+const requestFileFor = (nonce: string): string => `focus-request-${nonce}.json`;
+const replyFileFor = (nonce: string): string => `focus-reply-${nonce}.json`;
+/** How long the windows that hold a hand-off's folder wait for each other
+ *  before the deepest (then lowest id) acts. */
+const ELECTION_MS = 150;
+const WINDOW_ID_RE = /^w[0-9a-z]{1,16}$/;
+/** Per-hand-off files older than this are deleted by the next hand-off. */
+const HANDOFF_FILE_TTL_MS = 60_000;
+/** How long a hand-off waits for a window to take the request before it falls
+ *  back to raising the folder's window with the editor CLI itself (a window on
+ *  an older SessionDeck takes a request without saying so). */
+export const HANDOFF_ACK_MS = 2_000;
+/** How long a hand-off waits for the final answer once a window took it: that
+ *  window may run the editor CLI to come to the front (up to CLI_WAIT_MS). */
+export const HANDOFF_CONFIRM_MS = 10_000;
+const HANDOFF_POLL_MS = 100;
+/** Time kept back before the poster's deadline to post the report. */
+const REPORT_MARGIN_MS = 1_000;
+/** When a step must be done for its report to reach the poster in time. */
+const reportBy = (deadline: number | undefined): number | undefined => (deadline !== undefined ? deadline - REPORT_MARGIN_MS : undefined);
 
 /** Cursor-only workbench commands (absent in plain VS Code → executeCommand
  *  throws, which every caller treats as "not a Cursor window" and degrades).
@@ -48,13 +75,19 @@ interface FocusRequest {
   sessionPid: number;
   ts: number;
   nonce: string;
+  /** The window that takes it brings itself to the front (absent from windows
+   *  older than this field: they show the session and leave raising to us). */
+  raise?: boolean;
+  /** Past this (same host, same clock) the taker does nothing visible. */
+  deadline?: number;
 }
 
-interface InjectRequest {
-  sessionPid: number;
-  steps: Step[];
-  ts: number;
-  nonce: string;
+/** A reply in REPLY_FILE for one request. */
+export interface FocusReply {
+  ack?: boolean;
+  shown?: boolean;
+  raised?: boolean;
+  detail?: string;
 }
 
 interface CursorFocusRequest {
@@ -66,31 +99,63 @@ interface CursorFocusRequest {
   nonce: string;
 }
 
+/** What a navigate() call did. `window` = another window was asked to show it and
+ *  raised; `tab` / `terminal` = shown in this window (`unraised`: it could not
+ *  be brought to the front, with why). */
+export type NavOutcome =
+  | { ok: true; how: "tab" | "terminal"; unraised?: string }
+  /** `confirmed`: the window that got it said it showed the session. Absent when
+   *  it did not answer in time (a window on an older SessionDeck never does). */
+  | { ok: true; how: "window"; confirmed?: boolean; unraised?: string }
+  | { ok: false; reason: "no-window" | "no-tab" | "no-terminal" | "cli-failed" | "expired" | "handoff-failed"; detail?: string };
+
+/** `until`: the CLI run (and its retry) must be over by then. */
+export type CliRun = (folder: string, until?: number) => Promise<{ ok: true } | { ok: false; reason: string }>;
+
+/** Test seams: the window's folders and the editor CLI. */
+export interface NavigatorDeps {
+  folders?: () => readonly string[];
+  /** The workspace file of a multi-root window, when it has one on disk. */
+  workspaceFile?: () => string | undefined;
+  runCli?: CliRun;
+}
+
 export function navigationEnabled(): boolean {
   return vscode.workspace.getConfiguration("sessionDeck").get<boolean>("enableNavigation", true);
 }
 
 export class Navigator implements vscode.Disposable {
   private watcher: FSWatcher | undefined;
-  private handledNonce = "";
-  private handledInjectNonce = "";
+  /** Requests this window already took (fs.watch fires several events per
+   *  write, and a new sender writes two request files). Bounded. */
+  private readonly handledNonces = new Set<string>();
   private handledCursorNonce = "";
+  /** Requests this window wrote: its own watcher must not take them. */
+  private readonly sentNonces = new Set<string>();
   private readonly requestPath: string;
-  private readonly injectPath: string;
   private readonly cursorRequestPath: string;
+  private readonly replyPath: string;
+  private readonly storageDir: string;
+  /** This window's id in hand-off elections. */
+  private readonly windowId = "w" + Math.random().toString(36).slice(2, 12);
   private homes: ConfigHome[] = [];
 
   /** storageDir must be shared across windows: use context.globalStorageUri (same
    *  path in every window attached to this cursor-server). */
-  constructor(storageDir: string) {
+  constructor(
+    storageDir: string,
+    private readonly deps: NavigatorDeps = {}
+  ) {
     this.requestPath = join(storageDir, REQUEST_FILE);
-    this.injectPath = join(storageDir, INJECT_FILE);
     this.cursorRequestPath = join(storageDir, CURSOR_REQUEST_FILE);
+    this.replyPath = join(storageDir, REPLY_FILE);
+    this.storageDir = storageDir;
     try {
       mkdirSync(storageDir, { recursive: true });
       this.watcher = watch(storageDir, (_event, filename) => {
-        if (filename === REQUEST_FILE) void this.handleRequest();
-        if (filename === INJECT_FILE) void this.handleInject();
+        if (filename === REQUEST_FILE) void this.handleRequest(this.requestPath);
+        const per = typeof filename === "string" ? PER_REQUEST_RE.exec(filename) : null;
+        if (per !== null) void this.handleRequest(join(storageDir, filename as string));
         if (filename === CURSOR_REQUEST_FILE) void this.handleCursorRequest();
       });
     } catch {
@@ -104,48 +169,62 @@ export class Navigator implements vscode.Disposable {
     this.homes = homes;
   }
 
-  /** Broadcast a key-sequence injection; the window owning the session's
-   *  terminal (exact pid-ancestry match) is the only one that acts on it. */
-  requestInjection(sessionPid: number, steps: Step[]): void {
-    const request: InjectRequest = {
-      sessionPid,
-      steps,
-      ts: Date.now(),
-      nonce: Math.random().toString(36).slice(2),
-    };
-    try {
-      writeFileSync(this.injectPath, JSON.stringify(request));
-    } catch {
-      // best-effort
-    }
-  }
-
-  private async handleInject(): Promise<void> {
-    let request: InjectRequest;
-    try {
-      request = JSON.parse(readFileSync(this.injectPath, "utf8")) as InjectRequest;
-    } catch {
-      return;
-    }
-    if (request.nonce === this.handledInjectNonce) return;
-    if (Date.now() - request.ts > REQUEST_TTL_MS) return;
-    this.handledInjectNonce = request.nonce;
-    await sendViaLocalTerminal(request.sessionPid, request.steps);
-  }
-
   dispose(): void {
     this.watcher?.close();
   }
 
-  /** Returns false when there was nothing to navigate to (caller may fall back to preview). */
-  async navigate(row: SessionRow): Promise<boolean> {
+  /** Show a session: its tab or terminal in this window, or hand it to the window
+   *  that has its folder open, which shows it and comes to the front. `raise`
+   *  also brings THIS window to the front when the session is here (a request
+   *  from another host: the user is looking at a different window), and waits for
+   *  the other window's answer when it is not. Not ok = nothing was shown; the
+   *  caller may fall back to the preview. */
+  async navigate(row: SessionRow, opts: { raise?: boolean; deadline?: number } = {}): Promise<NavOutcome> {
     const { cwd, sessionId, entrypoint, pid } = row.meta;
-    if (this.inThisWindow(cwd)) {
-      // Terminal (cli) sessions have no editor tab: reveal the integrated-terminal
-      // tab whose shell is an ancestor of the session pid instead.
-      if (entrypoint === "cli") return focusLocalTerminal(pid);
-      return this.openTabHere(sessionId, entrypoint);
+    // A request from another host whose poster has stopped waiting: re-checked
+    // right before anything visible happens, so a window never switches after
+    // the user was told nobody answered.
+    const late = (): boolean => opts.deadline !== undefined && Date.now() > opts.deadline;
+    if (late()) return { ok: false, reason: "expired" };
+    // The same rule as the companion's routing and the hand-off receiver: a
+    // session in a subfolder of this window's folder is this window's.
+    const here = this.folderHolding(cwd);
+    if (here !== undefined) {
+      // Only the Claude extension's own sessions have an editor tab. Every other
+      // entrypoint (cli, sdk-cli, sdk-ts, …) runs in a terminal or an app: reveal the
+      // integrated-terminal tab whose shell is an ancestor of the session pid.
+      let shown: NavOutcome;
+      if (!hasEditorTab(entrypoint)) {
+        shown = (await focusLocalTerminal(pid)) ? { ok: true, how: "terminal" } : { ok: false, reason: "no-terminal" };
+      } else {
+        shown = (await this.openTabHere(sessionId, entrypoint)) ? { ok: true, how: "tab" } : { ok: false, reason: "no-tab" };
+      }
+      if (!shown.ok || opts.raise !== true) return shown;
+      if (late()) return { ok: false, reason: "expired" };
+      const raised = await this.runCli(this.raiseTarget(here), reportBy(opts.deadline));
+      return raised.ok ? shown : { ok: false, reason: "cli-failed", detail: raised.reason };
     }
+    // Not this window's folder, but a terminal session's own terminal may be here.
+    if (!hasEditorTab(entrypoint) && (await focusLocalTerminal(pid))) {
+      if (opts.raise !== true) return { ok: true, how: "terminal" };
+      const own = this.raiseTarget(this.folders()[0]);
+      if (own === undefined) return { ok: true, how: "terminal", unraised: "this window has no folder to bring up" };
+      const raised = await this.runCli(own, reportBy(opts.deadline));
+      return raised.ok ? { ok: true, how: "terminal" } : { ok: false, reason: "cli-failed", detail: raised.reason };
+    }
+    return this.handOff(row, opts.raise === true, opts.deadline);
+  }
+
+  /** Hand the session to the window that has its folder open: write the request
+   *  every window watches; the one that has the folder (or the session's
+   *  terminal) answers at once, shows it and brings itself up with the editor CLI.
+   *  When nobody takes it within HANDOFF_ACK_MS (a window on an older SessionDeck
+   *  takes requests without answering), raise the folder an ide lock file names
+   *  with the CLI. The lock lookup is only that hint: no hint and no taker is
+   *  "nobody has it open", never a guess. `wait` = report the final answer (a
+   *  request from another host), else return once a window took it. */
+  private async handOff(row: SessionRow, wait: boolean, deadline: number | undefined): Promise<NavOutcome> {
+    const { cwd, sessionId, entrypoint, pid } = row.meta;
     const request: FocusRequest = {
       cwd,
       sessionId,
@@ -153,14 +232,76 @@ export class Navigator implements vscode.Disposable {
       sessionPid: pid,
       ts: Date.now(),
       nonce: Math.random().toString(36).slice(2),
+      raise: true,
+      ...(deadline !== undefined ? { deadline } : {}),
     };
+    const hint = bestOpenFolder(cwd, this.homes);
+    this.sentNonces.add(request.nonce);
+    this.pruneHandoffFiles();
     try {
-      writeFileSync(this.requestPath, JSON.stringify(request));
+      writeFileSync(join(this.storageDir, requestFileFor(request.nonce)), JSON.stringify(request));
+      // Older windows read only the single file.
+      try {
+        writeFileSync(this.requestPath, JSON.stringify(request));
+      } catch {
+        // the new windows still have the per-request file
+      }
     } catch {
-      // relay write failed; still try to focus the window
+      if (hint === undefined) return { ok: false, reason: "handoff-failed", detail: "could not pass the request to its other windows" };
+      const raised = await this.runCli(hint, reportBy(deadline));
+      if (!raised.ok) return { ok: false, reason: "cli-failed", detail: raised.reason };
+      return { ok: false, reason: "handoff-failed", detail: "brought up the window that has its folder open, but could not pass it the request" };
     }
-    this.focusWindow(cwd);
-    return true;
+    try {
+      return await this.followHandOff(request, hint, wait, deadline);
+    } finally {
+      for (const f of [requestFileFor(request.nonce), replyFileFor(request.nonce)]) rmSync(join(this.storageDir, f), { force: true });
+      this.removeCandidates(request.nonce);
+      this.sentNonces.delete(request.nonce);
+    }
+  }
+
+  /** The rest of handOff, once the request is written: wait for a taker, fall
+   *  back to the lock hint, and read the answer. */
+  private async followHandOff(request: FocusRequest, hint: string | undefined, wait: boolean, deadline: number | undefined): Promise<NavOutcome> {
+    const { entrypoint } = request;
+    const stopAt = (ms: number): number => Math.min(Date.now() + ms, deadline !== undefined ? deadline - REPORT_MARGIN_MS : Number.POSITIVE_INFINITY);
+    let reply = await this.awaitReply(request.nonce, stopAt(HANDOFF_ACK_MS), (r) => r.ack === true || r.shown !== undefined);
+    let raisedHere = false;
+    const raiseHint = async (): Promise<NavOutcome | undefined> => {
+      if (hint === undefined || raisedHere) return undefined;
+      if (deadline !== undefined && Date.now() > deadline) return { ok: false, reason: "expired" };
+      raisedHere = true;
+      const raised = await this.runCli(hint, reportBy(deadline));
+      return raised.ok ? undefined : { ok: false, reason: "cli-failed", detail: raised.reason };
+    };
+    if (reply === undefined) {
+      if (hint === undefined) return { ok: false, reason: hasEditorTab(entrypoint) ? "no-window" : "no-terminal" };
+      const failed = await raiseHint();
+      if (failed !== undefined) return failed;
+    }
+    if (!wait) {
+      // A window from before `raise` showed it without coming up: raise it here.
+      if (reply !== undefined && isLegacyShown(reply)) {
+        const failed = await raiseHint();
+        if (failed !== undefined) return failed;
+      }
+      return { ok: true, how: "window" };
+    }
+    if (reply?.shown === undefined) reply = await this.awaitReply(request.nonce, stopAt(HANDOFF_CONFIRM_MS), (r) => r.shown !== undefined);
+    if (reply?.shown === undefined) return { ok: true, how: "window" };
+    if (!reply.shown) return { ok: false, reason: hasEditorTab(entrypoint) ? "no-tab" : "no-terminal", detail: reply.detail };
+    if (reply.raised === false) return { ok: false, reason: "cli-failed", detail: reply.detail };
+    if (isLegacyShown(reply)) {
+      // Builds between 0.42.5 and this change answer { nonce, shown } and never
+      // raise their window: the tab opened behind whatever is in front.
+      if (hint === undefined && !raisedHere) {
+        return { ok: true, how: "window", confirmed: true, unraised: "it is on a SessionDeck build that does not bring its window up, and no Claude Code lock file names that window's folder" };
+      }
+      const failed = await raiseHint();
+      if (failed !== undefined) return failed;
+    }
+    return { ok: true, how: "window", confirmed: true };
   }
 
   /** Cursor sibling of navigate(): open a Cursor GUI composer or cursor-agent CLI
@@ -184,7 +325,7 @@ export class Navigator implements vscode.Disposable {
     } catch {
       // relay write failed; still try to focus the window
     }
-    this.focusWindow(target.cwd);
+    void this.focusWindow(target.cwd);
     return true;
   }
 
@@ -241,72 +382,256 @@ export class Navigator implements vscode.Disposable {
   }
 
   private inThisWindow(cwd: string): boolean {
-    return (vscode.workspace.workspaceFolders ?? []).some((f) => f.uri.fsPath === cwd);
+    return this.folderHolding(cwd) !== undefined;
+  }
+
+  private folders(): readonly string[] {
+    if (this.deps.folders !== undefined) return this.deps.folders();
+    return (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+  }
+
+  /** This window's innermost workspace folder that is `cwd` or holds it
+   *  (Windows: any drive-letter case, separator or trailing separator), or
+   *  undefined. */
+  private folderHolding(cwd: string): string | undefined {
+    let best: string | undefined;
+    for (const f of this.folders()) if (folderContains(f, cwd) && (best === undefined || f.length > best.length)) best = f;
+    return best;
+  }
+
+  /** What to give the editor CLI so that it raises THIS window: its workspace file
+   *  when it has one (a folder of a multi-root workspace could open a new window),
+   *  else its folder. */
+  private raiseTarget(folder: string): string;
+  private raiseTarget(folder: string | undefined): string | undefined;
+  private raiseTarget(folder: string | undefined): string | undefined {
+    if (folder === undefined) return undefined;
+    return this.workspaceFile() ?? folder;
+  }
+
+  private workspaceFile(): string | undefined {
+    if (this.deps.workspaceFile !== undefined) return this.deps.workspaceFile();
+    const f = vscode.workspace.workspaceFile;
+    return f !== undefined && f.scheme === "file" ? f.fsPath : undefined;
   }
 
   private async openTabHere(sessionId: string, entrypoint?: string): Promise<boolean> {
-    if (entrypoint === "cli") return false; // terminal session: no tab to reveal
+    if (!hasEditorTab(entrypoint)) return false; // terminal or app session: no tab to reveal
     if (vscode.extensions.getExtension(CLAUDE_EXTENSION_ID) === undefined) return false;
     try {
-      await vscode.commands.executeCommand(OPEN_SESSION_COMMAND, sessionId);
+      await vscode.commands.executeCommand(CLAUDE_OPEN_COMMAND, sessionId);
       return true;
     } catch {
       return false;
     }
   }
 
-  private async handleRequest(): Promise<void> {
+  /** Take a hand-off from another window when the session is ours: a Claude tab
+   *  session when this window has its folder open, a terminal session when its
+   *  terminal is here. Answers at once (`ack`), shows it, brings this window up
+   *  when asked, then answers with the outcome. Not ours: no answer at all, so
+   *  the window that has it is the one that answers. */
+  private async handleRequest(path: string): Promise<void> {
     let request: FocusRequest;
     try {
-      request = JSON.parse(readFileSync(this.requestPath, "utf8")) as FocusRequest;
+      request = JSON.parse(readFileSync(path, "utf8")) as FocusRequest;
     } catch {
       return;
     }
-    if (request.nonce === this.handledNonce) return; // fs.watch fires multiple events per write
+    if (typeof request?.nonce !== "string" || !NONCE_RE.test(request.nonce) || typeof request.cwd !== "string") return;
+    if (this.handledNonces.has(request.nonce)) return; // fs.watch fires multiple events per write
+    if (this.sentNonces.has(request.nonce)) return; // our own request
     if (Date.now() - request.ts > REQUEST_TTL_MS) return;
-    if (!this.inThisWindow(request.cwd)) return;
-    this.handledNonce = request.nonce;
-    // Same terminal-vs-tab split as navigate(), now in the window that owns it.
-    if (request.entrypoint === "cli") {
-      await focusLocalTerminal(request.sessionPid);
-      return;
+    const late = (): boolean => typeof request.deadline === "number" && Date.now() > request.deadline;
+    if (late()) return;
+    const tab = hasEditorTab(request.entrypoint);
+    const folder = this.folderHolding(request.cwd);
+    if (tab && folder === undefined) return;
+    this.handledNonces.add(request.nonce);
+    if (this.handledNonces.size > 64) this.handledNonces.delete(this.handledNonces.values().next().value as string);
+    const legacySender = request.raise !== true; // an older window waits on the single reply file
+    let shown: boolean;
+    if (tab) {
+      // Two windows can hold the folder (the same folder, or nested ones): only
+      // one may open the tab and come up.
+      if (!(await this.winsHandoff(request.nonce, folder as string))) return;
+      // The election took time: past the deadline the clicker was already told
+      // nobody answered, so open nothing.
+      if (late()) return;
+      this.reply(request.nonce, { ack: true }, legacySender);
+      shown = await this.openTabHere(request.sessionId, request.entrypoint);
+    } else {
+      // Only the window that has the terminal answers.
+      if (!(await focusLocalTerminal(request.sessionPid))) return;
+      shown = true;
+      this.reply(request.nonce, { ack: true }, legacySender);
     }
-    await this.openTabHere(request.sessionId, request.entrypoint);
+    const answer: FocusReply = { shown };
+    if (shown && request.raise === true) {
+      const target = this.raiseTarget(folder ?? this.folders()[0]);
+      if (target === undefined) {
+        answer.raised = false;
+        answer.detail = "the window that has it has no folder to bring up";
+      } else if (late()) {
+        answer.raised = false;
+        answer.detail = "the request reached it after you stopped waiting, so it did not switch";
+      } else {
+        // Done in time for the sender, which stops waiting a margin before the deadline.
+        const raised = await this.runCli(target, typeof request.deadline === "number" ? request.deadline - 2 * REPORT_MARGIN_MS : undefined);
+        answer.raised = raised.ok;
+        if (!raised.ok) answer.detail = raised.reason;
+      }
+    }
+    this.reply(request.nonce, answer, legacySender);
+  }
+
+  /** Answer on the request's own reply file, and on the single file too for a
+   *  sender on an older build (it reads only that one). */
+  private reply(nonce: string, r: FocusReply, legacySender: boolean): void {
+    const doc = JSON.stringify({ nonce, ...r });
+    for (const path of legacySender ? [join(this.storageDir, replyFileFor(nonce)), this.replyPath] : [join(this.storageDir, replyFileFor(nonce))]) {
+      try {
+        writeFileSync(path, doc);
+      } catch {
+        // no answer: the sender falls back to the editor CLI, or reports it unconfirmed
+      }
+    }
+  }
+
+  /** Among the windows holding a hand-off's folder, is this the one to act? Each
+   *  candidate writes `focus-cand-<nonce>-<window>.json` with how deep its
+   *  folder holds the cwd, waits ELECTION_MS for the others, then the deepest
+   *  holder wins and ties go to the lowest window id. A window that could not
+   *  write its entry still counts itself. */
+  private async winsHandoff(nonce: string, folder: string): Promise<boolean> {
+    const depth = normFolder(folder).length;
+    const prefix = `focus-cand-${nonce}-`;
+    try {
+      writeFileSync(join(this.storageDir, `${prefix}${this.windowId}.json`), JSON.stringify({ depth }));
+    } catch {
+      // still compete with what the others wrote
+    }
+    await new Promise((r) => setTimeout(r, ELECTION_MS));
+    let best = { depth, id: this.windowId };
+    try {
+      for (const f of readdirSync(this.storageDir)) {
+        if (!f.startsWith(prefix) || !f.endsWith(".json")) continue;
+        const id = f.slice(prefix.length, -".json".length);
+        if (!WINDOW_ID_RE.test(id) || id === this.windowId) continue;
+        let d: unknown;
+        try {
+          d = (JSON.parse(readFileSync(join(this.storageDir, f), "utf8")) as { depth?: unknown }).depth;
+        } catch {
+          continue;
+        }
+        if (typeof d !== "number") continue;
+        if (d > best.depth || (d === best.depth && id < best.id)) best = { depth: d, id };
+      }
+    } catch {
+      // nothing to compare with: act
+    }
+    return best.id === this.windowId;
+  }
+
+  private removeCandidates(nonce: string): void {
+    try {
+      for (const f of readdirSync(this.storageDir)) if (f.startsWith(`focus-cand-${nonce}-`)) rmSync(join(this.storageDir, f), { force: true });
+    } catch {
+      // pruned later
+    }
+  }
+
+  /** Delete per-hand-off files left behind (a sender that died, a late reply). */
+  private pruneHandoffFiles(): void {
+    try {
+      const now = Date.now();
+      for (const f of readdirSync(this.storageDir)) {
+        if (!/^focus-(request|reply|cand)-/.test(f)) continue;
+        try {
+          if (now - statSync(join(this.storageDir, f)).mtimeMs > HANDOFF_FILE_TTL_MS) rmSync(join(this.storageDir, f), { force: true });
+        } catch {
+          // gone meanwhile
+        }
+      }
+    } catch {
+      // best effort
+    }
+  }
+
+  /** The first reply for `nonce` that `done` accepts, or undefined at `until`. */
+  private async awaitReply(nonce: string, until: number, done: (r: FocusReply) => boolean): Promise<FocusReply | undefined> {
+    for (;;) {
+      const r = readReply(join(this.storageDir, replyFileFor(nonce)), nonce) ?? readReply(this.replyPath, nonce);
+      if (r !== undefined && done(r)) return r;
+      if (Date.now() >= until) return undefined;
+      await new Promise((res) => setTimeout(res, Math.max(0, Math.min(HANDOFF_POLL_MS, until - Date.now()))));
+    }
   }
 
   /** Bring the target project's window to front (or open it) via the editor CLI.
    *  Verified: opening an already-open folder reuses and focuses its window. */
-  private focusWindow(cwd: string): void {
-    const folder = bestOpenFolder(cwd, this.homes) ?? cwd;
-    const cli = editorCliCommand();
-    try {
-      const child = spawn(cli, [folder], { detached: true, stdio: "ignore" });
-      child.on("error", () => undefined); // CLI missing — window focus is best-effort
-      child.unref();
-    } catch {
-      // best-effort only
-    }
+  private focusWindow(cwd: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+    return this.runCli(bestOpenFolder(cwd, this.homes) ?? cwd);
   }
+
+  /** Run the editor CLI on `folder`. Resolves once the CLI has exited (or after
+   *  CLI_WAIT_MS, when it is still running and so did start), with the reason a
+   *  failed run gives the user. */
+  private runCli(folder: string, until?: number): Promise<{ ok: true } | { ok: false; reason: string }> {
+    if (this.deps.runCli !== undefined) return this.deps.runCli(folder, until);
+    return runEditorCli(editorCliCommand(), folder, process.platform, cliLogArgs(), until);
+  }
+}
+
+/** A "shown" answer from a window that predates `raise` (it never says whether
+ *  it came to the front, and does not try). */
+export function isLegacyShown(r: FocusReply): boolean {
+  return r.shown === true && r.raised === undefined;
+}
+
+/** A reply file's answer for `nonce`, or undefined (missing, unreadable, or an
+ *  answer to another request). */
+export function readReply(path: string, nonce: string): FocusReply | undefined {
+  try {
+    const r = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    if (r === null || typeof r !== "object" || r.nonce !== nonce) return undefined;
+    const out: FocusReply = {};
+    if (r.ack === true) out.ack = true;
+    if (typeof r.shown === "boolean") out.shown = r.shown;
+    if (typeof r.raised === "boolean") out.raised = r.raised;
+    if (typeof r.detail === "string") out.detail = r.detail.slice(0, 300);
+    return out;
+  } catch {
+    return undefined;
+  }
+}
+
+/** True only for sessions the Claude Code extension owns (they have an editor
+ *  tab). The tree labels everything else "terminal"; navigation must agree. */
+export function hasEditorTab(entrypoint: string | undefined): boolean {
+  return entrypoint === "claude-vscode";
 }
 
 /** Map a session cwd to the workspace folder of an open IDE window using each
  *  home's ide/*.lock, so a session running in a subdirectory focuses the
  *  containing window instead of opening a new one on the subdirectory. */
-function bestOpenFolder(cwd: string, homes: ConfigHome[]): string | undefined {
+export function bestOpenFolder(cwd: string, homes: ConfigHome[]): string | undefined {
   let best: string | undefined;
   for (const home of homes) {
     try {
       const dir = join(home.dir, "ide");
       for (const f of readdirSync(dir)) {
         if (!f.endsWith(".lock")) continue;
-        let lock: { workspaceFolders?: string[] };
+        let lock: { workspaceFolders?: string[]; pid?: unknown };
         try {
-          lock = JSON.parse(readFileSync(join(dir, f), "utf8")) as { workspaceFolders?: string[] };
+          lock = JSON.parse(readFileSync(join(dir, f), "utf8")) as { workspaceFolders?: string[]; pid?: unknown };
         } catch {
           continue;
         }
+        // A lock left behind by a closed window names a folder nobody has open.
+        if (typeof lock.pid === "number" && !pidAlive(lock.pid)) continue;
         for (const folder of lock.workspaceFolders ?? []) {
-          if (!pathContains(folder, cwd)) continue;
+          if (!folderContains(folder, cwd)) continue;
           if (best === undefined || folder.length > best.length) best = folder;
         }
       }
@@ -317,14 +642,6 @@ function bestOpenFolder(cwd: string, homes: ConfigHome[]): string | undefined {
   return best;
 }
 
-/** Separator-agnostic containment: is `cwd` the folder itself or nested inside it?
- *  path.relative handles native Windows separators (and drive letters) that a
- *  literal `folder + "/"` prefix check would miss. */
-function pathContains(folder: string, cwd: string): boolean {
-  if (cwd === folder) return true;
-  const rel = relative(folder, cwd);
-  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
-}
 
 /** Resolve the editor CLI used to focus other windows, and which source it came
  *  from. Precedence: explicit `editorCliPath`, then the legacy `cursorCliPath`,
@@ -374,4 +691,207 @@ function defaultEditorCli(): string {
   if (name.includes("vscodium")) return "codium";
   if (name.includes("windsurf")) return "windsurf";
   return "code";
+}
+
+// ---- editor CLI and folder matching ------------------------------------
+// Path matching and editor-CLI spawning for window switching, with the platform
+// passed in so the Windows rules are tested on every OS. vscode-free.
+//
+// Two Windows facts drive this file:
+//  - The editor CLI on Windows is a batch shim (`cursor.cmd`, `code.cmd`). A bare
+//    `spawn("cursor", …)` looks only for `cursor.exe` (ENOENT), and Node refuses to
+//    spawn a .cmd/.bat file without a shell (EINVAL, since the 2024 fix for
+//    CVE-2024-27980). Both errors used to be swallowed, so the window never came up.
+//  - Windows paths compare without case, and the same folder arrives as `c:\x`
+//    (VS Code's fsPath) or `C:\x\` (a terminal's cwd).
+
+type Platform = NodeJS.Platform;
+
+function pathApi(platform: Platform): typeof posix {
+  return platform === "win32" ? win32 : posix;
+}
+
+/** Normalise a folder for comparison: resolved, no trailing separator, and
+ *  lower-cased on Windows. */
+export function normFolder(p: string, platform: Platform = process.platform): string {
+  const r = pathApi(platform).resolve(p);
+  return platform === "win32" ? r.toLowerCase() : r;
+}
+
+/** Do two strings name the same folder on `platform`? */
+export function sameFolder(a: string, b: string, platform: Platform = process.platform): boolean {
+  return normFolder(a, platform) === normFolder(b, platform);
+}
+
+/** Is `cwd` the folder itself or somewhere inside it? */
+export function folderContains(folder: string, cwd: string, platform: Platform = process.platform): boolean {
+  const f = normFolder(folder, platform);
+  const c = normFolder(cwd, platform);
+  if (f === c) return true;
+  const p = pathApi(platform);
+  const rel = p.relative(f, c);
+  return rel !== "" && !rel.startsWith("..") && !p.isAbsolute(rel);
+}
+
+export interface SpawnPlan {
+  command: string;
+  args: string[];
+  options: { detached: boolean; windowsHide: boolean; windowsVerbatimArguments: boolean };
+}
+
+/** Characters cmd.exe expands or splits on even inside double quotes. A folder
+ *  holding one can't be passed through cmd.exe safely, so we refuse it. */
+const CMD_UNSAFE = /["%\r\n]/;
+
+/** How to run the editor CLI on `folder`, or why it can't be run. On Windows a
+ *  non-.exe CLI (the usual `cursor` / `code` / `cursor.cmd`) runs through
+ *  `cmd.exe /d /s /c ""<cli>" "<folder>""`, each part quoted, so a space in either
+ *  is safe. */
+export function editorCliSpawnPlan(
+  cli: string,
+  folder: string,
+  platform: Platform = process.platform,
+  extra: readonly string[] = []
+): { ok: true; plan: SpawnPlan } | { ok: false; reason: string } {
+  if (platform !== "win32") {
+    return { ok: true, plan: { command: cli, args: [folder, ...extra], options: { detached: true, windowsHide: true, windowsVerbatimArguments: false } } };
+  }
+  if (/\.exe$/i.test(cli)) {
+    return { ok: true, plan: { command: cli, args: [folder, ...extra], options: { detached: false, windowsHide: true, windowsVerbatimArguments: false } } };
+  }
+  // An extra argument cmd.exe would mangle is left out, never refused for.
+  extra = extra.filter((a) => !CMD_UNSAFE.test(a));
+  if (CMD_UNSAFE.test(cli) || CMD_UNSAFE.test(folder)) {
+    return { ok: false, reason: `the folder path or editor CLI contains a character (" or %) that cannot be passed to ${cli} safely` };
+  }
+  // The CLI shim hands its arguments to Cursor.exe / Code.exe, which reads
+  // backslashes before a quote as escapes: `"c:\\"` would end in a literal quote.
+  // Doubling trailing backslashes keeps them literal. /v:off: no delayed
+  // expansion, so a `!` in a folder name is passed as is.
+  const q = (v: string): string => `"${v.replace(/(\\+)$/, "$1$1")}"`;
+  return {
+    ok: true,
+    plan: {
+      command: "cmd.exe",
+      args: ["/d", "/v:off", "/s", "/c", `"${[cli, folder, ...extra].map(q).join(" ")}"`],
+      options: { detached: false, windowsHide: true, windowsVerbatimArguments: true },
+    },
+  };
+}
+
+/** A failed CLI run, in words a user can act on. `code` is the exit code (9009 is
+ *  cmd.exe's "is not recognized"), `errCode` a spawn error code. */
+export function editorCliFailure(cli: string, r: { code?: number | null; errCode?: string; signal?: string | null }): string {
+  if (r.errCode === "ENOENT" || r.code === 9009) {
+    return `the editor CLI "${cli}" was not found; set sessionDeck.editorCliPath to its full path`;
+  }
+  if (r.errCode !== undefined) return `the editor CLI "${cli}" could not start (${r.errCode})`;
+  if (r.signal !== undefined && r.signal !== null) return `the editor CLI "${cli}" was stopped by ${r.signal}`;
+  return `the editor CLI "${cli}" exited with code ${r.code}`;
+}
+
+const CLI_WAIT_MS = 8_000;
+/** A CLI run (or its retry) is started only with at least this long left
+ *  before `until`: with less it could not be seen to finish, and a run that
+ *  has not finished must not be reported as having raised the window. */
+export const CLI_MIN_BUDGET_MS = 1_500;
+const CLI_NO_TIME = "there was too little time left before the click stopped waiting to bring that window up";
+
+/** Extra CLI arguments that keep the run from leaving a folder behind. On
+ *  Windows every `cursor <folder>` / `code <folder>` starts a short-lived second
+ *  instance that creates `<user data>\logs\<timestamp>` (mostly empty) before
+ *  passing the folder to the running editor. `--logsPath` is the editor's own
+ *  option (VS Code argv OPTIONS; its environment service uses it instead of the
+ *  timestamped folder), so every run reuses one folder in the temp dir. The
+ *  `--name=value` form can never be read as a second folder to open. */
+export function cliLogArgs(platform: Platform = process.platform, tmp: string = tmpdir()): string[] {
+  return platform === "win32" ? [`--logsPath=${win32.join(tmp, "sessiondeck-editor-cli-logs")}`] : [];
+}
+
+/** Run the editor CLI on `folder`. Resolves once the CLI has exited (or after
+ *  CLI_WAIT_MS, when it is still running and so did start), with a reason a user
+ *  can act on when it failed. Never rejects. If a run with cliLogArgs fails with
+ *  an exit code, it is run once more without them, so an editor that rejects
+ *  the option still switches. */
+export async function runEditorCli(
+  cli: string,
+  folder: string,
+  platform: NodeJS.Platform = process.platform,
+  extra: readonly string[] = cliLogArgs(platform),
+  until?: number
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  // Windows: find the shim ourselves. cmd.exe reports an unknown name only as
+  // exit code 1, which would read as a crash rather than "not found".
+  let resolved = cli;
+  if (platform === "win32" && !/[\\/]/.test(cli)) {
+    const found = findOnWindowsPath(cli, process.env.PATH ?? process.env.Path ?? "");
+    if (found === undefined) return { ok: false, reason: editorCliFailure(cli, { errCode: "ENOENT" }) };
+    resolved = found;
+  }
+  if (until !== undefined && until - Date.now() < CLI_MIN_BUDGET_MS) return { ok: false, reason: CLI_NO_TIME };
+  const first = await spawnCli(cli, resolved, folder, platform, extra, until);
+  if (first.ok || extra.length === 0 || first.code === undefined || first.code === 9009) return strip(first);
+  // The retry only when there is still time for it to start.
+  if (until !== undefined && until - Date.now() < CLI_MIN_BUDGET_MS) return strip(first);
+  return strip(await spawnCli(cli, resolved, folder, platform, [], until));
+}
+
+type CliRunResult = { ok: true } | { ok: false; reason: string; code?: number };
+const strip = (r: CliRunResult): { ok: true } | { ok: false; reason: string } => (r.ok ? r : { ok: false, reason: r.reason });
+
+function spawnCli(cli: string, resolved: string, folder: string, platform: NodeJS.Platform, extra: readonly string[], until?: number): Promise<CliRunResult> {
+  const planned = editorCliSpawnPlan(resolved, folder, platform, extra);
+  if (!planned.ok) return Promise.resolve({ ok: false, reason: planned.reason });
+  const { command, args, options } = planned.plan;
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (r: CliRunResult): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(r);
+    };
+    // Still running after the full CLI_WAIT_MS = it started: count that as done.
+    // Cut short by `until` it has not finished, so it is not counted as raised.
+    const waitMs = until !== undefined ? Math.max(0, Math.min(CLI_WAIT_MS, until - Date.now())) : CLI_WAIT_MS;
+    const timer = setTimeout(
+      () => finish(waitMs >= CLI_WAIT_MS ? { ok: true } : { ok: false, reason: `the editor CLI "${cli}" had not finished when the click stopped waiting` }),
+      waitMs
+    );
+    try {
+      const child = spawn(command, args, { ...options, stdio: "ignore" });
+      child.on("error", (err: NodeJS.ErrnoException) => finish({ ok: false, reason: editorCliFailure(cli, { errCode: err.code ?? "error" }) }));
+      // Only a clean exit counts; killed by a signal (code null) is a failure.
+      child.on("exit", (code, signal) =>
+        finish(code === 0 ? { ok: true } : { ok: false, reason: editorCliFailure(cli, { code, signal }), ...(code !== null ? { code } : {}) })
+      );
+      child.unref();
+    } catch (err) {
+      finish({ ok: false, reason: editorCliFailure(cli, { errCode: (err as NodeJS.ErrnoException).code ?? "error" }) });
+    }
+  });
+}
+
+/** The first `<dir>\\<name><ext>` on a Windows PATH that is a file, trying the
+ *  executable extensions in cmd.exe's order. */
+export function findOnWindowsPath(
+  name: string,
+  pathVar: string,
+  isFile: (p: string) => boolean = (p) => {
+    try {
+      return statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  }
+): string | undefined {
+  const exts = /\.[a-z0-9]+$/i.test(name) ? [""] : [".com", ".exe", ".bat", ".cmd"];
+  for (const dir of pathVar.split(";")) {
+    if (dir.trim() === "") continue;
+    for (const ext of exts) {
+      const full = win32.join(dir.trim(), name + ext);
+      if (isFile(full)) return full;
+    }
+  }
+  return undefined;
 }

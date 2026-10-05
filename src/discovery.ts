@@ -1,8 +1,11 @@
 import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { ConfigHome } from "./homes";
-import { pidAlive, pidStartTime } from "./procs";
+import { pidAlive, pidStartTime, procHost, tableStartDisagrees } from "./procs";
 import { recordClaudeHealth, pruneClaudeHealth } from "./canary";
+// format.ts imports from this module too; the cycle is safe because
+// normalizeDriveLetter is only called inside snapshot(), never at load time.
+import { normalizeDriveLetter } from "./format";
 
 export interface SessionMeta {
   pid: number;
@@ -237,7 +240,9 @@ export function worktreeInfo(cwd: string): WorktreeLink | undefined {
     capMap(wtLinkCache, 500);
   }
   if (cached.link === null) return undefined;
-  return { mainRoot: cached.link.mainRoot, branch: worktreeBranch(cached.link.gitdir) };
+  // mainRoot becomes a project group key, so it gets the same drive-letter form as
+  // the session cwds it is matched against.
+  return { mainRoot: normalizeDriveLetter(cached.link.mainRoot), branch: worktreeBranch(cached.link.gitdir) };
 }
 
 function liveSessions(homeDir: string): SessionMeta[] {
@@ -271,19 +276,69 @@ function liveSessions(homeDir: string): SessionMeta[] {
     } catch {
       continue;
     }
-    const start = pidStartTime(meta.pid);
+    // Tolerate registry shapes not yet seen on macOS/Windows: the file name is the
+    // pid, and a session without an id or cwd can't be shown.
+    if (typeof meta.pid !== "number" || !Number.isFinite(meta.pid)) {
+      if (!Number.isFinite(pidFromName)) continue;
+      meta.pid = pidFromName;
+    }
+    if (typeof meta.sessionId !== "string" || typeof meta.cwd !== "string") continue;
+    if (meta.procStart !== undefined && typeof meta.procStart !== "string") meta.procStart = String(meta.procStart);
+    const start = procHost() === "linux" ? pidStartTime(meta.pid) : undefined;
     // On Linux a live pid always has a start time; its absence means the process
     // died between the pidAlive check and this read — pre-refactor that skipped
     // the row, so preserve that exactly. Elsewhere start time is never available
     // (undefined is normal) and must NOT exclude an otherwise-live session.
     if (start === undefined) {
-      if (process.platform === "linux") continue;
+      if (procHost() === "linux") continue;
+      // macOS / Windows: the same reuse guard against the process table, once
+      // the pid's row is cached (a miss queues it for a later scan).
+      if (tableStartDisagrees(meta.pid, meta.procStart, typeof meta.startedAt === "number" ? meta.startedAt : undefined)) continue;
     } else if (meta.procStart !== undefined && String(start) !== meta.procStart) {
       continue; // pid reused
     }
     out.push(meta);
   }
   return out;
+}
+
+/** pid and procStart of every live registry entry in a home (for Diagnostics'
+ *  start-time check; no reuse guard, which is what it measures). procStart is
+ *  undefined when the entry has none, so Diagnostics can count it. */
+export function registryStartEntries(homeDir: string): { pid: number; procStart: string | undefined }[] {
+  const out: { pid: number; procStart: string | undefined }[] = [];
+  let files: string[];
+  try {
+    files = readdirSync(join(homeDir, "sessions"));
+  } catch {
+    return out;
+  }
+  for (const f of files) {
+    if (!f.endsWith(".json")) continue;
+    const pid = Number(f.slice(0, -5));
+    if (!Number.isInteger(pid) || pid <= 0 || !pidAlive(pid)) continue;
+    try {
+      const raw = JSON.parse(readFileSync(join(homeDir, "sessions", f), "utf8")) as { procStart?: unknown };
+      const start = typeof raw.procStart === "string" || typeof raw.procStart === "number" ? String(raw.procStart) : undefined;
+      out.push({ pid, procStart: start !== undefined && start.trim() !== "" ? start : undefined });
+    } catch {
+      // unreadable: not counted
+    }
+  }
+  return out;
+}
+
+/** The live `status` Claude Code writes into a session's registry file: "busy"
+ *  (mid-turn), "waiting" (mid-turn, on a permission or question), "idle", or
+ *  "shell" (between turns with a background task running). Read fresh, for the
+ *  move confirmation; undefined when the file or field is missing. */
+export function registryStatus(homeDir: string, pid: number): string | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(join(homeDir, "sessions", `${pid}.json`), "utf8")) as { status?: unknown };
+    return typeof raw.status === "string" ? raw.status : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** The `projects/<slug>/` directory name Claude Code derives from a session cwd
@@ -952,13 +1007,21 @@ function readRange(path: string, start: number, end: number): Buffer | undefined
 
 /** Full parse of a transcript's last 64 KB into a fresh TailState — the cold read,
  *  and the fallback whenever incremental folding can't guarantee equivalence. */
+// Claude Code 2.1.28x writes a `prompt_snapshot` attachment (~100 KB: the whole
+// system prompt and tool list) after a turn, which can push the reply out of the
+// 64 KB tail. A tail with no conversation record at all is read further back,
+// up to this much, so the last reply (and the turn's state) is still found.
+const MAX_TAIL_BYTES = 4 * 1024 * 1024;
+
 function fullTail(path: string, size: number, mtimeMs: number, ino = 0): TailState {
-  const base = Math.max(0, size - TAIL_BYTES);
-  const st = emptyState(mtimeMs, base, ino);
-  const buf = readRange(path, base, size);
-  if (buf !== undefined) st.size = foldBuf(st, buf, base);
-  else st.readError = true; // open/read failed — nothing parsed; don't let it read as drift
-  return st;
+  for (let window = TAIL_BYTES; ; window *= 4) {
+    const base = Math.max(0, size - window);
+    const st = emptyState(mtimeMs, base, ino);
+    const buf = readRange(path, base, size);
+    if (buf !== undefined) st.size = foldBuf(st, buf, base);
+    else st.readError = true; // open/read failed — nothing parsed; don't let it read as drift
+    if (st.readError || st.lastKind !== "" || base === 0 || window >= MAX_TAIL_BYTES) return st;
+  }
 }
 
 function toClassified(st: TailState): Classified {
@@ -1856,7 +1919,8 @@ export interface ReuseHint {
  *  `pidStartTime`/`procStart` reuse guard liveSessions() runs. So if a session's
  *  pid dies and is immediately reused by an unrelated process, its ghost row can
  *  survive at most one reconcile interval (≤30s) — the periodic forceFull rescan
- *  goes back through liveSessions() and its reuse guard drops it. Same
+ *  goes back through liveSessions() and its reuse guard drops it (on macOS and
+ *  Windows once the process table has the pid's row). Same
  *  self-healing, low-probability class as a missed watch event. */
 function cachedLive(): { meta: SessionMeta; home: ConfigHome }[] {
   const out: { meta: SessionMeta; home: ConfigHome }[] = [];
@@ -1934,9 +1998,12 @@ export function snapshot(homes: ConfigHome[], hint?: ReuseHint): Map<string, Ses
       reclassifyAll || cached === undefined || metaChanged || (dirty !== undefined && dirty.has(meta.sessionId))
         ? classifyFull(meta, home, now)
         : buildRow(cached, now);
-    const list = byProject.get(meta.cwd) ?? [];
+    // Grouped by the drive-normalised cwd (`s:\` and `S:\` are one folder); the row
+    // keeps its raw meta.cwd, which is what actions hand to the editor and the CLI.
+    const key = normalizeDriveLetter(meta.cwd);
+    const list = byProject.get(key) ?? [];
     list.push(row);
-    byProject.set(meta.cwd, list);
+    byProject.set(key, list);
   }
 
   // most recent activity first inside each project
@@ -2057,9 +2124,24 @@ export function __resetReuseCache(): void {
   reuseCache.clear();
 }
 
+let subMinuteMasked = 0;
+
+/** Run `fn` with every sub-minute age fmtAge renders ("45s") replaced by one
+ *  placeholder, so text built for comparison ignores the per-tick drift of a young
+ *  row's age while still seeing everything else, including any "1s" inside a
+ *  message (the tree's row comparison, SessionsProvider.fireTreeChanges). */
+export function withSubMinuteAgesMasked<T>(fn: () => T): T {
+  subMinuteMasked++;
+  try {
+    return fn();
+  } finally {
+    subMinuteMasked--;
+  }
+}
+
 export function fmtAge(sec: number | null): string {
   if (sec === null) return "new";
-  if (sec < 60) return `${Math.round(sec)}s`;
+  if (sec < 60) return subMinuteMasked > 0 ? "<1m" : `${Math.round(sec)}s`;
   if (sec < 90 * 60) return `${Math.round(sec / 60)}m`;
   if (sec < 48 * 3600) return `${Math.round(sec / 3600)}h`;
   return `${Math.round(sec / 86400)}d`;
