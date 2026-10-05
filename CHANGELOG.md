@@ -5,6 +5,53 @@ packages share one version number.
 
 ## [Unreleased]
 
+## [0.42.7] - 2026-10-05
+
+### Fixed
+- With two windows open on the same folder, clicking a Claude session
+  (including from another machine) no longer opens a second tab in the window
+  that does not have it; the window that runs the session shows it.
+- Clicking a terminal session from another machine when two windows have its
+  folder open now switches to the window whose terminal runs it, instead of
+  sometimes reporting "no integrated terminal there is running the session".
+- After updating, reload every editor window. Windows on different versions of
+  SessionDeck on one machine can disagree about which window handles a click
+  or publishes the machine's sessions.
+- The floating window now shows the ↗ badge on sessions that run outside the
+  editor, after the account letter, as the tree and Column View do.
+- Show Last Message on a Codex or Cursor session from another machine now says
+  the message is only available on the machine that runs it, instead of "No
+  message text."
+- Column View gives titles more room in a narrow sidebar: below 260 px the
+  time moves to the line under the title.
+- On native Windows, a session waiting on a question or a permission prompt now
+  shows under Needs you and raises its alert. Claude Code doesn't write the
+  question to the transcript until it is answered, so SessionDeck now also
+  reads the status Claude Code keeps in its session registry.
+- A session that needs you on another machine now raises one alert per
+  question or permission prompt, within a few seconds. Before, in v0.42.6 too
+  and for hook approvals as well, the alert could arrive late, repeat every 15
+  seconds, turn into a "1 sessions just blocked" notice, and then hide later
+  alerts for up to a minute. A question on another machine is now labelled as
+  a question, not as an approval.
+- A session waiting on a question or a permission prompt now stays under Needs
+  you while its subagents or background tasks keep working. Before, it could
+  drop back to "working" after about a minute, in v0.42.6 too on machines with
+  hooks.
+- A question in a session with hooks now raises one alert and stays labelled
+  as a question, instead of getting a second "Claude needs your permission"
+  alert a few seconds later, as v0.42.6 did. An approval no longer gets a
+  second alert after you approve it.
+- On Windows, the result of stopping a session from another machine could be
+  lost, leaving the other machine saying it had not heard back.
+- On Windows and macOS, questions and approvals from the session registry no
+  longer stay hidden when the process table can't be read. After 15 seconds
+  of failed reads they show anyway, and Diagnostics explains why.
+- A sandboxed command asking for network access, or a worker asking for
+  permission, now shows as an approval instead of a question.
+- Closing the editor tab of a session you moved into the editor ends the
+  session. SessionDeck now says so and offers to resume it.
+
 ## [0.42.6] - 2026-10-05
 
 ### Added

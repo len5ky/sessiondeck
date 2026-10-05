@@ -7,7 +7,7 @@
 // runs the exact same code path as a sidebar click.
 import * as vscode from "vscode";
 import { readFileSync } from "node:fs";
-import { PanelModel, stripSubMinuteAge } from "./format";
+import { OUTSIDE_GLYPH, OUTSIDE_TOOLTIP, PanelModel, stripSubMinuteAge } from "./format";
 
 /** Comparison key for the quiet-tick skip: a serialization of the model that
  *  ignores the two things that drift every 3s poll without any visible change —
@@ -365,6 +365,18 @@ function html(webview: vscode.Webview, extensionUri: vscode.Uri): string {
     font-size: 0.9em;
     font-weight: 600;
   }
+  /* Outside the editor: the small muted glyph Column View and the tree show. It
+     follows the account letter ("S↗") and never truncates with the title. */
+  .mark-outside {
+    flex: 0 0 auto;
+    margin-left: 6px;
+    color: var(--vscode-descriptionForeground);
+    font-size: 0.9em;
+    white-space: nowrap;
+  }
+  .badge + .mark-outside { margin-left: 1px; }
+  /* Columns layout puts the account letter and glyph before the title. */
+  .mark-outside.lead { margin-right: 6px; }
   /* Icon / account colors: resolve a ThemeColor name to its --vscode-* var. */
   .col-charts-red { color: var(--vscode-charts-red); }
   .col-charts-green { color: var(--vscode-charts-green); }
@@ -412,6 +424,10 @@ function html(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 <script nonce="${n}">
   const vscode = acquireVsCodeApi();
   const BRAND_SVG = ${JSON.stringify(brand)};
+  // Same badge as Column View's OUTSIDE_BADGE: after the account letter, outside the
+  // truncating label span, so a long title can't hide it.
+  const OUTSIDE_BADGE = ${JSON.stringify(`<span class="mark-outside" title="${OUTSIDE_TOOLTIP}" aria-label="${OUTSIDE_TOOLTIP}">${OUTSIDE_GLYPH}</span>`)};
+  const OUTSIDE_BADGE_LEAD = OUTSIDE_BADGE.replace('class="mark-outside"', 'class="mark-outside lead"');
   const saved = vscode.getState() || {};
   // Project/host/remote-project rows carry a "toggled away from the density default"
   // set (kept under the historical collapsed* names for state-shape compatibility):
@@ -578,11 +594,13 @@ function html(webview: vscode.Webview, extensionUri: vscode.Uri): string {
     // across every row AND the header — so the (fixed-width) account badge goes BEFORE
     // the flexible title, letting the title absorb its width; nothing variable sits to
     // the right of the columns. In list layout the badge keeps its trailing position.
+    // The outside glyph follows the account letter in both layouts ("S↗").
     const body = columns
-      ? badge + '<span class="' + labelCls + '">' + esc(s.title) + '</span>' + colCells(s.columns)
+      ? badge + (s.outside ? OUTSIDE_BADGE_LEAD : "") +
+        '<span class="' + labelCls + '">' + esc(s.title) + '</span>' + colCells(s.columns)
       : '<span class="' + labelCls + '">' + esc(s.title) + '</span>' +
         '<span class="desc">' + esc(s.description || "") + '</span>';
-    const trailingBadge = columns ? "" : badge;
+    const trailingBadge = columns ? "" : badge + (s.outside ? OUTSIDE_BADGE : "");
     let out =
       '<div class="row session' + (s.freeTier ? " free-tier" : "") + '" data-nav="' + esc(s.sessionId) + '"' +
         (hasKids ? ' data-toggle-session="' + esc(s.sessionId) + '"' : "") +
@@ -639,6 +657,7 @@ function html(webview: vscode.Webview, extensionUri: vscode.Uri): string {
         iconHtml(c.icon, c.iconColor, c.spin, c.brand) +
         '<span class="label">' + esc(c.title) + '</span>' +
         '<span class="desc">' + prov + esc(c.description || "") + '</span>' +
+        (c.outside ? OUTSIDE_BADGE : "") +
       '</div>'
     );
   }
@@ -682,6 +701,7 @@ function html(webview: vscode.Webview, extensionUri: vscode.Uri): string {
         '<span class="' + labelCls + '">' + esc(r.title) + '</span>' +
         '<span class="desc">' + esc(r.description || "") + '</span>' +
         badge +
+        (r.outside ? OUTSIDE_BADGE : "") +
       '</div>'
     );
   }
@@ -745,6 +765,7 @@ function html(webview: vscode.Webview, extensionUri: vscode.Uri): string {
         iconHtml(s.icon, s.iconColor, s.spin, s.brand) +
         '<span class="label">' + esc(s.title) + '</span>' +
         '<span class="desc">' + esc(s.description || "") + '</span>' +
+        (s.outside ? OUTSIDE_BADGE : "") +
       '</div>';
     if (hasKids && open) {
       out += '<div class="group">' + s.children.map(remoteChildHtml).join("") + '</div>';

@@ -463,6 +463,11 @@ export interface BridgeSession {
   children?: BridgeChild[];
 }
 
+/** The first publish revision (`HostSnapshot.publishRev`, src/bridge.ts
+ *  PUBLISH_REV) whose blocked rows publish ageSec counted from the block's onset,
+ *  so a viewer can tell two blocks apart by onset. Older snapshots can't be. */
+export const ONSET_PUBLISH_REV = 2;
+
 export interface HostSnapshot {
   v: 1;
   host: BridgeHost;
@@ -470,6 +475,10 @@ export interface HostSnapshot {
   seq: number;
   sessions: BridgeSession[];
   truncated?: boolean;
+  /** The publishing build's PUBLISH_REV (src/bridge.ts). Additive: absent from
+   *  0.42.6 and older publishers, and dropped by an older companion's validator, so
+   *  a viewer reads absent as "older publisher". A positive integer when present. */
+  publishRev?: number;
 }
 
 /** The list()/stored form: the bridge stamps a LOCAL-clock receive time on
@@ -600,6 +609,8 @@ export function validateSnapshot(
     sessions,
   };
   if (truncated) doc.truncated = true;
+  const rev = input.publishRev;
+  if (typeof rev === "number" && Number.isInteger(rev) && rev > 0 && rev <= 1_000_000) doc.publishRev = rev;
 
   // Final byte budget: drop sessions from the END until the serialized doc fits.
   if (JSON.stringify(doc).length > CAPS.docBytes) {
@@ -847,16 +858,12 @@ export async function takeActionsFromDir(
     } catch {
       // the write below fails too and is handled there
     }
-    const own = join(winDir, `${route.window}.json`);
-    const tmp = `${own}.${Math.random().toString(36).slice(2)}.tmp`;
     try {
-      await writeFile(tmp, JSON.stringify({ folders: route.folders }), "utf8");
-      await rename(tmp, own);
+      // writeFileAtomic retries a rename Windows refuses while another window
+      // reads the record, and never leaves its temp file behind on failure.
+      await writeFileAtomic(join(winDir, `${route.window}.json`), JSON.stringify({ folders: route.folders }));
     } catch {
       // routing is best effort: without the record this window is just unknown.
-      // The temp file must not stay behind (a rename that fails on Windows, say
-      // while another window reads the record, left one per failed ask).
-      await rm(tmp, { force: true }).catch(() => undefined);
     }
   }
   try {
@@ -968,18 +975,70 @@ export function validateFocusResult(input: unknown): FocusResult | null {
   return out;
 }
 
+// ---- atomic writes on the companion's folders ------------------------------
+
+/** Error codes a rename fails with on Windows while another rename or a reader
+ *  has the source or destination open (NTFS refuses to replace a file another
+ *  handle holds). They clear within milliseconds, so the rename is retried. */
+const TRANSIENT_RENAME_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
+/** Waits between rename attempts: 5 attempts, about 250 ms in all. */
+export const RENAME_RETRY_DELAYS_MS: readonly number[] = [10, 30, 60, 150];
+
+export interface RenameIo {
+  rename(from: string, to: string): Promise<void>;
+  sleep(ms: number): Promise<void>;
+}
+const defaultRenameIo: RenameIo = {
+  rename: (from, to) => rename(from, to),
+  sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+};
+
+const errCode = (err: unknown): unknown => (isObject(err) ? err.code : undefined);
+
+/** rename(), retried on the Windows codes above with a short bounded backoff.
+ *  Any other error (ENOENT: nothing to rename) is thrown at once, so callers
+ *  that read ENOENT as "none" stay as fast as before. The last error is thrown
+ *  when every attempt fails. */
+export async function renameRetrying(from: string, to: string, io: RenameIo = defaultRenameIo): Promise<void> {
+  for (let i = 0; ; i++) {
+    try {
+      await io.rename(from, to);
+      return;
+    } catch (err) {
+      if (i >= RENAME_RETRY_DELAYS_MS.length || !TRANSIENT_RENAME_CODES.has(String(errCode(err)))) throw err;
+      await io.sleep(RENAME_RETRY_DELAYS_MS[i]);
+    }
+  }
+}
+
+/** Write `data` to `target` through a temp file in the same folder and a rename
+ *  (renameRetrying), so a reader never sees a partial file. When it fails the
+ *  temp file is removed and the error is thrown. */
+export async function writeFileAtomic(target: string, data: string, io: RenameIo = defaultRenameIo): Promise<void> {
+  const tmp = `${target}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    await writeFile(tmp, data, "utf8");
+    await renameRetrying(tmp, target, io);
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => undefined);
+    throw err;
+  }
+}
+
 /** Take the result for one action id from the companion's results folder, once:
  *  the file is claimed by an atomic rename before it is read, so a result
  *  written meanwhile under the same id (a stop's outcome after its "asking")
  *  lands as a new file and is not deleted unread. `id` must be ACTION_ID_RE-
- *  gated. Undefined = no result yet (or not a valid one). */
-export async function takeResultFromDir(resultsDir: string, id: string): Promise<FocusResult | undefined> {
+ *  gated. Undefined = no result yet (or not a valid one). The claim retries
+ *  the Windows sharing errors (renameRetrying): a result being written at that
+ *  moment is taken now rather than on a later poll. */
+export async function takeResultFromDir(resultsDir: string, id: string, io?: RenameIo): Promise<FocusResult | undefined> {
   const full = join(resultsDir, `${id}.json`);
   const claimed = `${full}.${Math.random().toString(36).slice(2)}.taken`;
   try {
-    await rename(full, claimed);
+    await renameRetrying(full, claimed, io);
   } catch {
-    return undefined; // none yet, or another window took it
+    return undefined; // none yet, or another window took it (or still locked: the next poll asks again)
   }
   let parsed: unknown;
   try {

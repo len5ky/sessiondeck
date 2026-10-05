@@ -67,6 +67,14 @@ interface BridgeClientOptions {
   enabled?: () => boolean;
   /** Fired once if the companion never answers within the probe window. */
   onInitialProbeFailed?: () => void;
+  /** Fired when a fetch brings another host's snapshot this window has not seen
+   *  (a new seq or receive time), so the caller can refresh right away instead of
+   *  rendering it on the next 3 s tick. Not fired for an unchanged list. */
+  onRemoteChange?: () => void;
+  /** May this window publish now (it holds the publisher lease)? Checked before a
+   *  held snapshot goes out, since the window may have lost the lease while it
+   *  waited. Defaults to yes. */
+  mayPublish?: () => boolean;
 }
 
 function isObject(x: unknown): x is Record<string, unknown> {
@@ -105,6 +113,14 @@ export class BridgeClient {
   private seq = 0;
   private lastPublishAt = 0;
   private lastPublishKey = "";
+  /** Sessions with `attention` in the last snapshot sent: a session that gains it
+   *  is published at once, past the 3 s floor (see publish()). */
+  private lastSentAttention = new Set<string>();
+  /** A changed snapshot the 3 s floor held back, sent when the floor ends. */
+  private deferred: { snapshot: HostSnapshot; builtAt: number } | undefined;
+  private deferTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Identity of the last fetched list (host id, seq, receivedAt per host). */
+  private fetchedKey = "";
 
   /** Companion version from the last successful hello(), and whether it minor-skews
    *  from ours — surfaced read-only by the Setup Doctor (console-only otherwise). */
@@ -165,6 +181,7 @@ export class BridgeClient {
     this.disposed = true;
     this.releaseSettleWaiters();
     if (this.probeTimer !== undefined) clearTimeout(this.probeTimer);
+    this.cancelDeferred();
   }
 
   // ---- availability probe ---------------------------------------------------
@@ -236,17 +253,31 @@ export class BridgeClient {
 
   /** Fire-and-forget publish, throttled: skip when the snapshot is unchanged and
    *  the last publish was <15s ago (the 15s heartbeat republishes regardless of
-   *  change), and never publish twice within 3s. `force` (this window just took
-   *  the publisher lease over: another window may have written the host's
-   *  snapshot since our last publish) skips both. Any failure marks degraded. */
+   *  change), and publish at most once per 3s. A changed snapshot that lands
+   *  inside the 3 s floor is not dropped: it is sent when the floor ends (the
+   *  latest one wins; one equal to what was last sent cancels it). A session
+   *  that newly needs the user (`attention`) is the most time-critical thing a
+   *  snapshot carries, so a snapshot that adds one is sent at once, past the
+   *  floor. `force` (this window just took the publisher
+   *  lease over: another window may have written the host's snapshot since our
+   *  last publish) skips all of it. Any failure marks degraded. */
   async publish(snapshot: HostSnapshot, force = false): Promise<void> {
     const now = Date.now();
     const key = stableKey(snapshot);
-    if (!force) {
-      if (now - this.lastPublishAt < MIN_INTERVAL_MS) return; // hard 3s floor
+    if (!force && !this.addsAttention(snapshot)) {
+      if (now - this.lastPublishAt < MIN_INTERVAL_MS) {
+        // Back to what was last sent: nothing is owed, drop a held snapshot.
+        if (key === this.lastPublishKey) this.cancelDeferred();
+        if (key !== this.lastPublishKey) this.defer(snapshot, now);
+        return;
+      }
       if (key === this.lastPublishKey && now - this.lastPublishAt < HEARTBEAT_MS) return;
     }
+    this.cancelDeferred();
+    await this.send(snapshot, key, now);
+  }
 
+  private async send(snapshot: HostSnapshot, key: string, now: number): Promise<void> {
     this.seq += 1;
     const doc: HostSnapshot = { ...snapshot, seq: this.seq, publishedAt: now };
     try {
@@ -256,9 +287,40 @@ export class BridgeClient {
       this._available = true;
       this.lastPublishAt = now;
       this.lastPublishKey = key;
+      this.lastSentAttention = attentionIds(snapshot);
     } catch {
       this._available = false;
     }
+  }
+
+  /** Does this snapshot carry a session needing the user that the last sent one
+   *  did not? */
+  private addsAttention(snapshot: HostSnapshot): boolean {
+    return snapshot.sessions.some((s) => s.attention === true && !this.lastSentAttention.has(s.id));
+  }
+
+  /** Hold a snapshot the floor blocked and send it when the floor ends. ageSec
+   *  is re-aged by the wait at send time, so a viewer's onset
+   *  (receivedAt − ageSec·1000) does not move by the deferral. */
+  private defer(snapshot: HostSnapshot, now: number): void {
+    this.deferred = { snapshot, builtAt: now };
+    if (this.deferTimer !== undefined || this.disposed) return;
+    const wait = Math.max(0, this.lastPublishAt + MIN_INTERVAL_MS - now);
+    this.deferTimer = setTimeout(() => {
+      this.deferTimer = undefined;
+      const d = this.deferred;
+      this.deferred = undefined;
+      if (d === undefined || this.disposed) return;
+      if (!(this.opts.mayPublish?.() ?? true)) return; // lost the lease meanwhile
+      const aged = reaged(d.snapshot, (Date.now() - d.builtAt) / 1000);
+      void this.publish(aged);
+    }, wait);
+  }
+
+  private cancelDeferred(): void {
+    this.deferred = undefined;
+    if (this.deferTimer !== undefined) clearTimeout(this.deferTimer);
+    this.deferTimer = undefined;
   }
 
   /** True when the 15s heartbeat is due (or nothing has been published yet), i.e.
@@ -313,6 +375,14 @@ export class BridgeClient {
       if (Array.isArray(res)) {
         this.cache = res.filter(isStored);
         this._available = true;
+        const key = this.cache
+          .filter((h) => h.host.id !== this.opts.selfHostId)
+          .map((h) => `${h.host.id}:${h.seq}:${h.receivedAt}`)
+          .join(",");
+        if (key !== this.fetchedKey) {
+          this.fetchedKey = key;
+          this.opts.onRemoteChange?.();
+        }
       }
     } catch {
       this._available = false; // keep the cache untouched
@@ -542,6 +612,16 @@ export class BridgeClient {
   }
 }
 
+/** Ids of the sessions a snapshot flags as needing the user. */
+function attentionIds(s: HostSnapshot): Set<string> {
+  return new Set(s.sessions.filter((x) => x.attention === true).map((x) => x.id));
+}
+
+/** The snapshot with every session's ageSec advanced by `sec`. */
+function reaged(s: HostSnapshot, sec: number): HostSnapshot {
+  return { ...s, sessions: s.sessions.map((x) => ({ ...x, ageSec: x.ageSec + sec })) };
+}
+
 /** Stable identity of a snapshot for throttling: everything except the two
  *  per-publish fields (`publishedAt`, `seq`) that change on every heartbeat. */
 function stableKey(s: HostSnapshot): string {
@@ -657,7 +737,7 @@ export function buildSnapshot(model: PanelModel, identity: HostIdentity): HostSn
   if (authorityHint !== "") host.authorityHint = authorityHint;
   if (identity.label !== undefined) host.label = identity.label;
 
-  return { v: 1, host, publishedAt: 0, seq: 0, sessions };
+  return { v: 1, host, publishedAt: 0, seq: 0, sessions, publishRev: PUBLISH_REV };
 }
 
 /** A host's published snapshot is one file per host id, so every window on that
@@ -675,9 +755,12 @@ export const LEASE_STALE_MS = 45_000;
  *  whose build publishes more takes the lease from one that publishes less (see
  *  PublisherLease), so a window left on an older build can no longer hold the
  *  host's snapshot to that build's fields: it did, and `stoppable` never reached
- *  other hosts while a pre-Stop window held the lease. 1 = `stoppable`. A lease
- *  without the number (a build from before it) counts as 0. */
-export const PUBLISH_REV = 1;
+ *  other hosts while a pre-Stop window held the lease. 1 = `stoppable`. 2 = a
+ *  blocked row's ageSec counts from the block's onset, an approval never publishes
+ *  "waiting", and the snapshot carries this number as `publishRev` (viewers trust
+ *  the onset of a rev ≥ 2 snapshot to tell blocks apart). A lease without the
+ *  number (a build from before it) counts as 0. */
+export const PUBLISH_REV = 2;
 
 /** What a window sees in the lease file without touching it: `mine` (this window
  *  holds it, or the file can't be written so this window publishes alone), `free`
@@ -911,17 +994,42 @@ export interface RemoteStopDeps<S> {
   /** The local Stop Session (confirmation and stop); undefined = unavailable. */
   run(subject: S): Promise<{ outcome: string; reason?: string } | undefined>;
   now(): number;
+  /** Waits between retries of a final post (tests pass a fast one). */
+  sleep?(ms: number): Promise<void>;
+  /** Where a final post that never got stored is reported (console by default). */
+  log?(msg: string): void;
+}
+
+/** Waits before the 2nd and 3rd try of a stop's final post. Each try already
+ *  retries its file write for ~250 ms inside the companion; these cover a
+ *  longer hold-up while staying far inside the clicking window's 110 s wait. */
+export const FINAL_POST_RETRY_DELAYS_MS: readonly number[] = [500, 2_000];
+
+/** Post a stop's final outcome: the clicking window waits for it, so a post
+ *  that could not be stored is tried again, and logged if it never is. */
+async function postFinal<S>(deps: RemoteStopDeps<S>, r: Pick<FocusResult, "outcome" | "detail">): Promise<boolean> {
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((res) => setTimeout(res, ms)));
+  for (let i = 0; ; i++) {
+    if (await deps.post(r)) return true;
+    if (i >= FINAL_POST_RETRY_DELAYS_MS.length) break;
+    await sleep(FINAL_POST_RETRY_DELAYS_MS[i]);
+  }
+  (deps.log ?? ((m: string) => console.warn(m)))(
+    `[sessiondeck] could not post the outcome "${r.outcome}" of a stop asked from another host after ${FINAL_POST_RETRY_DELAYS_MS.length + 1} tries; that window will say it did not hear back`
+  );
+  return false;
 }
 
 export async function actOnRemoteStop<S>(deadline: number | undefined, deps: RemoteStopDeps<S>): Promise<void> {
   const row = deps.find();
   if (row === undefined) {
-    await deps.post({ outcome: "gone" });
+    await postFinal(deps, { outcome: "gone" });
     return;
   }
   const subject = deps.subject();
   if (subject === undefined) {
-    await deps.post(
+    await postFinal(
+      deps,
       row.pid === undefined || !deps.alive(row.pid)
         ? { outcome: "gone" }
         : { outcome: "not-stopped", detail: "SessionDeck there can't tell where it runs or which process runs it" }
@@ -934,11 +1042,11 @@ export async function actOnRemoteStop<S>(deadline: number | undefined, deps: Rem
   if (!(await deps.post({ outcome: "asking" }))) return;
   const r = await deps.run(subject);
   if (r === undefined) {
-    await deps.post({ outcome: "not-stopped", detail: "SessionDeck there can't stop sessions right now (a startup step failed)" });
+    await postFinal(deps, { outcome: "not-stopped", detail: "SessionDeck there can't stop sessions right now (a startup step failed)" });
     return;
   }
-  if (r.outcome === "stopped" || r.outcome === "cancelled" || r.outcome === "gone") await deps.post({ outcome: r.outcome });
-  else await deps.post(r.reason !== undefined ? { outcome: "not-stopped", detail: r.reason } : { outcome: "not-stopped" });
+  if (r.outcome === "stopped" || r.outcome === "cancelled" || r.outcome === "gone") await postFinal(deps, { outcome: r.outcome });
+  else await postFinal(deps, r.reason !== undefined ? { outcome: "not-stopped", detail: r.reason } : { outcome: "not-stopped" });
 }
 
 /** How long the clicking window waits for the outcome of a stop once the host

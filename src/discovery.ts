@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { ConfigHome } from "./homes";
-import { pidAlive, pidStartTime, procHost, tableStartDisagrees } from "./procs";
+import { pidAlive, pidStartTime, procHost, registryFailOpen, registryHold, registryHoldText, tableIdentity, tableStartDisagrees } from "./procs";
 import { recordClaudeHealth, pruneClaudeHealth } from "./canary";
 // format.ts imports from this module too; the cycle is safe because
 // normalizeDriveLetter is only called inside snapshot(), never at load time.
@@ -16,6 +16,15 @@ export interface SessionMeta {
   kind?: string;
   entrypoint?: string;
   name?: string;
+  /** Claude Code's own live status in the registry file: "busy", "waiting" (blocked
+   *  on a question or a permission prompt), "idle" or "shell". Read with the rest of
+   *  the record; dropped unless it is a string. */
+  status?: string;
+  /** Set alongside status "waiting": "input needed" (a question) or "permission
+   *  prompt" (a tool approval), as Claude Code 2.1.289 writes them. */
+  waitingFor?: string;
+  /** Epoch ms of the last status change (dropped unless a finite number). */
+  statusUpdatedAt?: number;
 }
 
 export type Status = "working" | "waiting" | "idle";
@@ -41,13 +50,28 @@ export interface SessionRow {
   /** Seconds since last activity on any chain (main, subagent, workflow); null when no transcript exists yet. */
   ageSec: number | null;
   mtimeMs: number;
-  /** Last write to the main transcript only (used to expire attention flags). */
+  /** Last write to the main transcript. Background work writes here too (queued
+   *  task notifications, attachments, parallel tool results), so it does not say the
+   *  user answered; see turnMs. */
   mainMtimeMs: number;
+  /** Creation time of the newest record showing the MAIN chain moved on: a new
+   *  assistant message, a user prompt or interrupt, or a turn_duration. Expires a
+   *  hook approval and a registry "waiting" (see registryWaitingFrom). 0 when none
+   *  is in the tail or no transcript exists. */
+  turnMs?: number;
+  /** Creation time of the pending question's tool_use record: its onset, which
+   *  later background writes don't move. Undefined unless pendingQuestion comes
+   *  from the transcript (or the record carries no timestamp). */
+  questionSinceMs?: number;
   lastText: string;
   /** Last ai-title record folded from the transcript tail: Claude's exact, full
    *  editor/sidebar session name. */
   aiTitle?: string;
   activity: SubActivity;
+  /** The registry says the session is blocked on the user while the transcript
+   *  does not show it (see registryWaitingFrom). Set only when the transcript tail
+   *  is not already a pending question; undefined otherwise. */
+  registryWaiting?: RegistryWaiting;
   /** The transcript tail is a still-open AskUserQuestion/ExitPlanMode tool_use —
    *  the session is blocked ON THE USER (a question/plan awaiting an answer), so
    *  it reads as "needs answer" rather than working, whatever the age. */
@@ -77,6 +101,119 @@ export interface SessionRow {
   /** inode of the main transcript (for the token scanner's rewrite detection);
    *  undefined on the no-transcript branch. */
   mainIno?: number;
+}
+
+/** A block on the user that only the registry reports. `kind` "question" also sets
+ *  the row's pendingQuestion; "approval" becomes the tree's attention flag. `sinceMs`
+ *  is the registry's statusUpdatedAt: stable while the block lasts, new for each
+ *  block, so it is the alert's onset timestamp. */
+export interface RegistryWaiting {
+  kind: "question" | "approval";
+  sinceMs: number;
+}
+
+/** A main-chain turn record (SessionRow.turnMs) made this long after the registry
+ *  entered "waiting" means the user answered and the session moved on, so the
+ *  registry record is stale. Observed on Windows 2.1.289: the records around a flip
+ *  are made before it (the question's tool_use 70 ms, the approval's 1 s), and the
+ *  first one made after it is the answer's. Background work keeps writing to the
+ *  transcript while the block is open (subagents, background tasks), so the file's
+ *  mtime says nothing here. */
+export const REGISTRY_WAIT_STALE_MS = 5_000;
+
+/** The registry's evidence that a session is blocked on the user, for the cases the
+ *  transcript misses (on native Windows, 2.1.289 holds a pending AskUserQuestion
+ *  tool_use back until it is answered, and a permission prompt reads as an ordinary
+ *  running tool). Claude Code writes status "waiting" only while a question or a
+ *  permission prompt is open; between turns it writes "idle", so an idle session
+ *  never matches. Undefined when the registry carries no status (older Claude Code),
+ *  when the transcript already shows the pending question (it is more specific), or
+ *  when the main chain started a new turn well after the registry went "waiting"
+ *  (`turnMs`, see SessionRow.turnMs). Otherwise the registry stands for as long as
+ *  it says "waiting" and the process lives. */
+export function registryWaitingFrom(
+  meta: Pick<SessionMeta, "status" | "waitingFor" | "statusUpdatedAt">,
+  turnMs: number,
+  transcriptQuestion: boolean
+): RegistryWaiting | undefined {
+  if (meta.status !== "waiting") return undefined;
+  noteWaitingFor(meta.waitingFor);
+  if (transcriptQuestion) return undefined;
+  const since = meta.statusUpdatedAt;
+  if (since === undefined || !Number.isFinite(since)) return undefined;
+  if (turnMs > since + REGISTRY_WAIT_STALE_MS) return undefined;
+  return { kind: meta.waitingFor !== undefined && APPROVAL_WAITING_FOR.has(meta.waitingFor) ? "approval" : "question", sinceMs: since };
+}
+
+/** `waitingFor` values that ask the user to allow something. Claude Code 2.1.289
+ *  writes a fixed label: "permission prompt" (a tool permission, the default for
+ *  a permission dialog), "sandbox request" (a sandboxed command needs network
+ *  access) and "worker request" (a worker's permission request); its own prompt
+ *  suggestion code files the last two under "pending_permission". */
+const APPROVAL_WAITING_FOR: ReadonlySet<string> = new Set(["permission prompt", "sandbox request", "worker request"]);
+/** Every label 2.1.289 writes with status "waiting". The others read as a
+ *  question: "input needed" (a question or MCP elicitation), "goal proposal"
+ *  (Claude proposed a session goal), "dialog open" (any other dialog). */
+const KNOWN_WAITING_FOR: ReadonlySet<string> = new Set([...APPROVAL_WAITING_FOR, "input needed", "goal proposal", "dialog open"]);
+const loggedWaitingFor = new Set<string>();
+
+/** A `waitingFor` value made safe for the log: control characters dropped,
+ *  anything from the first thing that looks like a path to the end replaced,
+ *  at most 40 characters. */
+export function waitingForLabel(value: string): string {
+  const clean = value
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/(?:[A-Za-z]:[\\/]|[\\/]|~|file:).*$/, "<path>")
+    .trim();
+  return clean.length > 40 ? clean.slice(0, 40) : clean;
+}
+
+/** Any other value still reads as a question; log it once per distinct value so
+ *  a new Claude Code status shows up in Output > SessionDeck. */
+function noteWaitingFor(value: string | undefined): void {
+  if (value === undefined || KNOWN_WAITING_FOR.has(value)) return;
+  const label = waitingForLabel(value);
+  if (loggedWaitingFor.has(label) || loggedWaitingFor.size >= 32) return;
+  loggedWaitingFor.add(label);
+  log(`session registry: unrecognised waitingFor "${label}", read as a question`);
+}
+
+/** registryWaitingFrom, held back while the pid's identity is unconfirmed: on
+ *  macOS/Windows a session killed with a question open leaves its file on
+ *  "waiting", and a reused pid passes the liveness check until its process-table
+ *  row is cached. The row is queued on the first registry scan (usually seconds
+ *  before any question) and its arrival refreshes the view. When the table has
+ *  been failing for TABLE_FAIL_OPEN_MS the unconfirmed block passes (fail open);
+ *  a row that disagrees is still dropped. */
+function confirmedRegistryWaiting(meta: SessionMeta, turnMs: number, transcriptQuestion: boolean): RegistryWaiting | undefined {
+  const w = registryWaitingFrom(meta, turnMs, transcriptQuestion);
+  if (w === undefined) return undefined;
+  const startedAt = typeof meta.startedAt === "number" ? meta.startedAt : undefined;
+  const identity = tableIdentity(meta.pid, meta.procStart, startedAt);
+  return identity === "confirmed" || (identity === "unknown" && registryFailOpen()) ? w : undefined;
+}
+
+let discoveryLog: (line: string) => void = () => undefined;
+/** Where discovery's few log lines go (the extension's Output > SessionDeck). */
+export function setDiscoveryLog(log: (line: string) => void): void {
+  discoveryLog = log;
+}
+function log(line: string): void {
+  try {
+    discoveryLog(line);
+  } catch {
+    // no output channel: nothing to tell
+  }
+}
+
+let loggedHoldSince: number | undefined;
+/** One log line per failure run of the process table, once it holds registry
+ *  alerts for registered sessions (registryHold). */
+function reportRegistryHold(registered: number): void {
+  const hold = registryHold(registered);
+  if (hold === undefined || hold.sinceMs === loggedHoldSince) return;
+  loggedHoldSince = hold.sinceMs;
+  log(registryHoldText(hold));
 }
 
 /** One subagent transcript (standalone, or nested under a workflow). */
@@ -284,6 +421,9 @@ function liveSessions(homeDir: string): SessionMeta[] {
     }
     if (typeof meta.sessionId !== "string" || typeof meta.cwd !== "string") continue;
     if (meta.procStart !== undefined && typeof meta.procStart !== "string") meta.procStart = String(meta.procStart);
+    if (typeof meta.status !== "string") meta.status = undefined;
+    if (typeof meta.waitingFor !== "string") meta.waitingFor = undefined;
+    if (typeof meta.statusUpdatedAt !== "number" || !Number.isFinite(meta.statusUpdatedAt)) meta.statusUpdatedAt = undefined;
     const start = procHost() === "linux" ? pidStartTime(meta.pid) : undefined;
     // On Linux a live pid always has a start time; its absence means the process
     // died between the pidAlive check and this read — pre-refactor that skipped
@@ -354,6 +494,14 @@ export function transcriptPath(meta: SessionMeta, homeDir: string): string {
 
 interface TranscriptEntry {
   type?: string;
+  /** `system` records: "turn_duration" closes a main-chain turn. */
+  subtype?: string;
+  /** ISO creation time of the record (set when the record is built, so a record
+   *  Claude Code writes late, like a Windows question's tool_use, keeps the time it
+   *  was made). Read for the turn and question onsets only. */
+  timestamp?: string;
+  /** A subagent's record. Never part of the main chain's turn. */
+  isSidechain?: boolean;
   aiTitle?: string;
   // Marks machinery records (the `<local-command-caveat>` envelope Claude Code
   // injects around slash-command output) — never a real user prompt, so skipped
@@ -390,7 +538,9 @@ interface TranscriptEntry {
     stop_reason?: string | null;
     // `name`/`input` ride on type:"tool_use" content items — used to spot a pending
     // AskUserQuestion/ExitPlanMode gate at the tail (parseTail only).
-    content?: string | Array<{ type?: string; text?: string; name?: string; input?: unknown }>;
+    // `id` rides tool_use items and `tool_use_id` tool_result items: they pair a
+    // pending question with its answer.
+    content?: string | Array<{ type?: string; text?: string; name?: string; input?: unknown; id?: string; tool_use_id?: string }>;
   };
 }
 
@@ -524,11 +674,11 @@ export function normalizeEditPath(raw: string, cwd: string): string | undefined 
 /** When an assistant content array ends the turn on a question/plan tool_use,
  *  return that tool's name + a short prompt string; undefined otherwise. */
 function questionFrom(
-  content: Array<{ type?: string; name?: string; input?: unknown }>
-): { name: string; text?: string } | undefined {
+  content: Array<{ type?: string; name?: string; input?: unknown; id?: string }>
+): { name: string; text?: string; id?: string } | undefined {
   for (const c of content) {
     if (c.type === "tool_use" && typeof c.name === "string" && QUESTION_TOOLS.has(c.name)) {
-      return { name: c.name, text: questionText(c.name, c.input) };
+      return { name: c.name, text: questionText(c.name, c.input), ...(typeof c.id === "string" ? { id: c.id } : {}) };
     }
   }
   return undefined;
@@ -786,6 +936,10 @@ interface Classified {
   pendingQuestion: boolean;
   /** pending question's prompt text, truncated, for the hover (undefined otherwise) */
   questionText?: string;
+  /** see SessionRow.turnMs */
+  turnMs: number;
+  /** see SessionRow.questionSinceMs */
+  questionSinceMs?: number;
   /** name of the pending tool_use at the tail (Bash/Edit/…), capped 40; undefined
    *  unless the last record is a pending assistant tool_use */
   pendingToolName?: string;
@@ -839,7 +993,12 @@ interface TailState {
   // Only meaningful when the LAST record is a pending assistant tool_use — reset on
   // every other record kind so an earlier question that has since been answered
   // (a following user:tool_result) never lingers here.
-  pending: { name: string; text?: string } | undefined;
+  pending: { name: string; text?: string; id?: string; sinceMs?: number } | undefined;
+  // Newest main-chain turn record's creation time (SessionRow.turnMs) and the
+  // message id of the last main-chain assistant record: the streamed blocks of one
+  // message share an id, so only a message's first block dates a new turn.
+  turnMs: number;
+  turnMsgId: string | undefined;
   // Pending tool name for the "doing now" caption; reset alongside `pending` so a
   // resolved tool call (a following text/user record) never lingers as a caption.
   pendingToolName: string | undefined;
@@ -883,7 +1042,33 @@ interface TailState {
 }
 
 function emptyState(mtimeMs: number, size: number, ino = 0): TailState {
-  return { size, mtimeMs, ino, lastKind: "", lastText: "", aiTitle: undefined, lastTextPos: -1, lastStop: undefined, pending: undefined, pendingToolName: undefined, pendingEditPath: undefined, recognized: false, version: undefined, usage: zeroUsage(), usageBase: size, recent: emptyRecentIds(), firstMsgId: undefined, firstMsgUsage: zeroUsage(), model: undefined, permissionMode: undefined, readError: false };
+  return { size, mtimeMs, ino, lastKind: "", lastText: "", aiTitle: undefined, lastTextPos: -1, lastStop: undefined, pending: undefined, turnMs: 0, turnMsgId: undefined, pendingToolName: undefined, pendingEditPath: undefined, recognized: false, version: undefined, usage: zeroUsage(), usageBase: size, recent: emptyRecentIds(), firstMsgId: undefined, firstMsgUsage: zeroUsage(), model: undefined, permissionMode: undefined, readError: false };
+}
+
+/** A user record made only of tool_results, none of them for `toolUseId`. */
+function answersOther(content: string | Array<{ type?: string; tool_use_id?: string }> | undefined, toolUseId: string): boolean {
+  return Array.isArray(content) && content.length > 0 && content.every((c) => c.type === "tool_result" && c.tool_use_id !== toolUseId);
+}
+
+/** Advance `st.turnMs` when `e` shows the main chain moved on: the first record of
+ *  a new assistant message, a user prompt or interrupt, or the turn_duration that
+ *  closes a turn. Background work also writes to the main transcript while a
+ *  question or approval is open (queue-operation records for finished background
+ *  tasks, attachments, a parallel tool's tool_result, progress), and none of those
+ *  count: none of them happens before the user answers on the main chain. */
+function noteTurn(st: TailState, e: TranscriptEntry, ts: number): void {
+  if (e.isSidechain === true || !Number.isFinite(ts)) return;
+  if (e.type === "assistant") {
+    const mid = e.message?.id;
+    if (mid === undefined || mid !== st.turnMsgId) st.turnMs = Math.max(st.turnMs, ts);
+    st.turnMsgId = mid;
+  } else if (e.type === "user") {
+    const c = e.message?.content;
+    const toolResults = Array.isArray(c) && c.length > 0 && c.every((x) => x.type === "tool_result");
+    if (e.isMeta !== true && !toolResults) st.turnMs = Math.max(st.turnMs, ts);
+  } else if (e.type === "system" && e.subtype === "turn_duration") {
+    st.turnMs = Math.max(st.turnMs, ts);
+  }
 }
 
 /** Fold ONE JSONL record onto `st` in place. Byte-for-byte the same per-record
@@ -905,6 +1090,8 @@ function foldRecord(st: TailState, line: string, offset: number): void {
   // that carries it so a mid-session mode change is reflected.
   if (typeof e.permissionMode === "string" && e.permissionMode !== "") st.permissionMode = e.permissionMode;
   const content = e.message?.content;
+  const ts = typeof e.timestamp === "string" ? Date.parse(e.timestamp) : Number.NaN;
+  noteTurn(st, e, ts);
   // Usage + model accounting (assistant records only). Model is last-seen; usage is
   // summed ONCE per message id (repeated across a message's streamed-block records).
   if (e.type === "assistant" && e.message !== undefined) {
@@ -925,7 +1112,8 @@ function foldRecord(st: TailState, line: string, offset: number): void {
     const kinds = content.map((c) => c.type ?? "?");
     if (kinds.includes("tool_use")) {
       st.lastKind = "assistant:tool_use";
-      st.pending = questionFrom(content);
+      const q = questionFrom(content);
+      st.pending = q === undefined ? undefined : Number.isFinite(ts) ? { ...q, sinceMs: ts } : q;
       st.pendingToolName = pendingToolNameFrom(content);
       st.pendingEditPath = pendingEditPathFrom(content);
     } else {
@@ -941,6 +1129,10 @@ function foldRecord(st: TailState, line: string, offset: number): void {
       st.lastTextPos = offset;
     }
   } else if (e.type === "user") {
+    // Another tool's result (a parallel or background call finishing) while a
+    // question is open does not answer it: only the result for the question's own
+    // tool_use, a prompt or an interrupt does.
+    if (st.pending?.id !== undefined && answersOther(content, st.pending.id)) return;
     // An abort marker is neither a fresh prompt nor a tool_result — the user
     // stopped the turn, so nothing is running and nothing is blocked on them.
     st.lastKind = isInterruptContent(content)
@@ -1033,6 +1225,8 @@ function toClassified(st: TailState): Classified {
     lastStop: st.lastStop,
     pendingQuestion: st.pending !== undefined,
     questionText: st.pending?.text,
+    turnMs: st.turnMs,
+    questionSinceMs: st.pending?.sinceMs,
     pendingToolName: st.pendingToolName,
     pendingEditPath: st.pendingEditPath,
     recognized: st.recognized,
@@ -1771,28 +1965,38 @@ const reuseCache = new Map<string, ReuseEntry>();
 function buildRow(e: ReuseEntry, now: number): SessionRow {
   const activity = deriveSubActivity(e.subInv, now);
   if (!e.hasTranscript || e.cls === undefined) {
+    const regWait = confirmedRegistryWaiting(e.meta, 0, false);
+    const regQuestion = regWait?.kind === "question";
     return {
       meta: e.meta,
-      status: "idle",
-      ageSec: null,
-      mtimeMs: e.mainMtimeMs,
+      status: regQuestion ? "waiting" : "idle",
+      // An open registry block dates the row from the flip; a null age would publish
+      // as 0 and move a remote viewer's onset (receivedAt − ageSec) every heartbeat.
+      ageSec: regWait !== undefined ? (now - regWait.sinceMs) / 1000 : null,
+      mtimeMs: Math.max(e.mainMtimeMs, regWait?.sinceMs ?? 0),
       mainMtimeMs: e.mainMtimeMs,
+      turnMs: 0,
       lastText: "",
       activity,
-      pendingQuestion: false,
+      registryWaiting: regWait,
+      pendingQuestion: regQuestion,
       homeDir: e.home.dir,
       homeLabel: e.home.label,
     };
   }
   const cls = e.cls;
   const mainAgeSec = (now - e.mainMtimeMs) / 1000;
-  let status = statusFrom(cls.lastKind, mainAgeSec, cls.pendingQuestion, cls.lastStop);
+  // The registry raises a question the transcript doesn't show yet (#147); from
+  // here on it behaves exactly like a transcript pending question, minus the text.
+  const regWait = confirmedRegistryWaiting(e.meta, cls.turnMs, cls.pendingQuestion);
+  const pendingQuestion = cls.pendingQuestion || regWait?.kind === "question";
+  let status = statusFrom(cls.lastKind, mainAgeSec, pendingQuestion, cls.lastStop);
   // Both subactivity overrides below are blocked when the main tail is blocked ON or
   // ABORTED BY the user: a pending question is waiting on the user (statusFrom returns
   // "waiting"), and an explicit interrupt settled the turn to idle (nothing is running
   // — the aborted turn's subagents were torn down with it). Neither may be resurrected
   // to "working" by a leftover fresh/pending child.
-  const userSettled = cls.pendingQuestion || cls.lastKind === "user:interrupt";
+  const userSettled = pendingQuestion || cls.lastKind === "user:interrupt";
   // A pending question / interrupt wins over the orchestrating→working override below.
   if (!userSettled && (activity.agents > 0 || activity.workflows > 0)) status = "working";
   // Parent-PID ground truth: a live session whose own tail looks finished but which
@@ -1803,7 +2007,12 @@ function buildRow(e: ReuseEntry, now: number): SessionRow {
   if (status !== "working" && !userSettled && pendingSubagentKeepsWorking(e.subInv, now, pidAlive(e.meta.pid))) {
     status = "working";
   }
-  const mtimeMs = Math.max(e.mainMtimeMs, activity.newestMs);
+  // A registry block is activity the transcript doesn't show: dating the row from
+  // the flip makes it unread past an earlier read mark and unhides a hidden row,
+  // as a transcript question's own write does. turnMs (stale rule, hook expiry)
+  // is untouched. ageSec then counts from the flip, so a remote viewer's
+  // onset (receivedAt − ageSec) is the flip too, stable while the block lasts.
+  const mtimeMs = Math.max(e.mainMtimeMs, activity.newestMs, regWait?.sinceMs ?? 0);
   const ageSec = (now - mtimeMs) / 1000;
   return {
     meta: e.meta,
@@ -1811,11 +2020,14 @@ function buildRow(e: ReuseEntry, now: number): SessionRow {
     ageSec,
     mtimeMs,
     mainMtimeMs: e.mainMtimeMs,
+    turnMs: cls.turnMs,
     lastText: cls.lastText,
     aiTitle: cls.aiTitle,
     activity,
-    pendingQuestion: cls.pendingQuestion,
+    registryWaiting: regWait,
+    pendingQuestion,
     questionText: cls.questionText,
+    questionSinceMs: cls.questionSinceMs,
     pendingToolName: cls.pendingToolName,
     // Normalize the raw pending edit path (if any) against the session cwd —
     // purely lexical, no fs call, so it adds no I/O to the tail parse. A path that
@@ -1940,7 +2152,12 @@ function sameMeta(a: SessionMeta, b: SessionMeta): boolean {
     a.procStart === b.procStart &&
     a.kind === b.kind &&
     a.entrypoint === b.entrypoint &&
-    a.name === b.name
+    a.name === b.name &&
+    // A live status flip (busy → waiting → busy) rewrites the registry in place; it
+    // must reclassify so registryWaiting follows it.
+    a.status === b.status &&
+    a.waitingFor === b.waitingFor &&
+    a.statusUpdatedAt === b.statusUpdatedAt
   );
 }
 
@@ -1969,6 +2186,7 @@ export function snapshot(homes: ConfigHome[], hint?: ReuseHint): Map<string, Ses
   } else {
     found.push(...cachedLive());
   }
+  reportRegistryHold(found.length);
   // One row per sessionId. A session can hold two live registrations — resumed in a
   // second terminal, or re-registered after its cwd moved — and liveSessions() reads
   // the id from each registry file's CONTENT (the name is only a pid), so both

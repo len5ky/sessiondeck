@@ -10,8 +10,8 @@ import { tmpdir } from "node:os";
 import { SessionRow } from "./discovery";
 import { ConfigHome } from "./homes";
 import { composerFocusPlan } from "./cursor";
-import { pidAlive } from "./procs";
-import { CLAUDE_EXTENSION_ID, CLAUDE_OPEN_COMMAND, focusLocalTerminal } from "./injector";
+import { ancestryOfPid, pidAlive } from "./procs";
+import { CLAUDE_EXTENSION_ID, CLAUDE_OPEN_COMMAND, findLocalTerminal, focusLocalTerminal } from "./injector";
 
 const REQUEST_FILE = "focus-request.json";
 const CURSOR_REQUEST_FILE = "cursor-focus-request.json";
@@ -28,9 +28,19 @@ const NONCE_RE = /^[0-9a-z]{1,32}$/;
 const PER_REQUEST_RE = /^focus-request-([0-9a-z]{1,32})\.json$/;
 const requestFileFor = (nonce: string): string => `focus-request-${nonce}.json`;
 const replyFileFor = (nonce: string): string => `focus-reply-${nonce}.json`;
+/** Created exclusively by the one window that acts on a hand-off (a receiver,
+ *  or the sender falling back to opening the tab itself): whoever fails to
+ *  create it stands down, so a late window never opens a second tab. */
+const claimFileFor = (nonce: string): string => `focus-claim-${nonce}.json`;
 /** How long the windows that hold a hand-off's folder wait for each other
  *  before the deepest (then lowest id) acts. */
 const ELECTION_MS = 150;
+/** The longest a window waits to learn whether its extension host started a
+ *  session's process (a process-table query on macOS / Windows; the result is
+ *  cached, and the tree has usually asked for it already). Past this the owner
+ *  is unknown and the folder rules decide, as before. Kept well inside
+ *  HANDOFF_ACK_MS so a receiver that looks it up still answers in time. */
+export const OWNER_LOOKUP_MS = 1_000;
 const WINDOW_ID_RE = /^w[0-9a-z]{1,16}$/;
 /** Per-hand-off files older than this are deleted by the next hand-off. */
 const HANDOFF_FILE_TTL_MS = 60_000;
@@ -80,6 +90,10 @@ interface FocusRequest {
   raise?: boolean;
   /** Past this (same host, same clock) the taker does nothing visible. */
   deadline?: number;
+  /** Sent by a window that holds the folder but whose extension host did not
+   *  start the session: only a window that did (or cannot tell) may take it, so
+   *  that when none did, the sender opens it itself as before. */
+  ownerOnly?: boolean;
 }
 
 /** A reply in REPLY_FILE for one request. */
@@ -118,6 +132,24 @@ export interface NavigatorDeps {
   /** The workspace file of a multi-root window, when it has one on disk. */
   workspaceFile?: () => string | undefined;
   runCli?: CliRun;
+  /** Parent pids of a process (nearest first), or undefined when unknown. */
+  ancestry?: (pid: number) => Promise<readonly number[] | undefined>;
+  /** This window's extension host pid. */
+  hostPid?: number;
+  /** This window's integrated terminal running `pid` (its shell is `pid` or an
+   *  ancestor), not yet revealed; undefined when it has none. */
+  findTerminal?: (pid: number) => Promise<{ show(): void } | undefined>;
+}
+
+/** Did this window's extension host start the session's process? Claude Code
+ *  spawns `claude` under the extension host of the window that shows its tab,
+ *  so that window is the one to show it. "unknown": no live pid, no ancestry,
+ *  or the lookup took too long. */
+export type Ownership = "here" | "elsewhere" | "unknown";
+
+export function ownershipOf(chain: readonly number[] | undefined, hostPid: number): Ownership {
+  if (chain === undefined || chain.length === 0) return "unknown";
+  return chain.includes(hostPid) ? "here" : "elsewhere";
 }
 
 export function navigationEnabled(): boolean {
@@ -190,22 +222,45 @@ export class Navigator implements vscode.Disposable {
     // session in a subfolder of this window's folder is this window's.
     const here = this.folderHolding(cwd);
     if (here !== undefined) {
+      const raiseHere = async (shown: NavOutcome): Promise<NavOutcome> => {
+        if (!shown.ok || opts.raise !== true) return shown;
+        if (late()) return { ok: false, reason: "expired" };
+        const raised = await this.runCli(this.raiseTarget(here), reportBy(opts.deadline));
+        return raised.ok ? shown : { ok: false, reason: "cli-failed", detail: raised.reason };
+      };
       // Only the Claude extension's own sessions have an editor tab. Every other
       // entrypoint (cli, sdk-cli, sdk-ts, …) runs in a terminal or an app: reveal the
       // integrated-terminal tab whose shell is an ancestor of the session pid.
-      let shown: NavOutcome;
       if (!hasEditorTab(entrypoint)) {
-        shown = (await focusLocalTerminal(pid)) ? { ok: true, how: "terminal" } : { ok: false, reason: "no-terminal" };
-      } else {
-        shown = (await this.openTabHere(sessionId, entrypoint)) ? { ok: true, how: "tab" } : { ok: false, reason: "no-tab" };
+        const terminal = await this.findTerminal(pid);
+        if (terminal !== undefined) {
+          if (late()) return { ok: false, reason: "expired" };
+          terminal.show();
+          return raiseHere({ ok: true, how: "terminal" });
+        }
+        // Another window on this folder may have it: a terminal's process runs
+        // under the editor's shared pty host, not under either window's extension
+        // host, so holding the folder says nothing about which window has it. Ask
+        // the other windows (the one with the terminal takes it); "no terminal"
+        // only when none does within the ack window.
+        return this.handOff(row, opts.raise === true, opts.deadline, async () => ({ ok: false, reason: "no-terminal" }));
       }
-      if (!shown.ok || opts.raise !== true) return shown;
-      if (late()) return { ok: false, reason: "expired" };
-      const raised = await this.runCli(this.raiseTarget(here), reportBy(opts.deadline));
-      return raised.ok ? shown : { ok: false, reason: "cli-failed", detail: raised.reason };
+      const showHere = async (): Promise<NavOutcome> => {
+        if (late()) return { ok: false, reason: "expired" };
+        return raiseHere((await this.openTabHere(sessionId, entrypoint)) ? { ok: true, how: "tab" } : { ok: false, reason: "no-tab" });
+      };
+      // Another window on this folder may be the one showing the tab (its
+      // extension host started the session): opening it here would make Claude
+      // Code open a second tab. Hand it over; if nobody takes it, open it here.
+      if ((await this.ownership(pid, reportBy(opts.deadline))) === "elsewhere") {
+        return this.handOff(row, opts.raise === true, opts.deadline, showHere);
+      }
+      return showHere();
     }
     // Not this window's folder, but a terminal session's own terminal may be here.
-    if (!hasEditorTab(entrypoint) && (await focusLocalTerminal(pid))) {
+    const mine = hasEditorTab(entrypoint) ? undefined : await this.findTerminal(pid);
+    if (mine !== undefined) {
+      mine.show();
       if (opts.raise !== true) return { ok: true, how: "terminal" };
       const own = this.raiseTarget(this.folders()[0]);
       if (own === undefined) return { ok: true, how: "terminal", unraised: "this window has no folder to bring up" };
@@ -222,8 +277,13 @@ export class Navigator implements vscode.Disposable {
    *  takes requests without answering), raise the folder an ide lock file names
    *  with the CLI. The lock lookup is only that hint: no hint and no taker is
    *  "nobody has it open", never a guess. `wait` = report the final answer (a
-   *  request from another host), else return once a window took it. */
-  private async handOff(row: SessionRow, wait: boolean, deadline: number | undefined): Promise<NavOutcome> {
+   *  request from another host), else return once a window took it.
+   *  `fallback` (this window holds the folder, but another window's extension
+   *  host started the session, or the session's terminal is not here): when no
+   *  window takes it, claim the hand-off and return what `fallback` does (show
+   *  the tab here; "no terminal") instead of using the lock hint; windows on
+   *  older builds are not asked, so they cannot act too. */
+  private async handOff(row: SessionRow, wait: boolean, deadline: number | undefined, fallback?: () => Promise<NavOutcome>): Promise<NavOutcome> {
     const { cwd, sessionId, entrypoint, pid } = row.meta;
     const request: FocusRequest = {
       cwd,
@@ -233,6 +293,7 @@ export class Navigator implements vscode.Disposable {
       ts: Date.now(),
       nonce: Math.random().toString(36).slice(2),
       raise: true,
+      ...(fallback !== undefined ? { ownerOnly: true } : {}),
       ...(deadline !== undefined ? { deadline } : {}),
     };
     const hint = bestOpenFolder(cwd, this.homes);
@@ -241,20 +302,25 @@ export class Navigator implements vscode.Disposable {
     try {
       writeFileSync(join(this.storageDir, requestFileFor(request.nonce)), JSON.stringify(request));
       // Older windows read only the single file.
-      try {
-        writeFileSync(this.requestPath, JSON.stringify(request));
-      } catch {
-        // the new windows still have the per-request file
+      if (fallback === undefined) {
+        try {
+          writeFileSync(this.requestPath, JSON.stringify(request));
+        } catch {
+          // the new windows still have the per-request file
+        }
       }
     } catch {
+      if (fallback !== undefined) return fallback();
       if (hint === undefined) return { ok: false, reason: "handoff-failed", detail: "could not pass the request to its other windows" };
       const raised = await this.runCli(hint, reportBy(deadline));
       if (!raised.ok) return { ok: false, reason: "cli-failed", detail: raised.reason };
       return { ok: false, reason: "handoff-failed", detail: "brought up the window that has its folder open, but could not pass it the request" };
     }
     try {
-      return await this.followHandOff(request, hint, wait, deadline);
+      return await this.followHandOff(request, hint, wait, deadline, fallback);
     } finally {
+      // The claim stays (pruned after HANDOFF_FILE_TTL_MS): a window that reaches
+      // this request late must still find it taken.
       for (const f of [requestFileFor(request.nonce), replyFileFor(request.nonce)]) rmSync(join(this.storageDir, f), { force: true });
       this.removeCandidates(request.nonce);
       this.sentNonces.delete(request.nonce);
@@ -263,10 +329,27 @@ export class Navigator implements vscode.Disposable {
 
   /** The rest of handOff, once the request is written: wait for a taker, fall
    *  back to the lock hint, and read the answer. */
-  private async followHandOff(request: FocusRequest, hint: string | undefined, wait: boolean, deadline: number | undefined): Promise<NavOutcome> {
+  private async followHandOff(
+    request: FocusRequest,
+    hint: string | undefined,
+    wait: boolean,
+    deadline: number | undefined,
+    fallback: (() => Promise<NavOutcome>) | undefined
+  ): Promise<NavOutcome> {
     const { entrypoint } = request;
     const stopAt = (ms: number): number => Math.min(Date.now() + ms, deadline !== undefined ? deadline - REPORT_MARGIN_MS : Number.POSITIVE_INFINITY);
-    let reply = await this.awaitReply(request.nonce, stopAt(HANDOFF_ACK_MS), (r) => r.ack === true || r.shown !== undefined);
+    const taken = (r: FocusReply): boolean => r.ack === true || r.shown !== undefined;
+    let reply = await this.awaitReply(request.nonce, stopAt(HANDOFF_ACK_MS), taken);
+    if (fallback !== undefined) {
+      if (reply === undefined) {
+        // Nobody answered: show it here (as before this hand-off existed), unless
+        // a window claimed it just now, in which case its answer is coming.
+        if (this.claim(request.nonce) !== "lost") return fallback();
+        reply = await this.awaitReply(request.nonce, stopAt(HANDOFF_ACK_MS), taken);
+        if (reply === undefined) return { ok: true, how: "window" };
+      }
+      hint = undefined; // the window that took it raises itself; no lock guess
+    }
     let raisedHere = false;
     const raiseHint = async (): Promise<NavOutcome | undefined> => {
       if (hint === undefined || raisedHere) return undefined;
@@ -447,24 +530,38 @@ export class Navigator implements vscode.Disposable {
     const tab = hasEditorTab(request.entrypoint);
     const folder = this.folderHolding(request.cwd);
     if (tab && folder === undefined) return;
+    const seenAt = Date.now();
     this.handledNonces.add(request.nonce);
     if (this.handledNonces.size > 64) this.handledNonces.delete(this.handledNonces.values().next().value as string);
     const legacySender = request.raise !== true; // an older window waits on the single reply file
     let shown: boolean;
     if (tab) {
       // Two windows can hold the folder (the same folder, or nested ones): only
-      // one may open the tab and come up.
-      if (!(await this.winsHandoff(request.nonce, folder as string))) return;
+      // one may open the tab and come up, the one whose extension host started
+      // the session when that is known.
+      const owner = await this.ownership(request.sessionPid, typeof request.deadline === "number" ? request.deadline : undefined);
+      // The sender holds the folder too and knows it did not start the session:
+      // a window that knows it did not either stays out, no entry and no claim.
+      if (request.ownerOnly === true && owner === "elsewhere") return;
+      if (!(await this.winsHandoff(request.nonce, folder as string, owner, seenAt))) return;
       // The election took time: past the deadline the clicker was already told
       // nobody answered, so open nothing.
       if (late()) return;
+      // A late window, or the sender that gave up waiting and shows it itself,
+      // may have claimed it first.
+      if (this.claim(request.nonce) === "lost") return;
       this.reply(request.nonce, { ack: true }, legacySender);
       shown = await this.openTabHere(request.sessionId, request.entrypoint);
     } else {
-      // Only the window that has the terminal answers.
-      if (!(await focusLocalTerminal(request.sessionPid))) return;
-      shown = true;
+      // Only the window that has the terminal answers. A terminal is in one
+      // window only, so there is no election; the claim keeps it from revealing
+      // after the sender gave up and reported that no window has it.
+      const terminal = await this.findTerminal(request.sessionPid);
+      if (terminal === undefined || late()) return;
+      if (this.claim(request.nonce) === "lost") return;
       this.reply(request.nonce, { ack: true }, legacySender);
+      terminal.show();
+      shown = true;
     }
     const answer: FocusReply = { shown };
     if (shown && request.raise === true) {
@@ -500,37 +597,78 @@ export class Navigator implements vscode.Disposable {
 
   /** Among the windows holding a hand-off's folder, is this the one to act? Each
    *  candidate writes `focus-cand-<nonce>-<window>.json` with how deep its
-   *  folder holds the cwd, waits ELECTION_MS for the others, then the deepest
-   *  holder wins and ties go to the lowest window id. A window that could not
-   *  write its entry still counts itself. */
-  private async winsHandoff(nonce: string, folder: string): Promise<boolean> {
+   *  folder holds the cwd and whether its extension host started the session
+   *  (`owner`: true, false, or "unknown" when it cannot tell), waits ELECTION_MS
+   *  for the others, then picks the winner with `handoffWinner`. A window that
+   *  knows it is not the owner waits until an owner still looking its process
+   *  up (OWNER_LOOKUP_MS from when the request was seen) has had time to enter.
+   *  A window that could not write its entry still counts itself. */
+  private async winsHandoff(nonce: string, folder: string, owner: Ownership = "unknown", seenAt: number = Date.now()): Promise<boolean> {
     const depth = normFolder(folder).length;
     const prefix = `focus-cand-${nonce}-`;
     try {
-      writeFileSync(join(this.storageDir, `${prefix}${this.windowId}.json`), JSON.stringify({ depth }));
+      writeFileSync(join(this.storageDir, `${prefix}${this.windowId}.json`), JSON.stringify({ depth, owner: owner === "here" ? true : owner === "elsewhere" ? false : "unknown" }));
     } catch {
       // still compete with what the others wrote
     }
-    await new Promise((r) => setTimeout(r, ELECTION_MS));
-    let best = { depth, id: this.windowId };
+    const until = owner === "elsewhere" ? Math.max(Date.now() + ELECTION_MS, seenAt + OWNER_LOOKUP_MS + ELECTION_MS) : Date.now() + ELECTION_MS;
+    await new Promise((r) => setTimeout(r, until - Date.now()));
+    const entries: HandoffCandidate[] = [{ id: this.windowId, depth, owner }];
     try {
       for (const f of readdirSync(this.storageDir)) {
         if (!f.startsWith(prefix) || !f.endsWith(".json")) continue;
         const id = f.slice(prefix.length, -".json".length);
         if (!WINDOW_ID_RE.test(id) || id === this.windowId) continue;
-        let d: unknown;
+        let c: { depth?: unknown; owner?: unknown };
         try {
-          d = (JSON.parse(readFileSync(join(this.storageDir, f), "utf8")) as { depth?: unknown }).depth;
+          c = JSON.parse(readFileSync(join(this.storageDir, f), "utf8")) as { depth?: unknown; owner?: unknown };
         } catch {
           continue;
         }
-        if (typeof d !== "number") continue;
-        if (d > best.depth || (d === best.depth && id < best.id)) best = { depth: d, id };
+        if (typeof c?.depth !== "number") continue;
+        // No `owner` field at all: a window on a build from before owner routing.
+        const them: Ownership | undefined = !("owner" in c) ? undefined : c.owner === true ? "here" : c.owner === false ? "elsewhere" : "unknown";
+        entries.push({ id, depth: c.depth, owner: them });
       }
     } catch {
       // nothing to compare with: act
     }
-    return best.id === this.windowId;
+    return handoffWinner(entries) === this.windowId;
+  }
+
+  /** Take the one right to act on a hand-off. "lost": another window (or the
+   *  sender) has it. "error": the claim could not be written; act anyway, as
+   *  before claims existed. */
+  private claim(nonce: string): "won" | "lost" | "error" {
+    try {
+      writeFileSync(join(this.storageDir, claimFileFor(nonce)), this.windowId, { flag: "wx" });
+      return "won";
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === "EEXIST" ? "lost" : "error";
+    }
+  }
+
+  /** Did this window's extension host start process `pid`? Looked up at most
+   *  OWNER_LOOKUP_MS (and never past `until`); the process-table result is
+   *  cached, so a later lookup of the same pid is instant. */
+  private async ownership(pid: number, until?: number): Promise<Ownership> {
+    if (!Number.isInteger(pid) || pid <= 0) return "unknown";
+    const budget = Math.min(OWNER_LOOKUP_MS, until !== undefined ? until - Date.now() : OWNER_LOOKUP_MS);
+    if (budget <= 0) return "unknown";
+    const lookup = this.deps.ancestry !== undefined ? this.deps.ancestry(pid) : ancestryOfPid(pid).then((c) => c?.map((p) => p.pid));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const chain = await Promise.race([
+      lookup.catch(() => undefined),
+      new Promise<undefined>((r) => {
+        timer = setTimeout(() => r(undefined), budget);
+      }),
+    ]);
+    clearTimeout(timer);
+    return ownershipOf(chain, this.deps.hostPid ?? process.pid);
+  }
+
+  private findTerminal(pid: number): Promise<{ show(): void } | undefined> {
+    return this.deps.findTerminal !== undefined ? this.deps.findTerminal(pid) : findLocalTerminal(pid);
   }
 
   private removeCandidates(nonce: string): void {
@@ -546,7 +684,7 @@ export class Navigator implements vscode.Disposable {
     try {
       const now = Date.now();
       for (const f of readdirSync(this.storageDir)) {
-        if (!/^focus-(request|reply|cand)-/.test(f)) continue;
+        if (!/^focus-(request|reply|cand|claim)-/.test(f)) continue;
         try {
           if (now - statSync(join(this.storageDir, f)).mtimeMs > HANDOFF_FILE_TTL_MS) rmSync(join(this.storageDir, f), { force: true });
         } catch {
@@ -585,6 +723,36 @@ export class Navigator implements vscode.Disposable {
 
 /** A "shown" answer from a window that predates `raise` (it never says whether
  *  it came to the front, and does not try). */
+/** One window's entry in a hand-off election. `owner` undefined: the entry has
+ *  no `owner` field, so it comes from a build before owner routing, which
+ *  ranks by depth alone. */
+export interface HandoffCandidate {
+  id: string;
+  depth: number;
+  owner: Ownership | undefined;
+}
+
+/** The window that acts on a hand-off, computed the same way by every window
+ *  on this build so they agree. If the deepest holder (ties to the lowest window
+ *  id) is an older-build entry, it wins: that is the rule the older build
+ *  applies, so it acts and every newer window stands down. Otherwise the older
+ *  entries stand down by their own rule, and among the entries that carry
+ *  `owner` the owner beats unknown beats a known non-owner, then the deepest
+ *  holder, then the lowest window id. */
+export function handoffWinner(entries: readonly HandoffCandidate[]): string | undefined {
+  const deeper = (a: HandoffCandidate, b: HandoffCandidate): boolean => (a.depth !== b.depth ? a.depth > b.depth : a.id < b.id);
+  let byDepth: HandoffCandidate | undefined;
+  for (const e of entries) if (byDepth === undefined || deeper(e, byDepth)) byDepth = e;
+  if (byDepth === undefined || byDepth.owner === undefined) return byDepth?.id;
+  const rank = (o: Ownership | undefined): number => (o === "here" ? 2 : o === "unknown" ? 1 : 0);
+  let best: HandoffCandidate | undefined;
+  for (const e of entries) {
+    if (e.owner === undefined) continue;
+    if (best === undefined || (rank(e.owner) !== rank(best.owner) ? rank(e.owner) > rank(best.owner) : deeper(e, best))) best = e;
+  }
+  return best?.id;
+}
+
 export function isLegacyShown(r: FocusReply): boolean {
   return r.shown === true && r.raised === undefined;
 }

@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { existsSync } from "node:fs";
 import {
   SessionRow,
+  type Status,
   snapshot,
   ReuseHint,
   fmtAge,
@@ -54,6 +55,7 @@ import {
   coloredIcon,
   preEscapeHtml,
   type StatusKind,
+  type SessionFlags,
   type HeatConstituents,
   statusPhrase as statusPhraseOf,
   sessionVisual,
@@ -119,6 +121,7 @@ import {
   hostDisplayLabel,
   SORT_MODES,
   FILTER_MODES,
+  ONSET_PUBLISH_REV,
 } from "./bridgeSchema";
 import { AlertRow, RemoteAlertRow } from "./alerts";
 import { ReasonStore } from "./reasons";
@@ -187,6 +190,18 @@ export interface RowFinders {
   cursor(id: string): CursorNode | undefined;
   codex(id: string): CodexNode | undefined;
   composer(id: string): ComposerNode | undefined;
+}
+
+/** The body of Show Last Message for a row from another host. Hosts publish the
+ *  last message of Claude sessions only (bridge.ts buildSnapshot), so an empty
+ *  Codex or Cursor row says where the message is instead of implying it has none. */
+export function remotePreviewBody(session: { tool: "claude" | "cursor" | "codex"; lastText?: string }): string {
+  if (session.lastText !== undefined && session.lastText !== "") return session.lastText;
+  if (session.tool === "codex" || session.tool === "cursor") {
+    const name = session.tool === "codex" ? "Codex" : "Cursor";
+    return `_The last message of a ${name} session is only available on the machine that runs it._`;
+  }
+  return "_No message text._";
 }
 
 /** The live row a row command acts on. A tree command receives the node object
@@ -808,6 +823,25 @@ function hiddenKeyLabel(key: string): string {
   const id = sep === -1 ? "" : key.slice(sep + 1);
   const short = id.length > 8 ? id.slice(0, 8) : id;
   return short === "" ? tool : `${tool} ${short}`;
+}
+
+/** Status flags for a remote session row. A snapshot has one `attention` flag for
+ *  both kinds of block: the publisher sets it for a permission prompt and for a
+ *  pending question (tree.ts panelSession: `node.attention || row.pendingQuestion`).
+ *  They differ in `status`: a pending question always publishes "waiting"
+ *  (discovery.ts statusFrom), and an approval never does (publishedBlock). So
+ *  attention + "waiting" is a question (needs an answer), and attention otherwise
+ *  is an approval. (A 0.42.6 publisher still sends "waiting" for an approval open
+ *  past 30 min, which reads as a question here.) */
+export function remoteSessionFlags(s: BridgeSession, unread: boolean): SessionFlags {
+  const attention = s.attention === true;
+  const question = attention && s.tool === "claude" && s.status === "waiting";
+  return {
+    status: s.status as SessionRow["status"],
+    unread,
+    attention: attention && !question,
+    pendingQuestion: question,
+  };
 }
 
 /** A remote child counts as "running" for icon purposes when its status says so.
@@ -1780,15 +1814,42 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
           .map((row) => {
             const sid = row.meta.sessionId;
             const attentionTs = this.attentionMap.get(sid);
-            // main transcript advancing past the event means the tool was approved
             let attention = attentionTs !== undefined;
-            if (attentionTs !== undefined && row.mainMtimeMs > attentionTs + 2000) {
+            // The hook approval ends when the main chain moves past it (a new assistant
+            // message, a prompt, an interrupt: turnMs). Any later write is not enough:
+            // subagents and background tasks write to the main transcript while the
+            // prompt is still open.
+            // A question open on the main chain owns the block: Claude Code fires its
+            // Notification hook ("Claude needs your permission") a few seconds into a
+            // pending question, and that event must neither toast again nor relabel
+            // the question as an approval. It is consumed, not just hidden, so it can't
+            // surface as an approval once the question is answered; a real permission
+            // prompt after the answer fires a hook of its own.
+            // A registry that reports status (WSL, 2.1.289) also ends it: once the
+            // registry has left "waiting" after the hook (approved, denied, moved on),
+            // the block the hook belonged to is over. Without this the hook outlived
+            // the registry block, re-dated it and toasted again. A status change from
+            // before the hook says nothing about it (a missed rescan, or a registry that
+            // never reports "waiting"). A registry with no status leaves the hook to the
+            // rules above.
+            const regEnded =
+              attentionTs !== undefined &&
+              row.meta.status !== undefined &&
+              row.meta.status !== "waiting" &&
+              row.meta.statusUpdatedAt !== undefined &&
+              row.meta.statusUpdatedAt > attentionTs;
+            if (attentionTs !== undefined && ((row.turnMs ?? 0) > attentionTs + 2000 || row.pendingQuestion || regEnded)) {
               this.attentionMap.delete(sid);
               this.reasons.delete(sid); // reason lives and dies with the attention flag
               attention = false;
             }
+            // No hook signal (native Windows has no hooks): the registry's own
+            // "waiting on a permission prompt" status raises the same flag (#147).
+            // It clears when the registry moves on (registryWaiting goes away).
+            const fromRegistry = !attention && row.registryWaiting?.kind === "approval";
+            if (fromRegistry) attention = true;
             // Only an attention row carries a reason; a captured message may be absent.
-            const reason = attention ? this.reasons.get(sid) : undefined;
+            const reason = attention && !fromRegistry ? this.reasons.get(sid) : undefined;
             const isUnread = row.status === "waiting" && row.mtimeMs > this.lastSeen(sid);
             return new SessionNode(row, isUnread, attention, reason);
           })
@@ -2788,7 +2849,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     const header =
       `# ${session.title ?? session.id}\n\n` +
       `${hostDisplayLabel(snap.host)} · \`${session.cwd}\` · ${session.status}\n\n---\n\n`;
-    return header + (session.lastText !== undefined && session.lastText !== "" ? session.lastText : "_No message text._");
+    return header + remotePreviewBody(session);
   }
 
   /** Move the keyboard-triage cursor by dir (+1 next / −1 prev) over the CURRENT
@@ -3079,20 +3140,67 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
   /** Alert-detector input for LOCAL Claude sessions only (the in-window "needs
    *  you" toasts). Reuses the already-derived attention/pendingQuestion state and
    *  each blocking instance's onset ts, so alerts.ts never re-reads disk. */
+  /** The onset of each block a session is in, as its local alert dates it. A
+   *  registry block (#147) is dated by the registry's statusUpdatedAt, which is new
+   *  for each block and stable while it lasts; that holds for an approval the hook
+   *  also reports, since the hook's Notification can come several seconds after
+   *  the flip, past the tracker's cross-source slack. Without the registry, a hook
+   *  approval keeps the hook's time and a transcript question its tool_use
+   *  record's (the file's mtime moves with every background write). */
+  private blockOnsets(s: SessionNode): {
+    attentionTs: number | undefined;
+    attentionFromRegistry: boolean;
+    questionTs: number;
+    questionFromRegistry: boolean;
+  } {
+    const hookTs = this.attentionMap.get(s.row.meta.sessionId);
+    const reg = s.row.registryWaiting;
+    const regApproval = reg?.kind === "approval";
+    const regQuestion = reg?.kind === "question";
+    return {
+      attentionTs: regApproval ? reg.sinceMs : hookTs,
+      attentionFromRegistry: regApproval,
+      questionTs: regQuestion ? reg.sinceMs : s.row.questionSinceMs ?? s.row.mainMtimeMs,
+      questionFromRegistry: regQuestion,
+    };
+  }
+
+  /** What a blocked row publishes to other hosts (undefined: not blocked). A viewer
+   *  dates the block by `publishedAt − ageSec·1000`, so ageSec counts from the
+   *  block's onset, not from the row's newest write: a blocked session's subagents
+   *  keep writing, and an age from those writes moved the viewer's onset forward on
+   *  every snapshot, re-raising the block. An approval publishes a status other than
+   *  "waiting" (viewers read attention + "waiting" as a pending question), even when
+   *  its transcript tail reads "waiting" (an end_turn text under a registry worker or
+   *  sandbox request, or a tool_use open past 30 min). */
+  private publishedBlock(s: SessionNode, now: number): { status: Status; ageSec: number } | undefined {
+    const o = this.blockOnsets(s);
+    if (s.attention) {
+      const status: Status = s.row.status === "waiting" && !s.row.pendingQuestion ? "working" : s.row.status;
+      const onset = o.attentionTs ?? (s.row.pendingQuestion ? o.questionTs : undefined);
+      return { status, ageSec: onset !== undefined ? Math.max(0, (now - onset) / 1000) : s.row.ageSec ?? 0 };
+    }
+    if (s.row.pendingQuestion) return { status: s.row.status, ageSec: Math.max(0, (now - o.questionTs) / 1000) };
+    return undefined;
+  }
+
   alertRows(): AlertRow[] {
     const rows: AlertRow[] = [];
     for (const p of this.projects) {
       for (const s of p.sessions) {
         if (s.dimmed) continue; // free-tier over-limit: no toast for excluded rows
         const sid = s.row.meta.sessionId;
+        const o = this.blockOnsets(s);
         rows.push({
           sessionId: sid,
           label: this.titleWithFallback(s.row, s.row.meta.name ?? projectDisplayName(s.row.meta.cwd)),
           attention: s.attention,
-          attentionTs: this.attentionMap.get(sid),
+          attentionTs: o.attentionTs,
+          attentionFromRegistry: o.attentionFromRegistry || undefined,
           reason: s.reason,
           pendingQuestion: s.row.pendingQuestion,
-          questionTs: s.row.mainMtimeMs,
+          questionTs: o.questionTs,
+          questionFromRegistry: o.questionFromRegistry || undefined,
           questionText: s.row.questionText,
         });
       }
@@ -3104,9 +3212,16 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
    *  Emits one row per remote session currently known (every host within the 24h
    *  window, stale or live) so the tracker can keep an alerted session's mark alive
    *  through a stale flicker. The `live`/`attention` gate lives in
-   *  `remoteCandidatesFrom`; the onset is the SAME heartbeat-stable last-activity
-   *  instant the remote-unread predicate uses (`receivedAt − ageSec·1000`, from the
-   *  publisher's original ageSec — not the node's elapsed-adjusted one). */
+   *  `remoteCandidatesFrom`. The onset is dated on the publisher's clock,
+   *  `publishedAt − ageSec·1000`: both are taken in the same publish on the same
+   *  host, so the publish → receive latency doesn't move it. It is only compared
+   *  with other onsets of the same host's session (the tracker key), never with
+   *  this window's clock, so clock skew between hosts doesn't matter. A snapshot
+   *  without publishedAt falls back to `receivedAt − ageSec·1000`. The
+   *  remote-unread predicate keeps the receivedAt form (it compares with marks
+   *  taken on this window's clock). A snapshot from a publisher older than
+   *  ONSET_PUBLISH_REV is flagged `legacyPublisher`: its onset follows the row's
+   *  newest write, so the tracker tells its blocks apart by a clear in between. */
   remoteAlertRows(): RemoteAlertRow[] {
     const rows: RemoteAlertRow[] = [];
     for (const h of this.hostNodes) {
@@ -3120,7 +3235,8 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
             hostLabel: hostDisplayLabel(h.snapshot.host),
             live: !h.stale,
             attention: s.attention === true,
-            onsetTs: h.snapshot.receivedAt - s.ageSec * 1000,
+            onsetTs: (h.snapshot.publishedAt > 0 ? h.snapshot.publishedAt : h.snapshot.receivedAt) - s.ageSec * 1000,
+            ...((h.snapshot.publishRev ?? 0) < ONSET_PUBLISH_REV ? { legacyPublisher: true } : {}),
           });
         }
       }
@@ -3315,6 +3431,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
         spin: p.spin,
         brand: p.brand,
         hover: p.hover,
+        ...(p.outside === true ? { outside: true as const } : {}),
       };
     });
   }
@@ -3373,12 +3490,20 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     if (running > 0) parts.push(`⚙${running}`);
     if (s.tool !== "claude") parts.push("❯");
     const children = activityTree ? (s.children ?? []).map((c) => this.panelRemoteChild(c, node.stale)) : [];
-    const statusKind: StatusKind = s.attention === true
+    const flags = remoteSessionFlags(s, node.unread);
+    const statusKind: StatusKind = flags.attention
       ? "attention"
-      : s.status === "working" && !node.stale
-        ? "working"
-        : "done";
-    const status = statusKind === "attention" ? "needs approval" : statusKind === "working" ? "working" : "done";
+      : flags.pendingQuestion === true
+        ? "question"
+        : s.status === "working" && !node.stale
+          ? "working"
+          : "done";
+    const status =
+      statusKind === "attention" || statusKind === "question"
+        ? statusPhraseOf(flags)
+        : statusKind === "working"
+          ? "working"
+          : "done";
     return {
       id: s.id,
       title,
@@ -3411,7 +3536,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
   private remoteVisual(s: BridgeSession, unread: boolean, stale: boolean): IconVisual {
     if (s.tool === "cursor") return cursorVisual(!stale && s.status === "working");
     if (s.tool === "codex") return codexVisual(!stale && s.status === "working");
-    const kind = statusKind({ status: s.status as SessionRow["status"], unread, attention: s.attention === true });
+    const kind = statusKind(remoteSessionFlags(s, unread));
     const v = sessionVisual(stale && kind === "working" ? "idle" : kind, false);
     return stale ? { ...v, spin: false } : v;
   }
@@ -3419,7 +3544,8 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
   /** Plain-text hover for a remote session row (tree tooltip + panel title). */
   private remoteHoverText(node: RemoteSessionNode): string {
     const s = node.session;
-    const lines: string[] = [`${s.title ?? s.id} — ${s.status}`];
+    const status = s.attention === true ? statusPhraseOf(remoteSessionFlags(s, node.unread)) : s.status;
+    const lines: string[] = [`${s.title ?? s.id} — ${status}`];
     lines.push(`${node.stale ? "last known" : "live"} · last activity ${fmtAge(node.ageSec)} ago`);
     if (s.lastText !== undefined && s.lastText !== "") {
       lines.push("—".repeat(3), s.lastText);
@@ -3448,6 +3574,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     };
     const orchestrating = row.activity.agents > 0 || row.activity.workflows > 0;
     const kind = statusKind(flags);
+    const published = this.publishedBlock(node, Date.now());
     const v = sessionVisual(kind, orchestrating);
     // "doing now" caption + quiet-too-long hint on a working row, or the "done"
     // caption on a finished-unread row — identical to the sidebar tree (shared
@@ -3494,8 +3621,8 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       hover: this.panelHover(node, title, terminal),
       // Publisher-only raws for the bridge (plan §9): unformatted status/age/text,
       // so buildSnapshot never reverse-parses these rendered strings.
-      rawStatus: row.status,
-      rawAgeSec: row.ageSec ?? 0,
+      rawStatus: published?.status ?? row.status,
+      rawAgeSec: published?.ageSec ?? row.ageSec ?? 0,
       rawLastText: row.lastText,
       // Prompt-fallback gate for the bridge: flag that title is user-prompt prose,
       // and carry the non-prompt stub so buildSnapshot can restore it when gated.
@@ -4188,12 +4315,15 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     // peer host — routed through mdText so nothing can inject markdown/HTML under
     // supportHtml. Only the colored status glyph + structural markers are authored.
     const rStale = node.stale;
-    const rIcon = s.attention === true ? "bell" : s.status === "working" ? "sync" : node.unread ? "bell-dot" : "check";
+    const rFlags = remoteSessionFlags(s, node.unread);
+    const rIcon = rFlags.pendingQuestion === true ? "comment-discussion" : rFlags.attention ? "bell" : s.status === "working" ? "sync" : node.unread ? "bell-dot" : "check";
     const rColor = rStale
       ? "disabledForeground"
-      : s.attention === true
+      : rFlags.attention
         ? "charts.red"
-        : s.status === "working"
+        : rFlags.pendingQuestion === true
+          ? "charts.yellow"
+          : s.status === "working"
           ? "charts.green"
           : node.unread
             ? "charts.yellow"
@@ -4201,7 +4331,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     md.appendMarkdown(`${coloredIcon(rIcon, rColor)} **`);
     this.mdText(md, title);
     md.appendMarkdown(`** — `);
-    this.mdText(md, s.status);
+    this.mdText(md, s.attention === true ? statusPhraseOf(rFlags) : s.status);
     md.appendMarkdown(`\n\n---\n\n$(watch) ${rStale ? "last known" : "live"} · ${fmtAge(node.ageSec)} ago\n\n`);
     if (s.outside === true && !rStale) {
       // Stop only when that host says it can (an older host's window offers Move only).

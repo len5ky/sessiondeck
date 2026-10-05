@@ -1115,6 +1115,9 @@ export interface ResolvedProc {
 
 // After a failed query, wait this long before spawning another.
 const RETRY_AFTER_MS = 60_000;
+/** After the first failure of a run, retry this soon: one transient failure is
+ *  answered well inside TABLE_FAIL_OPEN_MS, so it never opens the registry gate. */
+export const FIRST_RETRY_MS = 5_000;
 // A pid the table didn't contain (it exited) isn't asked for again for this long.
 const MISSING_TTL_MS = 30_000;
 
@@ -1131,6 +1134,10 @@ export class ProcTableService {
   private readonly listeners = new Set<() => void>();
   /** Number of table queries started (for tests and diagnostics). */
   queries = 0;
+  /** Failed queries since the last one that answered, and when the first of
+   *  them failed. */
+  private failures = 0;
+  private failingSinceMs: number | undefined;
 
   constructor(
     readonly backend: TableBackend,
@@ -1184,6 +1191,13 @@ export class ProcTableService {
     return this.resolved.get(pid);
   }
 
+  /** The current run of failed queries, or undefined when the last query
+   *  answered (or none failed yet). `sinceMs`: when the first of them failed. */
+  failureStreak(): { failures: number; sinceMs: number; failingMs: number } | undefined {
+    if (this.failingSinceMs === undefined) return undefined;
+    return { failures: this.failures, sinceMs: this.failingSinceMs, failingMs: this.now() - this.failingSinceMs };
+  }
+
   /** Wait for the running batch, if any (tests). */
   async settled(): Promise<void> {
     while (this.inFlight !== undefined) await this.inFlight;
@@ -1210,10 +1224,14 @@ export class ProcTableService {
     }
     if (table === undefined) {
       // Failed or timed out: no guess. Back off, and keep the pids for the retry.
-      this.retryAt = this.now() + RETRY_AFTER_MS;
+      this.failures++;
+      this.failingSinceMs ??= this.now();
+      this.retryAt = this.now() + (this.failures === 1 ? FIRST_RETRY_MS : RETRY_AFTER_MS);
       for (const pid of batch) this.pending.add(pid);
       return;
     }
+    this.failures = 0;
+    this.failingSinceMs = undefined;
     let changed = false;
     for (const pid of batch) {
       const a = ancestryFromTable(table, pid);
@@ -1342,12 +1360,68 @@ export function registryStartAgrees(platform: NodeJS.Platform, procStart: string
  *  (the caller compares /proc), a row not cached yet (queued, so a later scan
  *  can), or nothing comparable. Never blocks. */
 export function tableStartDisagrees(pid: number, procStart: string | undefined, startedAt?: number): boolean {
-  if (hostPlatform === "linux") return false;
+  return tableIdentity(pid, procStart, startedAt) === "disagrees";
+}
+
+/** The same check with the "can't tell yet" case kept apart: "unknown" off Linux
+ *  while the pid's table row is not cached (peek queues it; the table service's
+ *  onUpdate fires a refresh when it lands). "confirmed" on Linux, where the caller
+ *  already compared /proc, and when the cached row raises no disagreement. For
+ *  signals that must not fire on a ghost entry (a stale registry "waiting"). */
+export function tableIdentity(pid: number, procStart: string | undefined, startedAt?: number): "confirmed" | "disagrees" | "unknown" {
+  if (hostPlatform === "linux") return "confirmed";
   const r = tableService?.peek(pid);
-  if (r === undefined) return false;
-  if (typeof startedAt === "number" && startedAt > 0 && r.start > startedAt + START_SLACK_MS) return true;
-  if (hostPlatform !== "win32" || procStart === undefined || r.token === undefined) return false;
-  return registryStartAgrees(hostPlatform, procStart, r.token) === false;
+  if (r === undefined) return tableService === undefined ? "confirmed" : "unknown";
+  if (typeof startedAt === "number" && startedAt > 0 && r.start > startedAt + START_SLACK_MS) return "disagrees";
+  if (hostPlatform !== "win32" || procStart === undefined || r.token === undefined) return "confirmed";
+  return registryStartAgrees(hostPlatform, procStart, r.token) === false ? "disagrees" : "confirmed";
+}
+
+/** Registry questions and approvals are held back while their pid's table row is
+ *  unknown (see tableIdentity). After the table has failed this long in a row
+ *  they are let through: an unconfirmed real question is worth more than
+ *  suppressing a rare ghost from a reused pid. */
+export const TABLE_FAIL_OPEN_MS = 15_000;
+/** Diagnostics and the log report the hold after this many failed queries in a
+ *  row, or after the table has failed for TABLE_HOLD_REPORT_MS. */
+export const TABLE_HOLD_REPORT_FAILURES = 3;
+export const TABLE_HOLD_REPORT_MS = 30_000;
+
+/** Is the process table failing long enough that registry signals pass unconfirmed? */
+export function registryFailOpen(): boolean {
+  if (hostPlatform === "linux") return false;
+  const s = tableService?.failureStreak();
+  return s !== undefined && s.failingMs > TABLE_FAIL_OPEN_MS;
+}
+
+export interface RegistryHold {
+  /** "cim" (Windows PowerShell) or "ps" (macOS). */
+  backend: TableBackend;
+  failures: number;
+  /** When the first failure of this run happened (one run = one log line). */
+  sinceMs: number;
+  failingMs: number;
+  /** Registry signals now pass without the table check. */
+  failOpen: boolean;
+}
+
+/** The Diagnostics detail and the log line for a hold (one wording for both). */
+export function registryHoldText(h: { failures: number; failingMs: number; failOpen: boolean }): string {
+  const count = `${h.failures} ${h.failures === 1 ? "failure" : "failures"} in ${Math.round(h.failingMs / 1000)} s`;
+  return h.failOpen
+    ? `Process table unreadable (${count}). Questions and approvals now show unchecked; one from a session that has ended may linger.`
+    : `Process table unreadable (${count}). Questions and approvals reported only by the session registry are on hold.`;
+}
+
+/** The hold worth reporting, given how many sessions are registered: the table
+ *  failed TABLE_HOLD_REPORT_FAILURES times in a row or for longer than
+ *  TABLE_HOLD_REPORT_MS. Undefined on Linux, with no sessions, or while the
+ *  table answers. */
+export function registryHold(registered: number): RegistryHold | undefined {
+  if (hostPlatform === "linux" || registered <= 0 || tableService === undefined) return undefined;
+  const s = tableService.failureStreak();
+  if (s === undefined || (s.failures < TABLE_HOLD_REPORT_FAILURES && s.failingMs <= TABLE_HOLD_REPORT_MS)) return undefined;
+  return { backend: tableService.backend, failures: s.failures, sinceMs: s.sinceMs, failingMs: s.failingMs, failOpen: s.failingMs > TABLE_FAIL_OPEN_MS };
 }
 
 /** For Diagnostics: how many live registry entries' procStart match this OS's

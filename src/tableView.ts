@@ -252,6 +252,19 @@ function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
     .cell-model, .cell-tokens, .head .cell-model, .head .cell-tokens { display: block; }
     .foldcols { display: none; }
   }
+  /* Below 260px the fixed TIME cell and the cluster margin left a title about half
+     the room the list view gives it. There, TIME folds into the sub-line ahead of
+     MODEL and TOKENS, the way they fold, so the title takes the row. Activity
+     children keep their own time cell. A sub-line that holds only the folded time
+     (.time-only) shows at this width only. */
+  .fold-time { display: none; }
+  .subline.time-only { display: none; }
+  @container tree (max-width: 259.98px) {
+    .fold-time { display: inline; }
+    .subline.time-only { display: block; }
+    .m-fold .cell-time, .head .cell-time { display: none; }
+    .metrics.m-fold { margin-left: 0; }
+  }
 
   /* Icon / account theme colors. */
   .col-charts-red { color: var(--vscode-charts-red); }
@@ -366,7 +379,7 @@ function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   function metrics(kind, cols) {
     const c = cols || {};
     return (
-      '<span class="metrics">' +
+      '<span class="metrics m-fold">' +
         '<span class="cell cell-status">' + statusHtml(kind) + '</span>' +
         '<span class="cell cell-time">' + esc(c.time || "") + '</span>' +
         '<span class="cell cell-model">' + esc(c.model || COL_EMPTY) + '</span>' +
@@ -376,16 +389,24 @@ function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   }
   // The folded MODEL·TOKENS shown in the sub-line at narrow widths (only the present
   // ones; empty when the row has neither).
+  // The folded TIME leads it below 260px (fold-time, hidden at wider widths).
   function foldCols(cols) {
     const c = cols || {};
     const parts = [];
     if (c.model) parts.push(c.model);
     if (c.tokens) parts.push(c.tokens);
-    if (parts.length === 0) return "";
-    return '<span class="foldcols">' + esc(parts.join(" \\u00b7 ")) + '</span>';
+    const time = c.time
+      ? '<span class="fold-time">' + esc(c.time) + (parts.length > 0 ? " \\u00b7 " : "") + '</span>'
+      : "";
+    if (parts.length === 0) return time;
+    return time + '<span class="foldcols">' + esc(parts.join(" \\u00b7 ")) + '</span>';
   }
+  // A sub-line holding only the folded time is marked time-only: it shows below
+  // 260px only. Every other sub-line (the worktree caption too) is unaffected.
+  const TIME_ONLY = /^<span class="fold-time">[^<]*<\\/span>$/;
   function sublineHtml(inner) {
-    return inner ? '<div class="subline">' + inner + '</div>' : "";
+    if (!inner) return "";
+    return '<div class="subline' + (TIME_ONLY.test(inner) ? " time-only" : "") + '">' + inner + '</div>';
   }
 
   function acctBadge(multiHome, homeColor, homeLabel) {

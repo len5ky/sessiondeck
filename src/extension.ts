@@ -21,10 +21,29 @@ import {
   renewLeaseIfDue,
   CURSOR_SPOOL,
 } from "./hooks";
-import { codexHomeOf, focusLocalTerminal, identitySources, moveClaimIdentity, moveSession, MoveSubject, shortTitle, stopSession, sweepMoveClaims, verifiedClaudeStart } from "./injector";
+import {
+  claimActiveSince,
+  codexHomeOf,
+  focusLocalTerminal,
+  identitySources,
+  moveClaimIdentity,
+  MovedTerminals,
+  moveSession,
+  MoveSubject,
+  reopenMoved,
+  resumeClosed,
+  resumeClosedText,
+  resumedRunning,
+  shortTitle,
+  stopSession,
+  subjectOfRecord,
+  sweepMoveClaims,
+  verifiedClaudeStart,
+  type MovedRecord,
+} from "./injector";
 import { Navigator, navigationEnabled, resolveEditorCli, commandOnPath } from "./navigation";
-import { procIntrospection, procCensusAgeSec, pidCmdline, pidHasOpen, pidAlive, pidStartTime, procStartAgreement, procTable, type LocationVerdict } from "./procs";
-import { hasNodeSqlite, hasPython3, sqliteSelect } from "./sqliteRead";
+import { procIntrospection, procCensusAgeSec, pidCmdline, pidHasOpen, pidAlive, pidStartTime, processRunning, procStartAgreement, procTable, registryHold, type LocationVerdict } from "./procs";
+import { dbFilesContain, hasNodeSqlite, hasPython3, sqliteSelect, sqliteSelectRetry } from "./sqliteRead";
 import {
   ACTIVATION_STEP,
   buildDoctorReport,
@@ -43,7 +62,7 @@ import { TitleSource } from "./titles";
 import { TokenScanner } from "./discovery";
 import { cursorSessions, CursorEventTail, ComposerTracker } from "./cursor";
 import { codexSessions } from "./codex";
-import { fmtAge, snapshot, hotWatchTargets, watchEventDirty, ReuseHint, WatchTarget, registryStatus, registryStartEntries } from "./discovery";
+import { fmtAge, snapshot, hotWatchTargets, watchEventDirty, ReuseHint, WatchTarget, registryStatus, registryStartEntries, setDiscoveryLog } from "./discovery";
 import {
   sanitizeReason,
   sessionPropertiesMarkdown,
@@ -116,6 +135,8 @@ const PREVIEW_SCHEME = "sessiondeck";
 const PROPS_SCHEME = "sessiondeck-props";
 const LICENSE_SCHEME = "sessiondeck-license";
 const LEGACY_EXTENSION_ID = "lensky.claude-overview";
+/** Wait before the one retry of a failed state database read. */
+const STATE_DB_RETRY_MS = 500;
 
 async function migrateRenameState(
   context: vscode.ExtensionContext
@@ -138,14 +159,31 @@ async function migrateRenameState(
 
   const globalStorageRoot = join(context.globalStorageUri.fsPath, "..");
   const stateDb = join(globalStorageRoot, "state.vscdb");
-  const rows = await sqliteSelect(stateDb, `SELECT value FROM ItemTable WHERE key='${LEGACY_EXTENSION_ID}'`);
+  // The copy can catch the live database mid-checkpoint, so a failed read is tried
+  // once more; each failure's reason (no paths) goes to Output > SessionDeck.
+  // No state.vscdb (a fresh remote server): nothing to migrate, and no read, wait
+  // or copy on every start.
+  const rows = !existsSync(stateDb) ? null : await sqliteSelectRetry(
+    stateDb,
+    `SELECT value FROM ItemTable WHERE key='${LEGACY_EXTENSION_ID}'`,
+    STATE_DB_RETRY_MS,
+    (line) => logLine(`state migration: state database ${line}`)
+  );
   // null is "could not read", not "nothing there" (the legacy import makes the
   // same distinction): a database that exists but didn't read may still hold the
   // former extension's trial start, so this counts as a failed migration.
   // After LEGACY_IMPORT_MAX_ATTEMPTS failed starts the trial origin is settled
   // without it (decideTrialStart), and an unreadable database stops failing.
   const gaveUp = (context.globalState.get<number>(MIGRATION_FAILURES_KEY) ?? 0) >= LEGACY_IMPORT_MAX_ATTEMPTS;
-  if (rows === null && existsSync(stateDb) && !gaveUp) throw new Error("the editor's state database could not be read");
+  if (rows === null && existsSync(stateDb) && !gaveUp) {
+    // A database whose bytes never mention the former name has no state to migrate
+    // (a fresh profile, a remote host's database): that is not a failure.
+    if ((await dbFilesContain(stateDb, LEGACY_EXTENSION_ID)) === false) {
+      logLine("state migration: nothing to migrate, the state database holds no former-name state");
+    } else {
+      throw new Error("the editor's state database could not be read");
+    }
+  }
   const legacyMemento = parseLegacyMemento(rows?.[0]?.[0]);
   // In a remote window this reads the remote host's state DB, which never holds
   // the old memento (VS Code keeps extension mementos on the desktop side), so
@@ -384,6 +422,7 @@ async function startSessionDeck(
   registerCommand: (id: string, handler: CommandHandler) => vscode.Disposable
 ): Promise<void> {
   const activatedAt = Date.now();
+  setDiscoveryLog(logLine);
   // Read before anything this activation creates it: the folder holds the host id
   // and hook spool, so its presence means SessionDeck (or its former name) ran here.
   const stateDirExisted = existsSync(STATE_DIR);
@@ -602,6 +641,11 @@ async function startSessionDeck(
     // crossHost off = zero work: skip the 60s hello probe entirely (a later flip
     // back to true just needs a reload — no config watcher).
     enabled: () => crossHostEnabled(),
+    // Another host's new snapshot renders (and alerts) now, not on the next tick.
+    onRemoteChange: () => refreshFn(),
+    // A held snapshot goes out only while this window still holds the lease (the
+    // same check the tick makes before it publishes).
+    mayPublish: () => crossHostEnabled() && (publisherLease?.holds() ?? true),
   };
   // A client that failed to start is replaced by a disabled one (no probe, no
   // remote hosts), so everything that reads the bridge still works single-host.
@@ -1502,14 +1546,9 @@ async function startSessionDeck(
             // can't see or restore a row you hid here — that's by design.
             //
             // Sub-3s burst edge: the gate decides to publish on every signature change,
-            // but bridge.publish() enforces a hard 3s floor (MIN_INTERVAL_MS). If a
-            // second real change lands <3s after the first, publish() drops that call —
-            // and since we only rebuild on the NEXT signature change or the 15s
-            // heartbeat, that second change reaches peers at the following heartbeat
-            // rather than immediately. Bounded ≤15s + 1 tick ≪ the 45s live window, the
-            // LOCAL panel still reflects it on its own next tick, and only the remote
-            // mirror lags. (The 3s floor predates this gate — the gate just makes the
-            // deferral land on the heartbeat instead of the next 3s tick's rebuild.)
+            // and bridge.publish() sends at most once per 3s (MIN_INTERVAL_MS). A
+            // second real change <3s after the first is held and sent when the floor
+            // ends, and a session that newly needs the user is sent at once.
             // Taking a free lease over always publishes (CONTRACTS.md: one
             // publisher per host), even an unchanged snapshot within 15 s.
             void bridge.publish(buildSnapshot(panelModel, hostIdentity), lease === "free");
@@ -1547,6 +1586,9 @@ async function startSessionDeck(
     }
   };
 
+  /** The moved-terminal relaunch check, run on the 3 s poll once it is set up. */
+  let movedTick: (() => Promise<void>) | undefined;
+
   // Coalesced refresh: every async trigger (the 3s poll, session-dir fs.watch,
   // hook-event spool, title/RC background updates, config changes) funnels through
   // here instead of calling the full discovery pass directly. A single ~75ms
@@ -1564,7 +1606,10 @@ async function startSessionDeck(
   };
   refreshFn = scheduleRefresh;
 
-  const timer = setInterval(scheduleRefresh, 3000);
+  const timer = setInterval(() => {
+    scheduleRefresh();
+    void movedTick?.();
+  }, 3000);
   context.subscriptions.push({
     dispose: () => {
       clearInterval(timer);
@@ -1724,6 +1769,7 @@ async function startSessionDeck(
     const cfg = vscode.workspace.getConfiguration("sessionDeck");
     const cli = resolveEditorCli();
     const proc = procIntrospection();
+    const registered = homes.flatMap((h) => registryStartEntries(h.dir));
     const tp = titles.probe();
     const now = Date.now();
     const bridgeHosts = bridge.remoteHosts().map((h) => {
@@ -1762,7 +1808,8 @@ async function startSessionDeck(
       procPlatform: proc.platform,
       procFs: proc.procfs,
       procCensusAgeSec: procCensusAgeSec(),
-      procStartMatch: await procStartAgreement(homes.flatMap((h) => registryStartEntries(h.dir))),
+      procStartMatch: await procStartAgreement(registered),
+      registryHold: registryHold(registered.length),
       editorCli: cli.command,
       editorCliSource: cli.source,
       editorCliOnPath: commandOnPath(cli.command),
@@ -2241,6 +2288,52 @@ async function startSessionDeck(
     vscode.window.onDidOpenTerminal(() => void syncTerminalPids()),
     vscode.window.onDidCloseTerminal(() => void syncTerminalPids())
   );
+
+  // The terminals this window opened for a move: closing one ends its session
+  // (the CLI is the terminal's process), so a close that was not a Move, a Stop,
+  // the CLI's own exit or the window closing offers to resume it (#139, #144).
+  const MOVED_KEY = "sessionDeck.movedTerminals";
+  const claimDir = (): string => join(context.globalStorageUri.fsPath, "claims");
+  const elsewhere = (rec: MovedRecord): Promise<boolean> => resumedRunning(subjectOfRecord(rec), 0);
+  const alive = (pid: number, start: number | undefined): boolean => processRunning(pid, start);
+  const movedTerminals: MovedTerminals | undefined = health.run(
+    "moved terminals",
+    "the offer to resume a moved session whose tab closed",
+    () => {
+      const watch: MovedTerminals = new MovedTerminals(vscode.window, {
+        load: () => context.workspaceState.get(MOVED_KEY),
+        save: (records) => context.workspaceState.update(MOVED_KEY, records),
+        ours: (rec) => claimActiveSince(claimDir(), rec.subject.id, rec.since),
+        alive,
+        startOf: (pid) => identitySources().freshStart(pid),
+        runningElsewhere: elsewhere,
+        offer: (text, ...items) => vscode.window.showWarningMessage(text, ...items),
+        resume: async (rec) => {
+          const r = await resumeClosed(rec, claimDir(), {
+            alive: () => alive(rec.pid, rec.start),
+            runningElsewhere: () => elsewhere(rec),
+            open: () => reopenMoved(rec),
+          });
+          logLine(`moved terminal resume: ${r.outcome}`);
+          if (r.terminal !== undefined) void watch.track(r.terminal, rec.subject);
+          const say = resumeClosedText(rec.subject.title, r);
+          if (say?.level === "info") void vscode.window.showInformationMessage(say.text);
+          if (say?.level === "error") void vscode.window.showErrorMessage(say.text);
+          if (r.outcome === "resumed") {
+            registryChanged = true;
+            refresh();
+          }
+        },
+        sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+        now: Date.now,
+        log: logLine,
+      });
+      context.subscriptions.push(...watch.start());
+      movedTick = () => watch.checkRelaunched();
+      return watch;
+    },
+    undefined
+  );
   health.run(
     "process table",
     "where-a-session-runs updates",
@@ -2330,10 +2423,9 @@ async function startSessionDeck(
     if (failed !== undefined) tellUnavailable(failed);
     return failed !== undefined;
   };
-  const claimDir = (): string => join(context.globalStorageUri.fsPath, "claims");
   const runMove = async (subject: MoveSubject): Promise<void> => {
     if (moveUnavailable()) return;
-    const outcome = await moveSession(subject, claimDir());
+    const outcome = await moveSession(subject, claimDir(), (t, s) => void movedTerminals?.track(t, s));
     if (outcome === "cancelled") return;
     registryChanged = true;
     refresh();

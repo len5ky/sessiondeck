@@ -49,17 +49,29 @@ export async function focusLocalTerminal(
   terminals: readonly vscode.Terminal[] = vscode.window.terminals,
   ancestry: (pid: number) => Promise<ProcInfo[] | undefined> = ancestryOfPid
 ): Promise<boolean> {
-  if (terminals.length === 0) return false;
+  const terminal = await findLocalTerminal(sessionPid, terminals, ancestry);
+  if (terminal === undefined) return false;
+  terminal.show();
+  return true;
+}
+
+/** The match focusLocalTerminal reveals, without revealing it: the terminal of
+ *  THIS window whose shell is the session pid or one of its ancestors. */
+export async function findLocalTerminal(
+  sessionPid: number,
+  terminals: readonly vscode.Terminal[] = vscode.window.terminals,
+  ancestry: (pid: number) => Promise<ProcInfo[] | undefined> = ancestryOfPid
+): Promise<vscode.Terminal | undefined> {
+  if (terminals.length === 0) return undefined;
   const chain = await ancestry(sessionPid);
-  if (chain === undefined) return false;
+  if (chain === undefined) return undefined;
   const pids = new Set<number>([sessionPid, ...chain.map((p) => p.pid)]);
   for (const terminal of terminals) {
     const shellPid = await terminal.processId;
     if (shellPid === undefined || !pids.has(shellPid)) continue;
-    terminal.show();
-    return true;
+    return terminal;
   }
-  return false;
+  return undefined;
 }
 
 // ---- move: pure decisions ----------------------------------------------------
@@ -1783,7 +1795,11 @@ export function confirmItems(action: string, safeDefault: boolean): { items: vsc
 /** Run a move from the UI. Checks that can fail without side effects (unsafe id,
  *  missing folder, unverified process) run before anything is stopped; one move
  *  per session at a time across the windows on this host (`claimDir`). */
-export async function moveSession(s: MoveSubject, claimDir: string): Promise<MoveOutcome> {
+export async function moveSession(
+  s: MoveSubject,
+  claimDir: string,
+  opened?: (terminal: vscode.Terminal, subject: MoveSubject) => void
+): Promise<MoveOutcome> {
   if (resumeCommand(s.tool, s.id) === undefined) {
     void vscode.window.showErrorMessage(`"${s.title}" can't be moved: its session id is not one SessionDeck can resume.`);
     return "cancelled";
@@ -1845,6 +1861,11 @@ export async function moveSession(s: MoveSubject, claimDir: string): Promise<Mov
       `"${s.title}" was not moved: SessionDeck could not write to its storage folder to reserve the move. Nothing was stopped.`
     );
     return "cancelled";
+  }
+  // The terminal the move opened, still open: watched so a closed tab offers a
+  // resume (MovedTerminals).
+  if ((outcome.result === "resumed" || outcome.result === "unconfirmed") && resumed !== undefined && resumed.exitStatus === undefined) {
+    opened?.(resumed, s);
   }
   return outcome.result;
 }
@@ -1922,4 +1943,367 @@ export async function stopSession(
     return { outcome, message, reason };
   }
   return { outcome: outcome.result, message, reason };
+}
+
+// ---- moved terminals: closing the tab ends the session -----------------------
+//
+// A moved session's terminal runs the CLI as its own process, so closing the tab
+// (its X, Close All, closing the group) or the editor's "Relaunch Terminal" ends
+// the session, and the editor asks nothing first: it confirms a close only when
+// the process has children, and no terminal creation option changes that
+// (terminal.integrated.confirmOnKill is a user setting; isTransient would stop
+// the tab surviving a reload). So SessionDeck watches the terminals it opened for
+// a move and, when one closes without the session ending on purpose, offers to
+// resume it. The records live in the window's workspace state, so a reloaded
+// window finds a restored tab again by its process id and start time.
+
+/** vscode.TerminalExitReason (a stable API enum), copied so the pure parts of
+ *  this module read it without the vscode API. */
+export const EXIT_REASON = { Unknown: 0, Shutdown: 1, Process: 2, User: 3, Extension: 4 } as const;
+
+/** What a moved terminal's exit status says about how it closed:
+ *  - "shutdown": the window or the editor is closing (nothing to show it in);
+ *  - "cli-exit": the CLI ended by itself with code 0 (/exit, Ctrl+D);
+ *  - "closed": anything else: the tab was closed (User), another extension
+ *    disposed it (Extension), the process ended with an error or a signal, or the
+ *    editor gave no reason. The editor's Relaunch sends no close for the killed
+ *    CLI: MovedTerminals spots it by the terminal's process id changing. */
+export type ClosedKind = "shutdown" | "cli-exit" | "closed";
+
+export function closedKind(exit: { code: number | undefined; reason?: number } | undefined): ClosedKind {
+  if (exit?.reason === EXIT_REASON.Shutdown) return "shutdown";
+  if (exit?.reason === EXIT_REASON.Process && exit.code === 0) return "cli-exit";
+  return "closed";
+}
+
+/** The Output line for a closed moved terminal: reason and code only. */
+export function closedLog(exit: { code: number | undefined; reason?: number } | undefined, verdict: string): string {
+  const names = ["unknown", "shutdown", "process", "user", "extension"];
+  const reason = exit?.reason === undefined ? "none" : names[exit.reason] ?? String(exit.reason);
+  return `moved terminal closed: reason ${reason}, code ${exit?.code ?? "none"}: ${verdict}`;
+}
+
+/** What a resume needs again, kept for a moved terminal. */
+export type ResumeSubject = Pick<MoveSubject, "tool" | "id" | "title" | "cwd" | "homeDir" | "codexHome" | "rolloutPath" | "launch">;
+
+/** A terminal SessionDeck opened for a move: its process (the CLI for a direct
+ *  launch, the shell otherwise), when SessionDeck started watching it, and the
+ *  session it runs. */
+export interface MovedRecord {
+  pid: number;
+  start?: number;
+  since: number;
+  subject: ResumeSubject;
+}
+
+const MOVED_RECORDS_MAX = 50;
+
+/** Moved-terminal records read back from workspace state; anything malformed
+ *  (an older or hand-edited value) is dropped. */
+export function readMovedRecords(raw: unknown): MovedRecord[] {
+  if (!Array.isArray(raw)) return [];
+  const out: MovedRecord[] = [];
+  const str = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length < 4096;
+  for (const r of raw.slice(-MOVED_RECORDS_MAX)) {
+    if (r === null || typeof r !== "object") continue;
+    const x = r as Record<string, unknown>;
+    const s = x.subject as Record<string, unknown> | null | undefined;
+    if (!Number.isInteger(x.pid) || (x.pid as number) <= 1 || typeof x.since !== "number") continue;
+    if (x.start !== undefined && typeof x.start !== "number") continue;
+    if (s === null || typeof s !== "object") continue;
+    if ((s.tool !== "claude" && s.tool !== "codex") || !str(s.id) || !SAFE_ID.test(s.id) || typeof s.title !== "string" || !str(s.cwd)) continue;
+    const subject: ResumeSubject = { tool: s.tool, id: s.id, title: s.title.slice(0, 200), cwd: s.cwd };
+    if (str(s.homeDir)) subject.homeDir = s.homeDir;
+    if (str(s.codexHome)) subject.codexHome = s.codexHome;
+    if (str(s.rolloutPath)) subject.rolloutPath = s.rolloutPath;
+    const l = s.launch as { exe?: unknown; args?: unknown } | undefined;
+    if (l !== undefined && str(l.exe) && Array.isArray(l.args) && l.args.every((a) => typeof a === "string")) {
+      subject.launch = { exe: l.exe, args: l.args as string[] };
+    }
+    out.push({ pid: x.pid as number, ...(x.start !== undefined ? { start: x.start as number } : {}), since: x.since, subject });
+  }
+  return out;
+}
+
+/** The notice for a moved session whose tab closed, and its buttons. */
+export function closedNoticeText(title: string): string {
+  return `"${shortTitle(title)}" ended and its tab closed. The conversation is kept.`;
+}
+/** The notice when the editor relaunched the tab (it stays open, running a
+ *  replacement), same buttons. */
+export function relaunchedNoticeText(title: string): string {
+  return `"${shortTitle(title)}" ended when its terminal was relaunched. The conversation is kept.`;
+}
+export const RESUME_ITEM = "Resume";
+export const DISMISS_ITEM = "Dismiss";
+
+/** How long after a moved tab closes SessionDeck waits before offering: the
+ *  process ends (1 to 2 s seen) and a resume started elsewhere registers. */
+export const CLOSED_SETTLE_MS = 5_000;
+/** A move or stop claim on the session released this recently (and after the
+ *  terminal was tracked) marks the end as SessionDeck's own. */
+export const CLAIM_RECENT_MS = 30_000;
+
+/** Is a Move or Stop of session `id` running now on this host, or did one end
+ *  within CLAIM_RECENT_MS after `since`? Read from the same claim files that keep
+ *  two of them from running at once; a claim caught mid-write counts. */
+export async function claimActiveSince(
+  dir: string,
+  id: string,
+  since: number,
+  opts: { now?: () => number; holderAlive?: ClaimHolderProbe; windowSet?: Set<string> } = {}
+): Promise<boolean> {
+  const key = id.toLowerCase();
+  if ((opts.windowSet ?? movesInWindow).has(key)) return true;
+  const gens = claimGens(dir, key);
+  if (gens === undefined || gens.length === 0) return false;
+  const file = claimFile(dir, key, Math.max(...gens));
+  const now = (opts.now ?? Date.now)();
+  let content: string;
+  let mtime: number;
+  try {
+    content = readFileSync(file, "utf8");
+    mtime = statSync(file).mtimeMs;
+  } catch {
+    return false;
+  }
+  if (!CLAIM_CONTENT.test(content)) return true;
+  if (/^0 released/.test(content)) return mtime > since && now - mtime <= CLAIM_RECENT_MS;
+  return claimLive(content, now, opts.holderAlive ?? claimHolderAlive);
+}
+
+/** The parts of vscode.window the watch uses (tests pass the fake's). */
+export interface TerminalEvents {
+  readonly terminals: readonly vscode.Terminal[];
+  onDidOpenTerminal: vscode.Event<vscode.Terminal>;
+  onDidCloseTerminal: vscode.Event<vscode.Terminal>;
+}
+
+export interface MovedWatchDeps {
+  /** workspace state: the records, read once and written whole. */
+  load(): unknown;
+  save(records: MovedRecord[]): unknown;
+  /** A Move or Stop of the session holds or just released its claim. */
+  ours(rec: MovedRecord): Promise<boolean>;
+  /** Is the recorded process still running (same start)? */
+  alive(pid: number, start: number | undefined): boolean;
+  startOf(pid: number): Promise<number | undefined>;
+  /** Does the session run again somewhere (another process than `rec.pid`)? */
+  runningElsewhere(rec: MovedRecord): Promise<boolean>;
+  /** Show the non-modal notice; resolves the button picked. */
+  offer(text: string, ...items: string[]): PromiseLike<string | undefined>;
+  resume(rec: MovedRecord): Promise<void>;
+  sleep(ms: number): Promise<void>;
+  now(): number;
+  log(line: string): void;
+}
+
+export type ClosedVerdict = "untracked" | "stopping" | "shutdown" | "cli-exit" | "ours" | "alive" | "running" | "offered";
+
+/** Watches the terminals this window opened for a move (see the section note). */
+export class MovedTerminals {
+  private readonly byTerminal = new Map<vscode.Terminal, MovedRecord>();
+  private records: MovedRecord[];
+  private stopping = false;
+
+  constructor(private readonly api: TerminalEvents, private readonly deps: MovedWatchDeps, private readonly settleMs = CLOSED_SETTLE_MS) {
+    // A record whose process has ended while no window watched it (the window
+    // closed) is dropped; its tab is gone too.
+    const all = readMovedRecords(deps.load());
+    this.records = all.filter((r) => deps.alive(r.pid, r.start));
+    if (this.records.length !== all.length) this.persist();
+  }
+
+  /** Subscribe and pick up the terminals already open (restored after a reload). */
+  start(): vscode.Disposable[] {
+    for (const t of this.api.terminals) void this.adopt(t);
+    return [
+      this.api.onDidOpenTerminal((t) => void this.adopt(t)),
+      this.api.onDidCloseTerminal((t) => void this.closed(t)),
+      { dispose: () => this.dispose() },
+    ];
+  }
+
+  /** The window is closing: no notice from here on. */
+  dispose(): void {
+    this.stopping = true;
+  }
+
+  /** Watch a terminal a move (or a Resume) just opened. */
+  async track(terminal: vscode.Terminal, subject: ResumeSubject): Promise<void> {
+    if (terminal.exitStatus !== undefined) return;
+    const since = this.deps.now();
+    const pid = await terminal.processId;
+    if (pid === undefined || terminal.exitStatus !== undefined) return;
+    const start = await this.deps.startOf(pid);
+    const { tool, id, title, cwd, homeDir, codexHome, rolloutPath, launch } = subject;
+    const rec: MovedRecord = { pid, ...(start !== undefined ? { start } : {}), since, subject: { tool, id, title, cwd, homeDir, codexHome, rolloutPath, launch } };
+    this.byTerminal.set(terminal, rec);
+    this.records = [...this.records.filter((r) => r.pid !== pid), rec].slice(-MOVED_RECORDS_MAX);
+    this.persist();
+  }
+
+  /** A terminal opened or restored: is it one a move opened before a reload? A
+   *  tab that closed while this looked it up is classified at once. */
+  async adopt(terminal: vscode.Terminal): Promise<void> {
+    if (this.byTerminal.has(terminal) || this.records.length === 0) return;
+    const pid = await terminal.processId;
+    const rec = this.records.find((r) => r.pid === pid);
+    if (rec === undefined || pid === undefined) return;
+    // The pid alone could be reused by an unrelated process: the start must agree.
+    // A tab that closed meanwhile has no process left to read; its pid is taken
+    // as is (the record was checked alive with that start at activation).
+    if (rec.start !== undefined) {
+      const start = await this.deps.startOf(pid);
+      if (start !== rec.start && !(start === undefined && terminal.exitStatus !== undefined)) return;
+    }
+    // One tab per record: a reused pid can't bind a second tab to it.
+    if (this.byTerminal.has(terminal) || [...this.byTerminal.values()].includes(rec)) return;
+    this.byTerminal.set(terminal, rec);
+    if (terminal.exitStatus !== undefined) void this.closed(terminal);
+  }
+
+  /** A terminal closed. Offer the resume once, only for a moved session that
+   *  ended by the tab closing (see closedKind), not by a Move or Stop, not while
+   *  the window closes, and only if it is not already running again. A close
+   *  while the window closes or reloads keeps the record: the reloaded window
+   *  needs it to find the restored tab (a real window close leaves a dead pid,
+   *  which the next activation drops). */
+  async closed(terminal: vscode.Terminal): Promise<ClosedVerdict> {
+    const rec = this.byTerminal.get(terminal);
+    if (rec === undefined) return "untracked";
+    this.byTerminal.delete(terminal);
+    const exit = terminal.exitStatus;
+    let how: "relaunched" | undefined;
+    const say = (v: ClosedVerdict): ClosedVerdict => {
+      this.deps.log(closedLog(exit, how === undefined ? v : `${how}, ${v}`));
+      return v;
+    };
+    if (this.stopping) return say("stopping");
+    let kind = closedKind(exit);
+    if (kind === "shutdown") return say(kind);
+    this.forget(rec);
+    // A clean exit counts as the CLI's own only while the terminal still runs
+    // the recorded process. The editor's Relaunch kills the CLI without a close
+    // event and starts a replacement in the same tab; the close that follows is
+    // the replacement's, whose code may be 0.
+    if (kind === "cli-exit" && (await terminal.processId) !== rec.pid) {
+      how = "relaunched";
+      kind = "closed";
+    }
+    if (kind !== "closed") return say(kind);
+    return this.settleAndOffer(rec, closedNoticeText(rec.subject.title), say);
+  }
+
+  /** The tick's check (the extension's existing 3 s refresh): a watched tab
+   *  still open whose process is no longer the recorded one, the recorded one
+   *  gone, was relaunched by the editor. Its session ended without a close
+   *  event, so it gets the same offer. */
+  async checkRelaunched(): Promise<void> {
+    for (const [terminal, rec] of [...this.byTerminal]) {
+      if (this.stopping) return;
+      if (terminal.exitStatus !== undefined) continue;
+      const pid = await terminal.processId;
+      if (pid === undefined || pid === rec.pid || this.byTerminal.get(terminal) !== rec || terminal.exitStatus !== undefined) continue;
+      if (this.deps.alive(rec.pid, rec.start)) continue;
+      this.byTerminal.delete(terminal);
+      this.forget(rec);
+      void this.settleAndOffer(rec, relaunchedNoticeText(rec.subject.title), (v) => {
+        this.deps.log(`moved terminal relaunched: ${v}`);
+        return v;
+      });
+    }
+  }
+
+  private async settleAndOffer(rec: MovedRecord, text: string, say: (v: ClosedVerdict) => ClosedVerdict): Promise<ClosedVerdict> {
+    if (await this.deps.ours(rec)) return say("ours");
+    await this.deps.sleep(this.settleMs);
+    if (this.stopping) return say("stopping");
+    if (await this.deps.ours(rec)) return say("ours");
+    if (this.deps.alive(rec.pid, rec.start)) return say("alive");
+    if (await this.deps.runningElsewhere(rec)) return say("running");
+    if (this.stopping) return say("stopping");
+    say("offered");
+    void Promise.resolve(this.deps.offer(text, RESUME_ITEM, DISMISS_ITEM))
+      .then((pick) => {
+        if (pick === RESUME_ITEM && !this.stopping) return this.deps.resume(rec);
+      })
+      .catch(() => undefined);
+    return "offered";
+  }
+
+  private forget(rec: MovedRecord): void {
+    this.records = this.records.filter((r) => r !== rec);
+    this.persist();
+  }
+
+  private persist(): void {
+    try {
+      void Promise.resolve(this.deps.save(this.records)).catch(() => undefined);
+    } catch {
+      // workspace state unavailable: the in-memory watch still works
+    }
+  }
+}
+
+export type ResumeOutcome = "resumed" | "busy" | "unavailable" | "still-running" | "running" | "failed";
+
+/** Resume a moved session after its tab closed, under the same claim as Move and
+ *  Stop, so two windows can't both resume it and a Move can't run alongside. */
+export async function resumeClosed(
+  rec: MovedRecord,
+  claimDir: string,
+  deps: {
+    alive: () => boolean;
+    runningElsewhere: () => Promise<boolean>;
+    open: () => Promise<vscode.Terminal | undefined>;
+    claim?: ClaimOptions;
+  }
+): Promise<{ outcome: ResumeOutcome; terminal?: vscode.Terminal; error?: string }> {
+  const r = await withMoveClaim(
+    claimDir,
+    rec.subject.id,
+    async (): Promise<{ outcome: ResumeOutcome; terminal?: vscode.Terminal; error?: string }> => {
+      if (deps.alive()) return { outcome: "still-running" };
+      if (await deps.runningElsewhere()) return { outcome: "running" };
+      try {
+        return { outcome: "resumed", terminal: await deps.open() };
+      } catch (e) {
+        return { outcome: "failed", error: e instanceof Error ? e.message : String(e) };
+      }
+    },
+    deps.claim
+  );
+  if (r === "busy" || r === "unavailable") return { outcome: r };
+  return r.result;
+}
+
+/** What the window says after a Resume from the notice (undefined: nothing, the
+ *  tab opening says it). */
+export function resumeClosedText(title: string, r: { outcome: ResumeOutcome; error?: string }): { level: "info" | "error"; text: string } | undefined {
+  const t = shortTitle(title);
+  switch (r.outcome) {
+    case "resumed":
+      return undefined;
+    case "busy":
+      return { level: "info", text: busyText(t) };
+    case "still-running":
+      return { level: "info", text: `"${t}" is still running. Nothing was started.` };
+    case "running":
+      return { level: "info", text: `"${t}" is already running again. Nothing was started.` };
+    case "unavailable":
+      return { level: "error", text: `"${t}" was not resumed: SessionDeck could not write to its storage folder.` };
+    case "failed":
+      return { level: "error", text: `"${t}" could not be resumed: ${(r.error ?? "unknown error").replace(/\.+$/, "")}.` };
+  }
+}
+
+/** A full subject for resumeHere from a moved-terminal record. */
+export function subjectOfRecord(rec: MovedRecord): MoveSubject {
+  return { ...rec.subject, pid: rec.pid, start: rec.start, working: false, owner: undefined, where: "a terminal in the editor" };
+}
+
+/** Resume the session in a new editor-area terminal (Move's terminal path). */
+export async function reopenMoved(rec: MovedRecord): Promise<vscode.Terminal | undefined> {
+  return (await resumeHere(subjectOfRecord(rec), "terminal"))?.terminal;
 }

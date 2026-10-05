@@ -9,6 +9,7 @@
 import { FormatHealthReport, HarnessReport, HooksReport } from "./canary";
 import { LicenseState, licenseSummary, redactLicenseKeys } from "./license";
 import { BRIDGE_INSTALL_HINT, HOST_ID_FIX_HINT, hooksPartial } from "./controlPanel";
+import { registryHoldText } from "./procs";
 
 // ============================================================================
 // Refresh tick watchdog — a vscode-free ring buffer of the last N refresh-tick
@@ -300,6 +301,9 @@ export interface DoctorProbes {
   /** Did the start time Claude Code records for each running session match this
    *  OS's process table? (Confirms the macOS/Windows formats in the field.) */
   procStartMatch?: { matched: number; mismatched: number; unchecked: number; noStart?: number };
+  /** macOS/Windows: the process table keeps failing while sessions are
+   *  registered, so registry questions and approvals are held (or let through). */
+  registryHold?: { backend: "ps" | "cim"; failures: number; failingMs: number; failOpen: boolean };
   // 8 — editor CLI
   editorCli: string;
   editorCliSource: "editorCliPath" | "cursorCliPath" | "default";
@@ -703,6 +707,18 @@ export function procStartCheck(p: DoctorProbes): DoctorCheck | undefined {
   };
 }
 
+/** One line while the process table fails and registry alerts wait on it. */
+export function registryHoldCheck(p: DoctorProbes): DoctorCheck | undefined {
+  const h = p.registryHold;
+  if (h === undefined) return undefined;
+  return {
+    mark: "problem",
+    title: "Registry alerts",
+    detail: registryHoldText(h),
+    fix: h.backend === "cim" ? "check that PowerShell runs and can read Win32_Process (Get-CimInstance), then reload the window" : "check that ps runs, then reload the window",
+  };
+}
+
 function editorCliCheck(p: DoctorProbes): DoctorCheck {
   const src =
     p.editorCliSource === "default"
@@ -861,6 +877,7 @@ export function doctorChecks(p: DoctorProbes): DoctorCheck[] {
     sqliteCheck(p),
     procsCheck(p),
     ...(procStartCheck(p) !== undefined ? [procStartCheck(p)!] : []),
+    ...(registryHoldCheck(p) !== undefined ? [registryHoldCheck(p)!] : []),
     editorCliCheck(p),
     notificationsCheck(p),
     unfocusedAlertsCheck(p),

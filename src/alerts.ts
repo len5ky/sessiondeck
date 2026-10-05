@@ -4,6 +4,8 @@
 // its onset so one blocking incident toasts exactly once, never per refresh tick:
 //   - approval: the session is blocked on a permission prompt (attentionMap ts).
 //   - question: a still-open AskUserQuestion/ExitPlanMode (main-transcript mtime).
+// Either can also come from the session registry's status "waiting" (its
+// statusUpdatedAt is the onset) when the transcript or the hooks don't show it.
 // A session that stays blocked keeps the same onset ts → no re-toast; one that
 // unblocks and later re-blocks gets a fresh ts → toasts again.
 
@@ -38,13 +40,20 @@ export interface AlertRow {
   questionTs: number;
   /** The question prompt, pre-truncated upstream; absent for ExitPlanMode. */
   questionText?: string;
+  /** The approval comes from the registry, not the hook (attentionTs is then the
+   *  registry's statusUpdatedAt). */
+  attentionFromRegistry?: boolean;
+  /** The question comes from the registry, not the transcript (questionTs is then
+   *  the registry's statusUpdatedAt). */
+  questionFromRegistry?: boolean;
 }
 
 /** One LIVE remote session's alert-relevant state for a single refresh. Cross-host
  *  attention has no reason/question text (BridgeSession carries none), so the toast
- *  is a generic "needs you" — the honest v1. `onsetTs` is the row's stable
- *  last-activity instant (`receivedAt − ageSec·1000`); it does NOT advance while a
- *  block stays open across heartbeats, so one incident toasts exactly once. */
+ *  is a generic "needs you" — the honest v1. `onsetTs` is the block's onset on the
+ *  publisher's clock (`publishedAt − ageSec·1000`, tree.ts remoteAlertRows); it
+ *  does not advance while a block stays open across heartbeats, so one incident
+ *  toasts exactly once. */
 export interface RemoteAlertRow {
   hostId: string;
   sessionId: string;
@@ -56,9 +65,16 @@ export interface RemoteAlertRow {
   live: boolean;
   /** The session's `attention` flag from the bridge snapshot. */
   attention: boolean;
-  /** Onset instant of the current block (`receivedAt − ageSec·1000`), heartbeat-
-   *  stable — the exact derivation the remote-unread predicate uses. */
+  /** Onset instant of the current block on the publisher's clock
+   *  (`publishedAt − ageSec·1000`; `receivedAt − ageSec·1000` without publishedAt).
+   *  Stable to within a few ms of build-to-send time, not to the millisecond, so
+   *  the tracker matches it with REMOTE_ONSET_SLACK_MS. */
   onsetTs: number;
+  /** The snapshot comes from a publisher older than ONSET_PUBLISH_REV, whose
+   *  blocked rows date their age from the newest write (subagents included), so
+   *  the onset moves while one block stays open. Its blocks are told apart by a
+   *  snapshot in between showing the session not blocked, not by onset. */
+  legacyPublisher?: boolean;
 }
 
 interface Candidate {
@@ -67,14 +83,34 @@ interface Candidate {
   kind: AlertKind;
   /** Monotonic onset timestamp of this specific blocking instance. */
   instanceTs: number;
+  /** Which signal dated the onset. The registry and the transcript/hook see the
+   *  same block a few hundred ms apart, in either order; see SOURCE_SLACK_MS.
+   *  "remote": an onset derived from a peer's snapshot; see REMOTE_ONSET_SLACK_MS. */
+  source?: "registry" | "remote" | "remote-legacy";
 }
+
+/** Two onsets from DIFFERENT sources (registry vs transcript/hook) this close
+ *  together are one block seen twice, not two blocks: the alert fires once. Same-
+ *  source onsets keep the exact comparison, so a quick second approval still toasts. */
+export const SOURCE_SLACK_MS = 5_000;
+
+/** A remote onset is `publishedAt − ageSec·1000`: ageSec is computed when the
+ *  row is built and publishedAt when it is sent, so every snapshot of one open
+ *  block yields an onset a few ms off the last one; without publishedAt the
+ *  fallback `receivedAt − ageSec·1000` moves by the whole publish latency (more
+ *  when the publishing window is busy). Two remote onsets
+ *  this close, with no snapshot in between showing the session unblocked, are
+ *  the same block. A new block's onset is at least the old block's length plus
+ *  the gap later, so it still toasts. */
+export const REMOTE_ONSET_SLACK_MS = 5_000;
 
 /** Per-window, in-memory transition dedup. Not vscode-aware, so it is tested
  *  directly. `fresh()` returns only the candidates whose (session, kind, onset)
  *  instance has not been alerted yet, and prunes sessions that are gone. */
 export class AlertTracker {
-  /** key(sessionId, kind) -> onset ts of the last-alerted instance. */
-  private readonly seen = new Map<string, number>();
+  /** key(sessionId, kind) -> onset ts and source of the last-alerted instance;
+   *  `cleared` once a tick showed that session present without this kind. */
+  private readonly seen = new Map<string, { ts: number; source: Candidate["source"]; cleared: boolean }>();
 
   private static key(sessionId: string, kind: AlertKind): string {
     return `${sessionId}\0${kind}`;
@@ -82,19 +118,36 @@ export class AlertTracker {
 
   fresh(candidates: readonly Candidate[], liveIds: ReadonlySet<string>): Candidate[] {
     const out: Candidate[] = [];
+    const current = new Set<string>();
     for (const c of candidates) {
       const k = AlertTracker.key(c.sessionId, c.kind);
-      if (this.seen.get(k) !== c.instanceTs) {
-        this.seen.set(k, c.instanceTs);
-        out.push(c);
-      }
+      current.add(k);
+      const prev = this.seen.get(k);
+      // The exact onset is always the same block. The cross-source merge only
+      // joins two views of a block that never cleared in between: once a tick saw
+      // it gone, a new onset from the other source is a new block.
+      const open = prev !== undefined && !prev.cleared;
+      const dist = prev === undefined ? Number.POSITIVE_INFINITY : Math.abs(prev.ts - c.instanceTs);
+      // A remote onset jitters by the publish latency on every snapshot (see
+      // REMOTE_ONSET_SLACK_MS). The mark keeps the block's first onset, so the
+      // jitter can't walk it along.
+      const remoteSame = c.source === "remote" && open && dist < REMOTE_ONSET_SLACK_MS;
+      const crossSame = open && prev.source !== c.source && dist < SOURCE_SLACK_MS;
+      // An older publisher's onset can't identify a block: while the session stays
+      // blocked in every snapshot seen, it is one block, whatever its onset.
+      const legacySame = c.source === "remote-legacy" && open;
+      // A matched block keeps its mark (and first onset); anything else re-marks.
+      if (legacySame) prev.cleared = false;
+      else if (!remoteSame) this.seen.set(k, { ts: c.instanceTs, source: c.source, cleared: false });
+      if (!(dist === 0 || remoteSame || crossSame || legacySame)) out.push(c);
     }
     // Bound the map: drop marks for sessions no longer present on disk. A live
-    // session that merely unblocked keeps its mark (harmless — a re-block has a
-    // new onset ts and re-fires regardless).
-    for (const k of [...this.seen.keys()]) {
+    // session that merely unblocked keeps its mark, flagged cleared (an exact
+    // re-appearance of the same onset still doesn't re-fire).
+    for (const [k, v] of [...this.seen]) {
       const sid = k.slice(0, k.indexOf("\0"));
       if (!liveIds.has(sid)) this.seen.delete(k);
+      else if (!current.has(k)) v.cleared = true;
     }
     return out;
   }
@@ -104,10 +157,20 @@ export function candidatesFrom(rows: readonly AlertRow[]): Candidate[] {
   const out: Candidate[] = [];
   for (const r of rows) {
     if (r.attention && r.attentionTs !== undefined) {
-      out.push({ sessionId: r.sessionId, kind: "approval", instanceTs: r.attentionTs });
+      out.push({
+        sessionId: r.sessionId,
+        kind: "approval",
+        instanceTs: r.attentionTs,
+        ...(r.attentionFromRegistry === true ? { source: "registry" as const } : {}),
+      });
     }
     if (r.pendingQuestion) {
-      out.push({ sessionId: r.sessionId, kind: "question", instanceTs: r.questionTs });
+      out.push({
+        sessionId: r.sessionId,
+        kind: "question",
+        instanceTs: r.questionTs,
+        ...(r.questionFromRegistry === true ? { source: "registry" as const } : {}),
+      });
     }
   }
   return out;
@@ -126,6 +189,7 @@ export function remoteCandidatesFrom(rows: readonly RemoteAlertRow[]): Candidate
         sessionId: remoteAlertKey(r.hostId, r.sessionId),
         kind: "remote-attention",
         instanceTs: r.onsetTs,
+        source: r.legacyPublisher === true ? "remote-legacy" : "remote",
       });
     }
   }
@@ -149,8 +213,8 @@ function truncate(s: string, n: number): string {
 /** One incident's routing decision. `toast` → show the individual toast (incidents
  *  1 & 2 of a would-be burst, and every incident once no burst is active); `summary`
  *  → show ONE "N sessions just blocked" toast INSTEAD of this incident's individual
- *  one (the 3rd incident that trips the threshold); `suppress` → stay silent (a later
- *  incident inside an ongoing burst — the chip/badge already count it). `count` is
+ *  one (the incident that brings the window to 3 distinct sessions); `suppress` →
+ *  stay silent (a later incident inside an ongoing burst — the chip/badge already count it). `count` is
  *  DISTINCT sessions in the window (a session blocked on both approval and question
  *  emits two candidates but is one session), so it never over-counts. */
 export type BurstDecision =
@@ -203,13 +267,14 @@ const MIN_REASON_HINT = 4;
  *  deliberately says "just blocked", not "need you". Appends the shared reason
  *  prefix when the whole burst shares one. */
 export function burstSummaryMessage(count: number, reason?: string): string {
-  const base = `${count} sessions just blocked`;
+  const base = `${count} ${count === 1 ? "session" : "sessions"} just blocked`;
   return reason !== undefined && reason.trim() !== "" ? `${base} — ${truncate(reason, 60)}` : base;
 }
 
-/** Collapses toast storms: ≥`threshold` fresh incidents inside a rolling `windowMs`
- *  → COLLAPSE. The 1st/2nd pass through as individual toasts; the 3rd converts to a
- *  single summary; further incidents while the burst is live are suppressed. The
+/** Collapses toast storms: fresh incidents from ≥`threshold` distinct sessions
+ *  inside a rolling `windowMs` → COLLAPSE. Incidents pass through as individual
+ *  toasts until the one that brings the window to `threshold` distinct sessions,
+ *  which converts to a single summary; further incidents while the burst is live are suppressed. The
  *  burst ENDS after `resetMs` with no fresh incident, after which per-incident
  *  toasts resume (detected lazily on the next incident — the gate is incident-driven,
  *  matching the injected-clock, timer-free design of the rest of the pipeline). */
@@ -237,10 +302,11 @@ export class BurstGate {
     const cutoff = now - this.windowMs;
     while (this.recent.length > 0 && this.recent[0].ts < cutoff) this.recent.shift();
     this.recent.push({ ts: now, sessionId, reason });
-    if (this.recent.length >= this.threshold) {
-      // Count DISTINCT sessions, not raw candidates: a session blocked on both an
-      // approval and a question emits two incidents but is one session in the summary.
-      const count = new Set(this.recent.map((r) => r.sessionId)).size;
+    // Count DISTINCT sessions, not raw incidents: one session blocking again (or on
+    // both an approval and a question) is one session, already toasted by name. A
+    // storm is several sessions, so only distinct sessions can trip the summary.
+    const count = new Set(this.recent.map((r) => r.sessionId)).size;
+    if (count >= this.threshold) {
       const hint = commonReasonPrefix(this.recent.map((r) => r.reason));
       this.inBurst = true;
       this.recent.length = 0; // window no longer consulted while a burst is live

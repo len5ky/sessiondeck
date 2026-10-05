@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { existsSync, watch, type FSWatcher } from "node:fs";
-import { cp, mkdir, readdir, readFile, writeFile, rename, rm, stat } from "node:fs/promises";
+import { cp, mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
 // Shared source, imported DIRECTLY from the main extension's src/ (no byte-copy).
 // The bridge is bundled with `bun build` (see bridge/package.json), which pulls
 // these modules into the companion's single out/extension.js — one source of
@@ -24,6 +24,7 @@ import {
   validateFocusResult,
   takeActionsFromDir,
   takeResultFromDir,
+  writeFileAtomic,
   ACTION_ID_RE,
   HOST_ID_RE,
 } from "../../src/bridgeSchema";
@@ -526,16 +527,12 @@ function readReceivedAt(input: unknown): number | undefined {
   return undefined;
 }
 
-/** Write via tmp file in the same dir + rename, so readers never see a partial file. */
-async function writeAtomic(target: string, data: string): Promise<void> {
-  const tmp = `${target}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-  await writeFile(tmp, data, "utf8");
-  try {
-    await rename(tmp, target);
-  } catch (err) {
-    await tryUnlink(tmp);
-    throw err;
-  }
+/** Write via tmp file in the same dir + rename, so readers never see a partial
+ *  file. The shared writeFileAtomic retries a rename Windows refuses while a
+ *  window is claiming the previous file (EPERM/EBUSY/EACCES, ~250 ms at most)
+ *  and removes its temp file when it finally fails. */
+function writeAtomic(target: string, data: string): Promise<void> {
+  return writeFileAtomic(target, data);
 }
 
 async function tryUnlink(path: string): Promise<void> {
