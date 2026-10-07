@@ -56,6 +56,36 @@ const STALE_MS = 24 * 60 * 60 * 1000; // hosts unseen longer than this are hidde
 const PROBE_BUDGET_MS = 60000; // availability retry window after activation
 const LICENSE_TTL_MS = 60000; // re-fetch the companion's license at most this often
 
+/** How long a call to the companion may go unanswered before it is abandoned and
+ *  the companion counts as unavailable, as if the call had thrown. A remote
+ *  window's extension host keeps running after its window lost the connection
+ *  (the editor waits up to 3 h for it to come back), and its calls through that
+ *  window then neither fail nor arrive (#169). A slow but working companion
+ *  answers in a few seconds. */
+export const BRIDGE_CALL_TIMEOUT_MS = 10_000;
+
+/** A call abandoned after the call timeout. */
+class BridgeTimeout extends Error {}
+
+/** The calls the refresh tick and activation make on their own. Only their
+ *  timeout marks the companion unavailable: a click's call (postAction, the focus
+ *  results, claimOnce) that times out fails that click, and the stop's final-post
+ *  retries (#156) must still reach the companion. */
+/** How many late answers to a consuming read (actions, focus results) are kept. */
+const LATE_KEEP = 32;
+
+const PERIODIC = new Set<string>([LIST, PUBLISH, HELLO, CURSOR_SESSIONS, LICENSE, TAKE_ACTIONS, LEGACY_STATE]);
+
+/** When this window's snapshot last reached the companion (`lastDeliveredAt`, a
+ *  reply of `{ ok: true }`), and since when its publishes have failed with no
+ *  delivery in between (`failingSince`: a throw, a timeout or `{ ok: false }`;
+ *  undefined when none has failed since the last delivery). Times are on the
+ *  client's clock. The publisher lease follows it (PublisherLease.holds). */
+export interface DeliveryState {
+  lastDeliveredAt: number | undefined;
+  failingSince: number | undefined;
+}
+
 interface BridgeClientOptions {
   /** This host's id, so `remoteHosts()` can exclude our own snapshot. */
   selfHostId: string | undefined;
@@ -75,6 +105,10 @@ interface BridgeClientOptions {
    *  held snapshot goes out, since the window may have lost the lease while it
    *  waited. Defaults to yes. */
   mayPublish?: () => boolean;
+  /** Call timeout (BRIDGE_CALL_TIMEOUT_MS); tests pass a short one. */
+  callTimeoutMs?: number;
+  /** Clock for the publish cadence and delivery times (tests). Defaults to Date.now. */
+  now?: () => number;
 }
 
 function isObject(x: unknown): x is Record<string, unknown> {
@@ -136,10 +170,29 @@ export class BridgeClient {
 
   private cache: StoredHostSnapshot[] = [];
 
+  /** Calls of these kinds still waiting for an answer, so a tick does not start
+   *  another while one is pending (a call the timeout abandoned no longer counts). */
+  private readonly busy = new Set<string>();
+  /** The last call to the companion was abandoned unanswered (one log per streak). */
+  private _timingOut = false;
+  /** A publish is waiting for its answer; at most one is in flight. */
+  private publishing = false;
+  /** The latest snapshot asked for while a publish was in flight. */
+  private queued: { snapshot: HostSnapshot; force: boolean; builtAt: number } | undefined;
+  /** Focus results whose takeFocusResult answered after the timeout, by id, kept
+   *  for the next poll of that id (the companion deleted them when it replied). */
+  private readonly lateResults = new Map<string, { result: FocusResult; at: number }>();
+  /** Actions whose takeActions answered after the timeout, for the next take. */
+  private lateActions: { action: FocusAction; deadline?: number }[] = [];
+  private lastDeliveredAt: number | undefined;
+  private failingSince: number | undefined;
+  private readonly now: () => number;
+
   private _license: BridgeLicense | undefined;
   private licenseFetchedAt = 0;
 
   constructor(private readonly opts: BridgeClientOptions) {
+    this.now = opts.now ?? Date.now;
     // Skip all probe work when cross-host is disabled — no hello backoff loop runs.
     if (opts.enabled?.() ?? true) {
       this.probeStarted = true;
@@ -165,6 +218,83 @@ export class BridgeClient {
   /** Whether the companion minor-skews from our version (tolerated; doctor-only). */
   get versionSkew(): boolean {
     return this._versionSkew;
+  }
+
+  /** True while calls to the companion go unanswered past the call timeout (the
+   *  last call was abandoned); cleared by the next call that gets any answer. */
+  get callsTimingOut(): boolean {
+    return this._timingOut;
+  }
+
+  /** When this window's snapshot last reached the companion (see DeliveryState). */
+  get delivery(): DeliveryState {
+    return { lastDeliveredAt: this.lastDeliveredAt, failingSince: this.failingSince };
+  }
+
+  /** One command to the companion, abandoned after the call timeout: it then
+   *  rejects with BridgeTimeout and, for a PERIODIC call, the companion counts
+   *  as unavailable, as if the call had thrown, until a later call is answered.
+   *  An answer that comes after the timeout is dropped. Logged once per streak of timeouts (command name and
+   *  timeout only). */
+  private call(cmd: string, ...args: unknown[]): Promise<unknown> {
+    return this.invoke(cmd, args, undefined);
+  }
+
+  /** call(), for a read the companion consumes before it replies (an action, a
+   *  focus result): an answer that comes after the timeout is gone from the
+   *  companion, so it goes to `onLate` instead of being dropped. A late answer
+   *  is never evidence of availability or delivery: it changes neither. */
+  private callKeepingLate(cmd: string, onLate: (late: unknown) => void, ...args: unknown[]): Promise<unknown> {
+    return this.invoke(cmd, args, onLate);
+  }
+
+  private invoke(cmd: string, args: unknown[], onLate: ((late: unknown) => void) | undefined): Promise<unknown> {
+    const ms = this.opts.callTimeoutMs ?? BRIDGE_CALL_TIMEOUT_MS;
+    let answer: Thenable<unknown>;
+    try {
+      answer = vscode.commands.executeCommand(cmd, ...args);
+    } catch (err) {
+      this._timingOut = false; // an error is an answer: the companion is reachable
+      return Promise.reject(err);
+    }
+    return new Promise<unknown>((resolve, reject) => {
+      let done = false;
+      const timer = setTimeout(() => {
+        done = true;
+        if (PERIODIC.has(cmd)) this._available = false;
+        if (!this._timingOut) {
+          this._timingOut = true;
+          const after = PERIODIC.has(cmd) ? "; treating the Bridge as unavailable until it answers again" : "";
+          console.log(`[sessiondeck] bridge: ${cmd} got no answer in ${ms} ms${after}`);
+        }
+        reject(new BridgeTimeout(cmd));
+      }, ms);
+      const settle = (): boolean => {
+        if (done) return false; // abandoned: the answer is not this call's any more
+        done = true;
+        clearTimeout(timer);
+        this._timingOut = false; // any answer, an error too, means it is reachable
+        return true;
+      };
+      answer.then(
+        (v) => {
+          if (settle()) resolve(v);
+          else onLate?.(v);
+        },
+        (e: unknown) => settle() && reject(e)
+      );
+    });
+  }
+
+  /** Run `fn` unless a call of this kind is still pending; `whenBusy` otherwise. */
+  private async single<T>(kind: string, whenBusy: T, fn: () => Promise<T>): Promise<T> {
+    if (this.busy.has(kind)) return whenBusy;
+    this.busy.add(kind);
+    try {
+      return await fn();
+    } finally {
+      this.busy.delete(kind);
+    }
   }
 
   get cursorEnumAvailable(): boolean { return this._cursorEnumAvailable; }
@@ -223,7 +353,7 @@ export class BridgeClient {
   /** One hello() call: true when the companion answers with a valid handshake. */
   private async tryHello(): Promise<boolean> {
     try {
-      const res: unknown = await vscode.commands.executeCommand(HELLO);
+      const res: unknown = await this.call(HELLO);
       if (isObject(res) && res.v === 1 && typeof res.version === "string") {
         this._available = true;
         this._companionVersion = res.version;
@@ -260,9 +390,15 @@ export class BridgeClient {
    *  snapshot carries, so a snapshot that adds one is sent at once, past the
    *  floor. `force` (this window just took the publisher
    *  lease over: another window may have written the host's snapshot since our
-   *  last publish) skips all of it. Any failure marks degraded. */
+   *  last publish) skips all of it. Any failure marks degraded. At most one
+   *  publish is in flight: a snapshot asked for meanwhile is held (the latest
+   *  wins) and sent when the pending one is answered, fails or is abandoned. */
   async publish(snapshot: HostSnapshot, force = false): Promise<void> {
-    const now = Date.now();
+    const now = this.now();
+    if (this.publishing) {
+      this.queued = { snapshot, force: force || (this.queued?.force ?? false), builtAt: now };
+      return;
+    }
     const key = stableKey(snapshot);
     if (!force && !this.addsAttention(snapshot)) {
       if (now - this.lastPublishAt < MIN_INTERVAL_MS) {
@@ -280,17 +416,36 @@ export class BridgeClient {
   private async send(snapshot: HostSnapshot, key: string, now: number): Promise<void> {
     this.seq += 1;
     const doc: HostSnapshot = { ...snapshot, seq: this.seq, publishedAt: now };
+    this.publishing = true;
     try {
       // A `{ ok: false }` result still means the companion is present — the call
-      // resolving (not throwing) is what proves availability.
-      await vscode.commands.executeCommand(PUBLISH, doc);
+      // resolving (not throwing) is what proves availability. Only `{ ok: true }`
+      // is a delivery (the companion stored it).
+      const res = await this.call(PUBLISH, doc);
       this._available = true;
       this.lastPublishAt = now;
       this.lastPublishKey = key;
       this.lastSentAttention = attentionIds(snapshot);
+      if (isObject(res) && res.ok === true) {
+        this.lastDeliveredAt = this.now();
+        this.failingSince = undefined;
+      } else {
+        this.failingSince ??= this.now();
+      }
     } catch {
       this._available = false;
+      this.failingSince ??= this.now();
+    } finally {
+      this.publishing = false;
     }
+    // The snapshot held meanwhile goes next, also after a failure or a timeout:
+    // a session that newly needs the user must not wait for the heartbeat
+    // because an older publish hung. Re-aged by the wait, as for the floor.
+    const q = this.queued;
+    this.queued = undefined;
+    if (q === undefined || this.disposed) return;
+    if (!(this.opts.mayPublish?.() ?? true)) return; // lost the lease meanwhile
+    void this.publish(reaged(q.snapshot, (this.now() - q.builtAt) / 1000), q.force);
   }
 
   /** Does this snapshot carry a session needing the user that the last sent one
@@ -312,13 +467,14 @@ export class BridgeClient {
       this.deferred = undefined;
       if (d === undefined || this.disposed) return;
       if (!(this.opts.mayPublish?.() ?? true)) return; // lost the lease meanwhile
-      const aged = reaged(d.snapshot, (Date.now() - d.builtAt) / 1000);
+      const aged = reaged(d.snapshot, (this.now() - d.builtAt) / 1000);
       void this.publish(aged);
     }, wait);
   }
 
   private cancelDeferred(): void {
     this.deferred = undefined;
+    this.queued = undefined;
     if (this.deferTimer !== undefined) clearTimeout(this.deferTimer);
     this.deferTimer = undefined;
   }
@@ -331,7 +487,7 @@ export class BridgeClient {
    *  publish(); a successful publish resets lastPublishAt, so this goes false for the
    *  next 15s, and a failed one leaves availability false (bridgePublishing gates it). */
   publishDue(): boolean {
-    return Date.now() - this.lastPublishAt >= HEARTBEAT_MS;
+    return this.now() - this.lastPublishAt >= HEARTBEAT_MS;
   }
 
   // ---- fetch ----------------------------------------------------------------
@@ -340,16 +496,20 @@ export class BridgeClient {
    * the last-good cache; a companion activation change forces one full re-pull. */
   async cursorSessions(): Promise<CursorEnumSessionWire[]> {
     if (!this._available) return this.enumCache;
+    return this.single(CURSOR_SESSIONS, this.enumCache, () => this.pullCursorSessions());
+  }
+
+  private async pullCursorSessions(): Promise<CursorEnumSessionWire[]> {
     try {
       let validated = validateCursorSessions(
-        await vscode.commands.executeCommand(CURSOR_SESSIONS, { sinceGen: this.enumSinceGen }),
+        await this.call(CURSOR_SESSIONS, { sinceGen: this.enumSinceGen }),
       );
       if (validated === null) return this.enumCache;
       const expectedInstanceId = this.enumLastInstanceId ?? this.companionInstanceId;
       if (expectedInstanceId !== undefined && validated.instanceId !== expectedInstanceId) {
         this.enumSinceGen = "";
         validated = validateCursorSessions(
-          await vscode.commands.executeCommand(CURSOR_SESSIONS, { sinceGen: "" }),
+          await this.call(CURSOR_SESSIONS, { sinceGen: "" }),
         );
         if (validated === null) return this.enumCache;
       }
@@ -370,8 +530,12 @@ export class BridgeClient {
    *  on failure keep the last-good cache and mark unavailable. Also the recovery
    *  probe after the initial window — a success here flips degraded back to live. */
   async fetchNow(): Promise<void> {
+    return this.single(LIST, undefined, () => this.fetchList());
+  }
+
+  private async fetchList(): Promise<void> {
     try {
-      const res: unknown = await vscode.commands.executeCommand(LIST);
+      const res: unknown = await this.call(LIST);
       if (Array.isArray(res)) {
         this.cache = res.filter(isStored);
         this._available = true;
@@ -409,8 +573,12 @@ export class BridgeClient {
     if (this._license !== undefined && now - this.licenseFetchedAt < LICENSE_TTL_MS) {
       return this._license;
     }
+    return this.single(LICENSE, this._license, () => this.fetchLicense(now));
+  }
+
+  private async fetchLicense(now: number): Promise<BridgeLicense | undefined> {
     try {
-      const res: unknown = await vscode.commands.executeCommand(LICENSE);
+      const res: unknown = await this.call(LICENSE);
       const v = validateBridgeLicense(res);
       if (v !== null) {
         this._license = v;
@@ -435,7 +603,7 @@ export class BridgeClient {
   async legacyState(): Promise<LegacyStateDoc | undefined> {
     if (!this._available || this._rev < 2) return undefined;
     try {
-      return validateLegacyState(await vscode.commands.executeCommand(LEGACY_STATE)) ?? undefined;
+      return validateLegacyState(await this.call(LEGACY_STATE)) ?? undefined;
     } catch {
       return undefined;
     }
@@ -483,7 +651,7 @@ export class BridgeClient {
   async claimOnce(name: string): Promise<boolean | undefined> {
     if (!this._available || this._rev < 2) return undefined;
     try {
-      const res: unknown = await vscode.commands.executeCommand(CLAIM_ONCE, name);
+      const res: unknown = await this.call(CLAIM_ONCE, name);
       return isObject(res) && typeof res.claimed === "boolean" ? res.claimed : undefined;
     } catch {
       return undefined;
@@ -524,7 +692,7 @@ export class BridgeClient {
     if (this._rev >= 3) payload.id = newActionId();
     if (!validateAction(payload).ok) return { posted: false };
     try {
-      const res: unknown = await vscode.commands.executeCommand(POST_ACTION, payload);
+      const res: unknown = await this.call(POST_ACTION, payload);
       if (!(isObject(res) && res.ok === true)) return { posted: false };
       return payload.id !== undefined ? { posted: true, id: payload.id } : { posted: true };
     } catch {
@@ -538,7 +706,7 @@ export class BridgeClient {
     const doc = validateFocusResult({ ...r, v: 1, at: Date.now() });
     if (doc === null) return false;
     try {
-      const res: unknown = await vscode.commands.executeCommand(POST_FOCUS_RESULT, doc);
+      const res: unknown = await this.call(POST_FOCUS_RESULT, doc);
       return isObject(res) && res.ok === true;
     } catch {
       return false;
@@ -547,12 +715,30 @@ export class BridgeClient {
 
   /** Take the acting host's report for a focus action, once; undefined = none yet. */
   async takeFocusResult(id: string): Promise<FocusResult | undefined> {
+    const now = this.now();
+    for (const [k, v] of this.lateResults) if (now - v.at > STOP_ANSWER_WAIT_MS) this.lateResults.delete(k);
+    const late = this.lateResults.get(id);
+    if (late !== undefined) {
+      this.lateResults.delete(id);
+      return late.result;
+    }
     if (!this._available || this._rev < 3) return undefined;
-    try {
-      const res: unknown = await vscode.commands.executeCommand(TAKE_FOCUS_RESULT, id);
+    const parse = (res: unknown): FocusResult | undefined => {
       if (!isObject(res) || res.ok !== true) return undefined;
       const r = validateFocusResult(res.result);
       return r !== null && r.id === id ? r : undefined;
+    };
+    try {
+      return parse(
+        await this.callKeepingLate(TAKE_FOCUS_RESULT, (res) => {
+          const r = parse(res);
+          if (r === undefined) return;
+          this.lateResults.delete(id);
+          this.lateResults.set(id, { result: r, at: this.now() });
+          // Bounded: drop the oldest beyond LATE_KEEP.
+          while (this.lateResults.size > LATE_KEEP) this.lateResults.delete(this.lateResults.keys().next().value!);
+        }, id)
+      );
     } catch {
       return undefined;
     }
@@ -566,7 +752,14 @@ export class BridgeClient {
    *  as a duration, so the two hosts' clocks are never compared. Old companion /
    *  failure → []. */
   async takeActions(selfHostId: string, folders?: readonly string[]): Promise<{ action: FocusAction; deadline?: number }[]> {
-    if (!this._available) return [];
+    const late = this.lateActions;
+    this.lateActions = [];
+    if (!this._available) return late;
+    const taken = await this.single(TAKE_ACTIONS, [], () => this.pullActions(selfHostId, folders));
+    return late.length === 0 ? taken : [...late, ...taken];
+  }
+
+  private async pullActions(selfHostId: string, folders?: readonly string[]): Promise<{ action: FocusAction; deadline?: number }[]> {
     try {
       const takenAt = Date.now();
       // Command rev 4: say which folders this window has open, so the companion
@@ -574,31 +767,43 @@ export class BridgeClient {
       // would ignore it; it is sent only to rev 4 and up all the same.
       const route: TakeRoute | undefined =
         this._rev >= 4 && folders !== undefined ? { window: this.windowToken, folders: folders.slice(0, ROUTE_MAX_FOLDERS) } : undefined;
+      // An answer after the timeout is kept for the next take, its deadlines
+      // still counted from now (the caller skips any action past its deadline).
+      const onLate = (res: unknown): void => {
+        const late = this.parseActions(res, selfHostId, takenAt).map((a) => ({ ...a, deadline: a.deadline ?? takenAt + FOCUS_ANSWER_WAIT_MS }));
+        this.lateActions = [...this.lateActions, ...late].slice(-LATE_KEEP);
+      };
       const res: unknown =
         route !== undefined
-          ? await vscode.commands.executeCommand(TAKE_ACTIONS, selfHostId, route)
-          : await vscode.commands.executeCommand(TAKE_ACTIONS, selfHostId);
-      if (!isObject(res) || res.ok !== true || !Array.isArray(res.actions)) return [];
-      const remaining = isObject(res.remainingMs) ? res.remainingMs : {};
-      const out: { action: FocusAction; deadline?: number }[] = [];
-      for (const raw of res.actions) {
-        const v = validateAction(raw);
-        if (!v.ok || v.action.targetHostId !== selfHostId) continue;
-        const id = v.action.id;
-        if (id === undefined) {
-          out.push({ action: v.action });
-          continue;
-        }
-        const left = remaining[id];
-        // An id with no time left reported (a companion without the rule): give
-        // it the full wait from now, the most the poster can still be waiting.
-        const ms = typeof left === "number" && Number.isFinite(left) ? Math.max(0, Math.min(left, FOCUS_ANSWER_WAIT_MS)) : FOCUS_ANSWER_WAIT_MS;
-        out.push({ action: v.action, deadline: takenAt + ms });
-      }
-      return out;
+          ? await this.callKeepingLate(TAKE_ACTIONS, onLate, selfHostId, route)
+          : await this.callKeepingLate(TAKE_ACTIONS, onLate, selfHostId);
+      return this.parseActions(res, selfHostId, takenAt);
     } catch {
       return [];
     }
+  }
+
+  /** The actions in a takeActions answer, validated, with deadlines on this
+   *  host's clock counted from `takenAt`. */
+  private parseActions(res: unknown, selfHostId: string, takenAt: number): { action: FocusAction; deadline?: number }[] {
+    if (!isObject(res) || res.ok !== true || !Array.isArray(res.actions)) return [];
+    const remaining = isObject(res.remainingMs) ? res.remainingMs : {};
+    const out: { action: FocusAction; deadline?: number }[] = [];
+    for (const raw of res.actions) {
+      const v = validateAction(raw);
+      if (!v.ok || v.action.targetHostId !== selfHostId) continue;
+      const id = v.action.id;
+      if (id === undefined) {
+        out.push({ action: v.action });
+        continue;
+      }
+      const left = remaining[id];
+      // An id with no time left reported (a companion without the rule): give
+      // it the full wait from now, the most the poster can still be waiting.
+      const ms = typeof left === "number" && Number.isFinite(left) ? Math.max(0, Math.min(left, FOCUS_ANSWER_WAIT_MS)) : FOCUS_ANSWER_WAIT_MS;
+      out.push({ action: v.action, deadline: takenAt + ms });
+    }
+    return out;
   }
 
   /** Remote hosts to render: from the cached list, drop our own host and any host
@@ -747,7 +952,9 @@ export function buildSnapshot(model: PanelModel, identity: HostIdentity): HostSn
  *  storage folder all of a host's windows share), renewed on every publish
  *  (at least the 15 s heartbeat) and free once it is LEASE_STALE_MS old, so a
  *  closed window's lease passes on. Two windows racing for a free lease both
- *  write; the one whose write is read back holds it. */
+ *  write; the one whose write is read back holds it. The holder renews only while
+ *  its snapshots reach the companion (see PublisherLease.holds), so a window that
+ *  lost its connection lets the lease go stale too (#169). */
 export const LEASE_STALE_MS = 45_000;
 
 /** What this build puts in a published snapshot, as one number: bump it whenever
@@ -782,11 +989,27 @@ export function publishGate(
   return { bridgePublishing, heartbeatDue: bridgePublishing && (lease === "free" || publishDue) };
 }
 
+/** For Diagnostics (#169): seconds since this window's snapshot last reached the
+ *  companion (or, never having delivered one, since its publishes started
+ *  failing), while that is longer than LEASE_STALE_MS and this window is the one
+ *  that would publish: it holds the lease, or the lease is free, so no other
+ *  window is publishing the host. Undefined once a delivery succeeds, while
+ *  another window holds a live lease, and for a window that never tried (no
+ *  companion). */
+export function undeliveredSec(lease: LeaseState, d: DeliveryState, now: number): number | undefined {
+  if (lease === "taken") return undefined;
+  const since = d.lastDeliveredAt ?? d.failingSince;
+  if (since === undefined) return undefined;
+  return now - since > LEASE_STALE_MS ? Math.round((now - since) / 1000) : undefined;
+}
+
 export class PublisherLease {
   private readonly file: string;
   private readonly mine: string;
   /** The last write failed: the lease can't be stored, so this window publishes. */
   private unusable = false;
+  /** When this window last took the lease while it was free (its grace to deliver). */
+  private acquiredAt: number | undefined;
   constructor(
     dir: string,
     token: string,
@@ -822,18 +1045,39 @@ export class PublisherLease {
   }
 
   /** May this window publish now? Takes or renews the lease. True when the
-   *  lease can't be stored at all (a lone window must still publish). */
-  holds(): boolean {
-    if (this.peek() === "taken") return false;
+   *  lease can't be stored at all (a lone window must still publish).
+   *
+   *  With `delivery` (this window's BridgeClient.delivery), the lease follows
+   *  delivery (#169): the window takes or renews it only while its last snapshot
+   *  reached the companion within LEASE_STALE_MS, while no publish has failed
+   *  since its last delivery (it has not had its chance yet), or within
+   *  LEASE_STALE_MS of taking it over. Otherwise it leaves the file alone, so the
+   *  lease goes stale and another window of the host takes over, but it still
+   *  answers true while nobody else holds it: a window alone on its host keeps
+   *  trying to publish, and takes the lease again once a snapshot gets through. */
+  holds(delivery?: DeliveryState): boolean {
+    const state = this.peek();
+    if (state === "taken") return false;
+    if (delivery !== undefined && !this.mayHold(state, delivery)) return true;
     try {
       mkdirSync(join(this.file, ".."), { recursive: true });
       writeFileSync(this.file, `${this.now()} ${this.mine} ${this.rev}`);
       this.unusable = false;
-      return readFileSync(this.file, "utf8").split(" ")[1] === this.mine;
+      const mine = readFileSync(this.file, "utf8").split(" ")[1] === this.mine;
+      if (mine && state === "free") this.acquiredAt = this.now();
+      return mine;
     } catch {
       this.unusable = true;
       return true;
     }
+  }
+
+  /** May a window in this lease state with this delivery record take or renew it? */
+  private mayHold(state: LeaseState, d: DeliveryState): boolean {
+    const now = this.now();
+    if (d.lastDeliveredAt !== undefined && now - d.lastDeliveredAt <= LEASE_STALE_MS) return true;
+    if (d.failingSince === undefined) return true;
+    return state === "mine" && this.acquiredAt !== undefined && now - this.acquiredAt <= LEASE_STALE_MS;
   }
 
   /** Give the lease up (window closing), if it is ours. */

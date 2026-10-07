@@ -751,17 +751,47 @@ const NON_PROMPT_TAGS = [
   "<local-command-caveat>",
 ];
 
-/** Raw text of a user record's content — the string form, or the first text block
- *  of the array form. undefined when the record carries no text (tool_result-only,
- *  image-only, or a malformed shape). */
-function userRecordText(rec: TranscriptEntry): string | undefined {
+// Context blocks the Claude Code extension's webview puts in front of the prompt
+// in a tab session's user record (LC1 in webview/index.js, 2.1.289): one opened-
+// file or selection block, then a block per @terminal and @browser mention, then
+// the prompt as the last text block. Each is a whole text block that starts with
+// the open tag and ends with its close; the selected code inside goes in
+// unescaped, so only the block's ends are tested. Seen on a Windows tab session
+// as a row title "<ide_opened_file>The user opened the file …" (#136 step 18).
+const CONTEXT_BLOCKS: ReadonlyArray<readonly [string, string]> = [
+  ["<ide_opened_file>", "</ide_opened_file>"],
+  ["<ide_selection>", "</ide_selection>"],
+  ['<terminal name="', "</terminal>"],
+  ["<browser_instruction>", "</browser_instruction>"],
+  ['<browser tabGroupId="', "</browser>"],
+];
+
+function isContextBlock(text: string): boolean {
+  const t = text.trimEnd();
+  return CONTEXT_BLOCKS.some(([open, close]) => t.startsWith(open) && t.endsWith(close));
+}
+
+/** The prompt among a user record's text blocks: the first non-blank one that is
+ *  not editor context. When every block is context-shaped the last one is what
+ *  the user typed (the webview always adds the prompt as the last text block
+ *  once any text block is there, so a prompt pasted as a wrapper stays the
+ *  title). undefined when there is no text, or the prompt is blank. */
+function promptText(texts: readonly string[]): string | undefined {
+  if (texts.length === 0) return undefined;
+  if (texts.every(isContextBlock)) return texts[texts.length - 1];
+  return texts.find((t) => t.trim() !== "" && !isContextBlock(t));
+}
+
+/** The text blocks of a user record's content: the string form as one block, or
+ *  every text block of the array form. Empty when the record carries no text
+ *  (tool_result-only, image-only, or a malformed shape). */
+function userRecordTexts(rec: TranscriptEntry): string[] {
   const c = rec.message?.content;
-  if (typeof c === "string") return c;
-  if (Array.isArray(c)) {
-    const block = c.find((b) => b?.type === "text");
-    if (block !== undefined && typeof block.text === "string") return block.text;
-  }
-  return undefined;
+  if (typeof c === "string") return [c];
+  if (!Array.isArray(c)) return [];
+  const out: string[] = [];
+  for (const b of c) if (b?.type === "text" && typeof b.text === "string") out.push(b.text);
+  return out;
 }
 
 /** First usable user PROMPT line from a transcript HEAD, or undefined when the head
@@ -769,7 +799,8 @@ function userRecordText(rec: TranscriptEntry): string | undefined {
  *  (reuse sanitizeReason) — this only locates the raw line. Skips the machinery that
  *  precedes/surrounds a real first prompt (queue-operation/attachment/assistant
  *  records via the type gate; isMeta caveat records; slash-command wrappers and
- *  local-command envelopes; tool_result-only user records; interrupt markers),
+ *  local-command envelopes; the editor context blocks the Claude Code extension
+ *  puts in front of a prompt; tool_result-only user records; interrupt markers),
  *  matching the record shapes observed across real transcripts. Exported for tests. */
 export function firstUserPromptLine(head: string): string | undefined {
   for (const raw of head.split("\n")) {
@@ -782,8 +813,10 @@ export function firstUserPromptLine(head: string): string | undefined {
       break; // truncated final line of the head window — no complete records follow
     }
     if (rec.type !== "user" || rec.isMeta === true) continue;
-    const text = userRecordText(rec);
-    if (text === undefined) continue; // tool_result / image-only user record
+    // Editor context blocks come before the prompt in the same record; a record
+    // with context and a blank prompt falls through to the next one.
+    const text = promptText(userRecordTexts(rec));
+    if (text === undefined) continue; // tool_result / image-only / blank-prompt user record
     if (NON_PROMPT_TAGS.some((t) => text.includes(t))) continue;
     if (text.includes("[Request interrupted by user]")) continue;
     for (const line of text.split("\n")) {

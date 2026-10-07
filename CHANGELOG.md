@@ -5,6 +5,24 @@ packages share one version number.
 
 ## [Unreleased]
 
+## [0.42.8] - 2026-10-07
+
+### Fixed
+- Clicking a terminal session whose process has ended now says at once that
+  the session is no longer running, instead of waiting about two seconds.
+- A toast for a session on another machine now says whether it needs your
+  input or your approval, as local toasts do, when that machine runs
+  SessionDeck 0.42.7 or later. Sessions from older versions still say "needs
+  you".
+- A Claude Code tab session opened with a file or a selection, or with a
+  terminal or browser attachment, is now titled by your prompt, not by the
+  editor's "The user opened the file …" note or the attachment's contents.
+- A window that lost its connection could keep its machine's sessions from
+  being published, so the machine showed as offline in other windows for up
+  to three hours (in v0.42.6 and v0.42.7 too). Such a window now gives up
+  publishing within about 90 seconds and another window on that machine takes
+  over. Diagnostics says when a window can't reach the Bridge.
+
 ## [0.42.7] - 2026-10-05
 
 ### Fixed

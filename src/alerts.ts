@@ -50,7 +50,8 @@ export interface AlertRow {
 
 /** One LIVE remote session's alert-relevant state for a single refresh. Cross-host
  *  attention has no reason/question text (BridgeSession carries none), so the toast
- *  is a generic "needs you" — the honest v1. `onsetTs` is the block's onset on the
+ *  names the kind of block when the publisher tells them apart (`blockKind`), and
+ *  says "needs you" otherwise. `onsetTs` is the block's onset on the
  *  publisher's clock (`publishedAt − ageSec·1000`, tree.ts remoteAlertRows); it
  *  does not advance while a block stays open across heartbeats, so one incident
  *  toasts exactly once. */
@@ -75,6 +76,12 @@ export interface RemoteAlertRow {
    *  the onset moves while one block stays open. Its blocks are told apart by a
    *  snapshot in between showing the session not blocked, not by onset. */
   legacyPublisher?: boolean;
+  /** What the block is, for the toast's words only: never part of the alert's
+   *  identity, so a block whose kind reads differently between two snapshots
+   *  still toasts once. Absent when the publisher cannot tell a question from an
+   *  approval (one older than ONSET_PUBLISH_REV publishes "waiting" for an
+   *  approval open past 30 min). */
+  blockKind?: "approval" | "question";
 }
 
 interface Candidate {
@@ -338,14 +345,16 @@ export function alertMessage(row: AlertRow, kind: AlertKind): string {
 }
 
 /** Cross-host toast text. BridgeSession carries no reason/question, so the message
- *  is a generic "needs you" — the honest v1 (see the log). Names the host so a
+ *  says the kind of block in the local toasts' words ("needs your approval",
+ *  "needs your input"), or "needs you" when the kind is unknown. Names the host so a
  *  five-host fleet's toast says which machine to look at. Both interpolated strings
  *  are REMOTE-SUPPLIED (the session title / host label a peer published), so — like
  *  every other hook/remote free-text sink — they run through sanitizeReason to strip
  *  control chars and newlines that could otherwise corrupt or spoof the toast line
  *  (the upstream length clamp does not remove control chars). */
 export function remoteAlertMessage(row: RemoteAlertRow): string {
-  return `${sanitizeReason(row.label, 60)} on ${sanitizeReason(row.hostLabel, 40)}: needs you`;
+  const what = row.blockKind === "approval" ? "needs your approval" : row.blockKind === "question" ? "needs your input" : "needs you";
+  return `${sanitizeReason(row.label, 60)} on ${sanitizeReason(row.hostLabel, 40)}: ${what}`;
 }
 
 /** Wires the dedup core to VS Code. `notify` shows the toast + [Open] button;

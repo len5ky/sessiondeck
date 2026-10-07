@@ -3228,6 +3228,8 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       for (const p of h.projects) {
         for (const node of p.sessions) {
           const s = node.session;
+          const legacy = (h.snapshot.publishRev ?? 0) < ONSET_PUBLISH_REV;
+          const flags = remoteSessionFlags(s, false);
           rows.push({
             hostId: h.snapshot.host.id,
             sessionId: s.id,
@@ -3236,7 +3238,11 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
             live: !h.stale,
             attention: s.attention === true,
             onsetTs: (h.snapshot.publishedAt > 0 ? h.snapshot.publishedAt : h.snapshot.receivedAt) - s.ageSec * 1000,
-            ...((h.snapshot.publishRev ?? 0) < ONSET_PUBLISH_REV ? { legacyPublisher: true } : {}),
+            ...(legacy ? { legacyPublisher: true } : {}),
+            // Only a rev ≥ 2 publisher never sends "waiting" for an approval, so
+            // only its blocks are named; an older one's keep "needs you".
+            ...(!legacy && flags.pendingQuestion ? { blockKind: "question" as const } : {}),
+            ...(!legacy && flags.attention ? { blockKind: "approval" as const } : {}),
           });
         }
       }

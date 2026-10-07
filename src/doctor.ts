@@ -278,6 +278,12 @@ export interface DoctorProbes {
   bridgeCompanionVersion?: string;
   bridgeVersionSkew: boolean;
   bridgeHosts: DoctorHostEntry[];
+  /** Calls to the companion go unanswered past the call timeout (#169). */
+  bridgeTimingOut?: boolean;
+  /** This window would publish its host (it holds the publisher lease, or the
+   *  lease is free), but its last snapshot reached the companion this many
+   *  seconds ago, past the lease bound (#169). */
+  publishUndeliveredSec?: number;
   cursorEnumAvailable: boolean;
   cursorEnumCount: number;
   cursorEnumGen: string;
@@ -562,6 +568,14 @@ function bridgeCheck(p: DoctorProbes): DoctorCheck {
       fix: "set sessionDeck.crossHost: true to aggregate your other hosts",
     };
   }
+  if (reach === "missing" && p.bridgeTimingOut === true) {
+    return {
+      mark: "problem",
+      title: "Bridge companion",
+      detail: "not answering: calls to it are timing out, so this window may have lost its connection",
+      fix: "check this window's connection to the remote, then reload the window",
+    };
+  }
   if (reach === "missing") {
     return {
       mark: "problem",
@@ -704,6 +718,19 @@ export function procStartCheck(p: DoctorProbes): DoctorCheck | undefined {
     title,
     detail: `on ${p.procPlatform}, the start time Claude Code records did not match the process table for ${m.mismatched} of ${compared} running sessions${unread}. Move into Editor and Stop Session will not stop these sessions`,
     fix: "please report this line with your OS version",
+  };
+}
+
+/** One line while this window would publish its host but its snapshots stop
+ *  reaching the companion, until one gets through (#169). */
+export function publishDeliveryCheck(p: DoctorProbes): DoctorCheck | undefined {
+  const sec = p.publishUndeliveredSec;
+  if (!p.crossHost || sec === undefined) return undefined;
+  return {
+    mark: "problem",
+    title: "Publishing this host",
+    detail: `this window publishes this host's sessions, but no snapshot has reached the Bridge for ${sec} s; other windows may show this host as offline`,
+    fix: "reload this window; for a remote window, check its connection to the remote",
   };
 }
 
@@ -871,6 +898,7 @@ export function doctorChecks(p: DoctorProbes): DoctorCheck[] {
     hooksCheck(p),
     cursorMonitoringCheck(p),
     bridgeCheck(p),
+    ...(publishDeliveryCheck(p) !== undefined ? [publishDeliveryCheck(p)!] : []),
     cursorEnumerationCheck(p),
     hostIdCheck(p),
     titlesCheck(p),

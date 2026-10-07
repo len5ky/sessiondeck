@@ -51,6 +51,8 @@ export const HANDOFF_ACK_MS = 2_000;
 /** How long a hand-off waits for the final answer once a window took it: that
  *  window may run the editor CLI to come to the front (up to CLI_WAIT_MS). */
 export const HANDOFF_CONFIRM_MS = 10_000;
+/** The report for a terminal session whose process has ended. */
+export const SESSION_ENDED = "the session is no longer running";
 const HANDOFF_POLL_MS = 100;
 /** Time kept back before the poster's deadline to post the report. */
 const REPORT_MARGIN_MS = 1_000;
@@ -139,6 +141,8 @@ export interface NavigatorDeps {
   /** This window's integrated terminal running `pid` (its shell is `pid` or an
    *  ancestor), not yet revealed; undefined when it has none. */
   findTerminal?: (pid: number) => Promise<{ show(): void } | undefined>;
+  /** Is the process still running (default: pidAlive). */
+  alive?: (pid: number) => boolean;
 }
 
 /** Did this window's extension host start the session's process? Claude Code
@@ -232,6 +236,12 @@ export class Navigator implements vscode.Disposable {
       // entrypoint (cli, sdk-cli, sdk-ts, …) runs in a terminal or an app: reveal the
       // integrated-terminal tab whose shell is an ancestor of the session pid.
       if (!hasEditorTab(entrypoint)) {
+        // The session's process has ended: no window can have a terminal running
+        // it, so say so now instead of asking the other windows and waiting out
+        // HANDOFF_ACK_MS. An unknown pid (0) still hands off.
+        if (Number.isFinite(pid) && pid > 0 && !(this.deps.alive ?? pidAlive)(pid)) {
+          return { ok: false, reason: "no-terminal", detail: SESSION_ENDED };
+        }
         const terminal = await this.findTerminal(pid);
         if (terminal !== undefined) {
           if (late()) return { ok: false, reason: "expired" };

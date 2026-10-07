@@ -86,7 +86,7 @@ import { saveQuietly, onFailedSave, unsavedSettingKeys, decideTrialStart, trialO
 import { AccountDecorationProvider, PreviewDocs } from "./decorations";
 import { OverviewPanel } from "./panel";
 import { TableViewProvider } from "./tableView";
-import { BridgeClient, buildSnapshot, FOCUS_NOTE_MS, LatestClick, PublisherLease, publishGate, type FocusNotice, focusNotice, navReport, remoteFocusPrecheck, actOnRemoteStop, followStop, STOP_ANSWER_WAIT_MS, stopNotice, waitForFocusResult } from "./bridge";
+import { BridgeClient, buildSnapshot, undeliveredSec, FOCUS_NOTE_MS, LatestClick, PublisherLease, publishGate, type FocusNotice, focusNotice, navReport, remoteFocusPrecheck, actOnRemoteStop, followStop, STOP_ANSWER_WAIT_MS, stopNotice, waitForFocusResult } from "./bridge";
 import {
   copyMissingMementoValues,
   hostDisplayLabel,
@@ -645,7 +645,7 @@ async function startSessionDeck(
     onRemoteChange: () => refreshFn(),
     // A held snapshot goes out only while this window still holds the lease (the
     // same check the tick makes before it publishes).
-    mayPublish: () => crossHostEnabled() && (publisherLease?.holds() ?? true),
+    mayPublish: (): boolean => crossHostEnabled() && (publisherLease?.holds(bridge.delivery) ?? true),
   };
   // A client that failed to start is replaced by a disabled one (no probe, no
   // remote hosts), so everything that reads the bridge still works single-host.
@@ -1537,8 +1537,10 @@ async function startSessionDeck(
         if (bridgeUp && hostIdentity !== undefined) {
           // One window per host publishes (see PublisherLease): the host's
           // snapshot is one file, and windows overwriting each other made rows
-          // and their marks flicker on other hosts.
-          if (decision.publish && panelModel !== undefined && (publisherLease?.holds() ?? true)) {
+          // and their marks flicker on other hosts. The lease follows delivery: a
+          // window whose snapshots stopped reaching the companion (its connection
+          // to the remote dropped) stops renewing it, so another window takes over.
+          if (decision.publish && panelModel !== undefined && (publisherLease?.holds(bridge.delivery) ?? true)) {
             // buildSnapshot reads `panelModel`, which is built from the tree's already
             // hidden-filtered projects — so a session you hid locally is intentionally
             // absent from what we publish to peers too (hiding follows you across your
@@ -1794,6 +1796,8 @@ async function startSessionDeck(
       bridgeCompanionVersion: bridge.companionVersion,
       bridgeVersionSkew: bridge.versionSkew,
       bridgeHosts,
+      bridgeTimingOut: bridge.callsTimingOut,
+      publishUndeliveredSec: undeliveredSec(publisherLease?.peek() ?? "mine", bridge.delivery, Date.now()),
       cursorEnumAvailable: bridge.cursorEnumAvailable,
       cursorEnumCount: bridge.cursorEnumSessions.length,
       cursorEnumGen: bridge.cursorEnumGen,
