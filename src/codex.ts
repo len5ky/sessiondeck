@@ -12,11 +12,11 @@
 //
 // Note: ~/.codex/session_index.jsonl exists but is a single stale row without a
 // cwd — it does not index sessions usefully, so we walk the (bounded) tree.
-import { openSync, readSync, closeSync, readdirSync, statSync, fstatSync } from "node:fs";
-import { join } from "node:path";
+import { openSync, readSync, closeSync, readdirSync, statSync, fstatSync, readFileSync, existsSync } from "node:fs";
+import { join, basename, dirname } from "node:path";
 import { homedir } from "node:os";
-import { claudeAncestorPid, procCensus, type LiveProc } from "./procs";
-import { recordCodexHealth, pruneCodexHealth } from "./canary";
+import { claudeAncestorPid, procCensus, pidAlive, pidCmdline, type LiveProc } from "./procs";
+import { recordCodexHealth, pruneCodexHealth, recordCopilotHealth, pruneCopilotHealth } from "./canary";
 
 export type CodexProvenance = "interactive" | "exec" | "subagent";
 
@@ -91,7 +91,13 @@ export function matchCodexLauncher(
   return hits.length === 1 ? hits[0].id : undefined;
 }
 
+/** Which CLI wrote the row. Copilot CLI sessions ride the codex lane (same node,
+ *  panel and bridge shapes); only the label, icon, resume command, contextValue
+ *  and bridge `tool` branch on it. */
+export type CodexFamily = "codex" | "copilot";
+
 export interface CodexRow {
+  family: CodexFamily;
   /** The rollout's OWN thread id (`session_meta.payload.id`) — unique per rollout
    *  file. A Codex subagent rollout reuses the PARENT's `session_id` but carries a
    *  distinct `id`, so identity keys on `id`: keying on `session_id` collapses a
@@ -156,6 +162,16 @@ export interface CodexRow {
   rolloutPath: string;
   /** Codex CLI version from the rollout head (`session_meta.cli_version`); "" absent. */
   cliVersion: string;
+  /** Copilot only: a live session whose last structural event is an unanswered
+   *  `permission.requested` (it waits on the user's approval). */
+  attention?: boolean;
+  /** Copilot only: who drives the session, from workspace.yaml `client_name`
+   *  (`github/cli` → "cli", `vscode-agent-host` → "vscode" (VS Code Copilot Chat),
+   *  anything else → "other"). */
+  surface?: "cli" | "vscode" | "other";
+  /** Copilot only: "ask" when a top-level `subagent.selected` picked `vscode-ask`
+   *  (a VS Code Ask chat), else "agent". */
+  mode?: "agent" | "ask";
 }
 
 /** A session is shown when process-matched or active within this window. */
@@ -363,7 +379,7 @@ function metaFor(path: string, mtimeMs: number): CodexMeta | null {
 
 /** Read the last TAIL_BYTES of a file as UTF-8 (whole file when smaller). Returns
  *  null when the file can't be opened/read. Never throws. */
-function readTail(path: string): string | null {
+function readTail(path: string, maxBytes: number = TAIL_BYTES): string | null {
   let fd: number;
   try {
     fd = openSync(path, "r");
@@ -372,7 +388,7 @@ function readTail(path: string): string | null {
   }
   try {
     const size = fstatSync(fd).size;
-    const start = size > TAIL_BYTES ? size - TAIL_BYTES : 0;
+    const start = size > maxBytes ? size - maxBytes : 0;
     const len = size - start;
     if (len <= 0) return "";
     const buf = Buffer.allocUnsafe(len);
@@ -551,6 +567,7 @@ export function codexSessions(windowMs: number = RELEVANT_MS): CodexRow[] {
         ? claudeAncestorPid(pid, claudePids)
         : undefined;
     return {
+      family: "codex",
       id: c.meta.id,
       cwd: c.meta.cwd,
       name,
@@ -577,4 +594,481 @@ export function codexSessions(windowMs: number = RELEVANT_MS): CodexRow[] {
   });
   rows.sort((a, b) => b.updatedMs - a.updatedMs);
   return rows;
+}
+
+// ---- GitHub Copilot CLI (`copilot`) ------------------------------------------
+// Copilot CLI writes one directory per session under
+//   $COPILOT_HOME (default ~/.copilot)/session-state/<uuid>/
+// holding `events.jsonl` (append-only event log), `workspace.yaml` (flat scalars:
+// cwd, name, …) and, while a process has the session open, `inuse.<pid>.lock`
+// (content = pid of the native `copilot` binary; a clean exit removes it, a
+// SIGKILL leaves it stale, so the pid must be checked). Copilot rows ride the
+// codex lane: `copilotSessions()` returns `CodexRow`s with `family: "copilot"`.
+// See docs/CONTRACTS.md "GitHub Copilot CLI sessions".
+
+/** Events that decide status, title and turn boundaries. Everything else
+ *  (`model.*` side-calls, usage records, `session.info`, `system.message`,
+ *  `hook.*`, `subagent.*`, unknown types) is skipped for status. A top-level
+ *  `subagent.selected`/`deselected` (no envelope `agentId`) is a mode switch and
+ *  is read for `mode` only; lines WITH `agentId` are subagent traffic. */
+const COPILOT_STRUCTURAL = new Set([
+  "session.start",
+  "session.resume",
+  "user.message",
+  "assistant.turn_start",
+  "assistant.message",
+  "tool.execution_start",
+  "tool.execution_complete",
+  "permission.requested",
+  "permission.completed",
+  "assistant.turn_end",
+  "session.shutdown",
+]);
+/** Newest session dirs read per scan (by events.jsonl mtime). */
+const COPILOT_MAX_DIRS = 50;
+/** Wider tail windows tried, in order, when the default window holds no
+ *  structural event at all (one huge non-structural line, e.g. a big
+ *  system.message or tool output, filled it). Bounded. */
+const COPILOT_TAIL_RETRY_BYTES = [1024 * 1024, 4 * 1024 * 1024];
+
+/** A top-level mode switch: `subagent.selected` of `vscode-ask` = Ask chat,
+ *  `subagent.deselected` (or another selection) = back to agent. */
+function modeSwitch(e: CopilotEvent): "agent" | "ask" | undefined {
+  if (e.sub) return undefined;
+  if (e.type === "subagent.selected") return str(e.data.agentName) === "vscode-ask" ? "ask" : "agent";
+  if (e.type === "subagent.deselected") return "agent";
+  return undefined;
+}
+
+/** `workspace.yaml` `client_name` → the surface that drives the session. */
+export function copilotSurface(clientName: string): "cli" | "vscode" | "other" {
+  if (clientName === "github/cli") return "cli";
+  if (clientName === "vscode-agent-host") return "vscode";
+  return "other";
+}
+
+/** `$COPILOT_HOME/session-state`, defaulting to `~/.copilot/session-state`. */
+export function copilotRoot(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
+  const base = env.COPILOT_HOME !== undefined && env.COPILOT_HOME !== "" ? env.COPILOT_HOME : join(home, ".copilot");
+  return join(base, "session-state");
+}
+
+function yamlScalar(raw: string): string | null {
+  const v = raw.trim();
+  if (v.startsWith("'")) {
+    if (v.length < 2 || !v.endsWith("'")) return null;
+    const inner = v.slice(1, -1);
+    // A lone quote inside a single-quoted scalar is malformed; '' is the escape.
+    if (inner.replace(/''/g, "").includes("'")) return null;
+    return inner.replace(/''/g, "'");
+  }
+  if (v.startsWith('"')) {
+    try {
+      const out = JSON.parse(v) as unknown;
+      return typeof out === "string" ? out : null;
+    } catch {
+      return null;
+    }
+  }
+  return v;
+}
+
+/** Flat `key: value` reader for `workspace.yaml` (every key Copilot writes is a
+ *  scalar). Handles plain, single-quoted (`''` escape) and double-quoted scalars,
+ *  quoted scalars folded over indented continuation lines, and `|`/`>` blocks.
+ *  Unknown keys are kept, the caller picks what it needs. null when nothing parses
+ *  or a quoted scalar is malformed (the canary's parse-health datum). */
+export function readWorkspaceYaml(text: string): Record<string, string> | null {
+  const out = Object.create(null) as Record<string, string>;
+  const lines = text.split(/\r?\n/);
+  let keys = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^([A-Za-z_][A-Za-z0-9_]*):(?:[ \t]+(.*))?$/.exec(lines[i]);
+    if (m === null) continue;
+    let raw = m[2] ?? "";
+    const block = /^[|>][-+]?$/.test(raw.trim()) ? raw.trim()[0] : undefined;
+    const quoted = raw.startsWith("'") || raw.startsWith('"');
+    if (block !== undefined || quoted) {
+      const more: string[] = [];
+      while (i + 1 < lines.length && /^[ \t]+\S/.test(lines[i + 1])) more.push(lines[++i].trim());
+      if (block !== undefined) {
+        out[m[1]] = more.join(block === "|" ? "\n" : " ");
+        keys++;
+        continue;
+      }
+      if (more.length > 0) raw = [raw, ...more].join(" ");
+    }
+    const v = yamlScalar(raw);
+    if (v === null) return null;
+    out[m[1]] = v;
+    keys++;
+  }
+  return keys > 0 ? out : null;
+}
+
+interface CopilotEvent {
+  type: string;
+  data: Record<string, unknown>;
+  /** Envelope `agentId`: the line belongs to an inline subagent. */
+  sub: boolean;
+}
+
+function copilotEvent(line: string): CopilotEvent | null {
+  if (line.trim() === "") return null;
+  let obj: { type?: unknown; data?: unknown; agentId?: unknown };
+  try {
+    obj = JSON.parse(line) as { type?: unknown; data?: unknown; agentId?: unknown };
+  } catch {
+    return null; // a cut first/last line of a byte window, or noise
+  }
+  if (typeof obj.type !== "string") return null;
+  const data = typeof obj.data === "object" && obj.data !== null ? (obj.data as Record<string, unknown>) : {};
+  return { type: obj.type, data, sub: typeof obj.agentId === "string" && obj.agentId !== "" };
+}
+
+/** Model: the latest of `session.start.data.selectedModel`,
+ *  `session.model_change.data.newModel` and `session.auto_mode_resolved.data.chosenModel`
+ *  in file order wins. An explicit switch after an Auto resolution shows the explicit
+ *  model; a switch back to "auto" shows "auto" until the next resolution. Fed in one
+ *  pass alongside the status scan; subagent lines and `model.*` side-calls never count. */
+class CopilotModel {
+  private latest = "";
+  see(e: CopilotEvent): void {
+    if (e.sub) return;
+    const m =
+      e.type === "session.start"
+        ? str(e.data.selectedModel)
+        : e.type === "session.model_change"
+          ? str(e.data.newModel)
+          : e.type === "session.auto_mode_resolved"
+            ? str(e.data.chosenModel)
+            : "";
+    if (m !== "") this.latest = m;
+  }
+  get value(): string {
+    return this.latest;
+  }
+}
+
+export interface CopilotHead {
+  /** `session.start.data.sessionId`. */
+  sessionId: string;
+  /** `session.start.data.context.cwd` ("" absent; workspace.yaml `cwd` wins). */
+  cwd: string;
+  /** `session.start.data.copilotVersion` ("" absent). */
+  cliVersion: string;
+  /** Model resolved from the head events ("" none). */
+  model: string;
+  /** `session.start.data.startTime` in ms (0 absent). */
+  startedMs: number;
+  /** First non-subagent `user.message` content, snippeted ("" none). */
+  snippet: string;
+  /** Last top-level mode switch in the head window, if any. */
+  mode?: "agent" | "ask";
+}
+
+/** Parse the head of `events.jsonl` (the first {@link HEAD_BYTES}). The first line
+ *  must be `session.start`; the ~24 KB `system.message` comes after the first
+ *  `user.message`, so the window reaches it. null without a `session.start`. */
+export function parseCopilotHead(text: string): CopilotHead | null {
+  const lines = text.split("\n");
+  if (lines.length > 1 && !text.endsWith("\n")) lines.pop(); // partial last line
+  let head: CopilotHead | null = null;
+  const model = new CopilotModel();
+  for (const line of lines) {
+    const e = copilotEvent(line);
+    if (e === null) continue;
+    model.see(e);
+    const sw = modeSwitch(e);
+    if (sw !== undefined && head !== null) head.mode = sw;
+    if (head === null) {
+      if (e.type !== "session.start" || e.sub) continue;
+      const ctx = typeof e.data.context === "object" && e.data.context !== null ? (e.data.context as Record<string, unknown>) : {};
+      const sessionId = str(e.data.sessionId);
+      if (sessionId === "") return null;
+      head = {
+        sessionId,
+        cwd: str(ctx.cwd),
+        cliVersion: str(e.data.copilotVersion),
+        model: "",
+        startedMs: Date.parse(str(e.data.startTime)) || 0,
+        snippet: "",
+      };
+    } else if (head.snippet === "" && e.type === "user.message" && !e.sub) {
+      head.snippet = snippetOf(str(e.data.content));
+    }
+  }
+  if (head === null) return null;
+  head.model = model.value;
+  return head;
+}
+
+export interface CopilotTail {
+  /** Last structural non-subagent event type ("" none in the window). */
+  last: string;
+  /** The last structural event is `assistant.turn_end` or `session.shutdown`. */
+  endedTurn: boolean;
+  /** A turn is open: the last structural event is inside a turn (user prompt,
+   *  assistant message, tool call, permission) with no later turn end/shutdown. */
+  openTurn: boolean;
+  /** A turn is open and some `permission.requested` in it has no matching
+   *  `permission.completed` (by `requestId`). Only meaningful for a live session. */
+  permissionPending: boolean;
+  /** A `session.resume` is in the window. */
+  resumed: boolean;
+  /** Final non-empty assistant message of the last finished turn (done caption). */
+  lastAgentMessage?: string;
+  /** Model resolved from the tail ("" none in the window). */
+  model: string;
+  /** Last top-level mode switch in the window, if any. */
+  mode?: "agent" | "ask";
+}
+
+/** Scan a tail window of `events.jsonl` (structural events only, subagent lines
+ *  ignored). Pure; never throws. */
+export function copilotTailInfo(text: string): CopilotTail {
+  const model = new CopilotModel();
+  let last = "";
+  // Approvals still waiting: concurrent tool calls raise several requests and
+  // answer them one by one, so one completion must not clear the others.
+  const pending = new Set<string>();
+  let resumed = false;
+  let message: string | undefined;
+  let mode: "agent" | "ask" | undefined;
+  for (const line of text.split("\n")) {
+    const e = copilotEvent(line);
+    if (e === null) continue;
+    model.see(e);
+    mode = modeSwitch(e) ?? mode;
+    if (e.sub || !COPILOT_STRUCTURAL.has(e.type)) continue;
+    last = e.type;
+    if (e.type === "session.resume") resumed = true;
+    if (e.type === "user.message") message = undefined;
+    if (e.type === "assistant.message") {
+      const c = str(e.data.content);
+      if (c.trim() !== "") message = c;
+    }
+    if (e.type === "permission.requested") pending.add(str(e.data.requestId));
+    else if (e.type === "permission.completed") pending.delete(str(e.data.requestId));
+    else if (e.type === "assistant.turn_end" || e.type === "session.shutdown" || e.type === "session.resume") pending.clear();
+  }
+  const endedTurn = last === "assistant.turn_end" || last === "session.shutdown";
+  const openTurn = last !== "" && !endedTurn && last !== "session.start" && last !== "session.resume";
+  return {
+    last,
+    endedTurn,
+    openTurn,
+    permissionPending: openTurn && pending.size > 0,
+    resumed,
+    lastAgentMessage: endedTurn ? message : undefined,
+    model: model.value,
+    ...(mode !== undefined ? { mode } : {}),
+  };
+}
+
+/** Is `pid` a running Copilot process? Signal-0 liveness, plus (Linux) the
+ *  cmdline must name `copilot`, so a stale lock whose pid was reused by an
+ *  unrelated process does not read as live. */
+export function copilotPidAlive(pid: number): boolean {
+  if (!pidAlive(pid)) return false;
+  const argv = pidCmdline(pid);
+  if (argv === undefined) return true; // non-Linux / unreadable: signal-0 decides
+  // The lock names the native binary (`…/@github/copilot-<platform>/copilot`, or a
+  // standalone `copilot`); a node-run loader carries the package path as argv[1].
+  // VS Code's Copilot Chat locks with its agent host's `copilot-runtime`.
+  const exe = basename(argv[0] ?? "");
+  return exe === "copilot" || exe === "copilot-runtime" || /[\\/]@github[\\/]copilot[\\/]/.test(argv[1] ?? "");
+}
+
+/** Does the Copilot process `pid` hold this session (its `inuse.<pid>.lock`
+ *  beside `eventsPath`)? A clean exit removes the lock. */
+export function copilotHoldsLock(pid: number, eventsPath: string): boolean {
+  return existsSync(join(dirname(eventsPath), `inuse.${pid}.lock`));
+}
+
+/** The live pid holding a session dir (`inuse.<pid>.lock`), or undefined when no
+ *  lock exists or every lock's pid is dead (stale lock after a SIGKILL). */
+export function copilotLockPid(dir: string, isAlive: (pid: number) => boolean = copilotPidAlive): number | undefined {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return undefined;
+  }
+  for (const f of entries) {
+    const m = /^inuse\.(\d+)\.lock$/.exec(f);
+    if (m === null) continue;
+    const pid = Number(m[1]);
+    if (Number.isSafeInteger(pid) && pid > 1 && isAlive(pid)) return pid;
+  }
+  return undefined;
+}
+
+function readHeadText(path: string): string | null {
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch {
+    return null;
+  }
+  try {
+    const buf = Buffer.allocUnsafe(HEAD_BYTES);
+    const n = readSync(fd, buf, 0, HEAD_BYTES, 0);
+    return buf.toString("utf8", 0, n);
+  } catch {
+    return null;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+interface CopilotParsed {
+  head: CopilotHead | null;
+  yaml: Record<string, string> | null;
+  yamlPresent: boolean;
+  tail: CopilotTail;
+}
+
+const copilotCache = new Map<string, { key: string; parsed: CopilotParsed }>();
+
+function copilotParsed(dir: string, events: string, mtimeMs: number, size: number): CopilotParsed {
+  // workspace.yaml is rewritten on its own (a generated title lands after the
+  // last event), so its mtime is part of the cache key.
+  let yamlMtime = -1;
+  try {
+    yamlMtime = statSync(join(dir, "workspace.yaml")).mtimeMs;
+  } catch {
+    yamlMtime = -1;
+  }
+  const key = `${mtimeMs}:${size}:${yamlMtime}`;
+  const hit = copilotCache.get(dir);
+  if (hit !== undefined && hit.key === key) return hit.parsed;
+  const headText = readHeadText(events);
+  const head = headText === null ? null : parseCopilotHead(headText);
+  let yamlText: string | null = null;
+  try {
+    yamlText = readFileSync(join(dir, "workspace.yaml"), "utf8");
+  } catch {
+    yamlText = null;
+  }
+  const yaml = yamlText === null ? null : readWorkspaceYaml(yamlText);
+  let tail = copilotTailInfo(readTail(events) ?? "");
+  let covered = TAIL_BYTES;
+  for (const bytes of COPILOT_TAIL_RETRY_BYTES) {
+    if (tail.last !== "" || size <= covered) break; // found one, or the window already held the whole file
+    tail = copilotTailInfo(readTail(events, bytes) ?? "");
+    covered = bytes;
+  }
+  // Still nothing structural in the widest window: one giant line fills the end
+  // of the log. A turn end or shutdown would follow it as a short line, so the
+  // turn is open.
+  if (tail.last === "" && size > covered) tail = { ...tail, openTurn: true };
+  const parsed: CopilotParsed = { head, yaml, yamlPresent: yamlText !== null, tail };
+  copilotCache.set(dir, { key, parsed });
+  if (copilotCache.size > 500) copilotCache.clear();
+  return parsed;
+}
+
+export interface CopilotScanOptions {
+  /** session-state directory (default {@link copilotRoot}). */
+  root?: string;
+  /** Clock in ms (tests). */
+  now?: number;
+  /** Pid liveness (tests). */
+  isAlive?: (pid: number) => boolean;
+  /** Live claude pids for the subagent fold (tests; default the /proc census). */
+  claudePids?: Set<number>;
+}
+
+/** Copilot CLI sessions as codex-lane rows (`family: "copilot"`): a session dir
+ *  is read when its `events.jsonl` changed within `windowMs` or a live process
+ *  holds its lock; the newest {@link COPILOT_MAX_DIRS} dirs only. */
+export function copilotSessions(windowMs: number = RELEVANT_MS, opts: CopilotScanOptions = {}): CodexRow[] {
+  const root = opts.root ?? copilotRoot();
+  const now = opts.now ?? Date.now();
+  const isAlive = opts.isAlive ?? copilotPidAlive;
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch {
+    pruneCopilotHealth(new Set());
+    return [];
+  }
+  const dirs: Array<{ id: string; dir: string; events: string; mtimeMs: number; size: number }> = [];
+  for (const id of names) {
+    const dir = join(root, id);
+    const events = join(dir, "events.jsonl");
+    let mtimeMs: number;
+    let size: number;
+    try {
+      const st = statSync(events);
+      mtimeMs = st.mtimeMs;
+      size = st.size;
+    } catch {
+      continue; // no events.jsonl: never a session we can show
+    }
+    dirs.push({ id, dir, events, mtimeMs, size });
+  }
+  dirs.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const scanned = new Set<string>();
+  const rows: CodexRow[] = [];
+  let claudePids = opts.claudePids;
+  for (const d of dirs.slice(0, COPILOT_MAX_DIRS)) {
+    const pid = copilotLockPid(d.dir, isAlive);
+    const live = pid !== undefined;
+    if (!live && !(now - d.mtimeMs < windowMs)) continue;
+    scanned.add(d.dir);
+    const p = copilotParsed(d.dir, d.events, d.mtimeMs, d.size);
+    // Parse health (canary): a session.start must lead the log, its sessionId
+    // must name the dir, and a present workspace.yaml must parse.
+    const healthy = p.head !== null && p.head.sessionId === d.id && (!p.yamlPresent || p.yaml !== null);
+    recordCopilotHealth(d.dir, healthy, p.head !== null && p.head.cliVersion !== "" ? p.head.cliVersion : undefined);
+    if (p.head === null || p.head.sessionId !== d.id) continue;
+    const cwd = p.yaml?.cwd || p.head.cwd;
+    if (cwd === "") continue;
+    const surface = copilotSurface(yamlStr(p.yaml, "client_name"));
+    const yamlName = p.yaml?.name ?? "";
+    const name = yamlName.trim() !== "" ? snippetOf(yamlName) : p.head.snippet !== "" ? p.head.snippet : "copilot";
+    const ageSec = Math.max(0, (now - d.mtimeMs) / 1000);
+    // Mid-turn and live is working; a fresh write (< WORKING_MS) mid-turn counts too
+    // (the codex rule), so a long tool call between two writes still reads working.
+    const working = p.tail.openTurn && (live || ageSec * 1000 < WORKING_MS);
+    if (pid !== undefined && claudePids === undefined) claudePids = new Set(procCensus().claude.map((c) => c.pid));
+    const parentClaudePid = pid !== undefined && claudePids !== undefined && claudePids.size > 0 ? claudeAncestorPid(pid, claudePids) : undefined;
+    rows.push({
+      family: "copilot",
+      id: d.id,
+      cwd,
+      name,
+      kind: surface === "vscode" ? "Copilot (VS Code)" : surface === "cli" ? "Copilot CLI" : "Copilot",
+      parentId: "",
+      subagentRole: "",
+      provenance: parentClaudePid !== undefined ? "subagent" : "interactive",
+      external: false,
+      live,
+      parentClaudePid,
+      originator: yamlStr(p.yaml, "client_name"),
+      modelProvider: "github",
+      model: p.tail.model || p.head.model,
+      ageSec,
+      updatedMs: d.mtimeMs,
+      startedMs: p.head.startedMs,
+      status: working ? "working" : "idle",
+      endedTurn: p.tail.endedTurn,
+      lastAgentMessage: p.tail.lastAgentMessage,
+      pid,
+      rolloutPath: d.events,
+      cliVersion: p.head.cliVersion,
+      attention: live && p.tail.permissionPending,
+      surface,
+      mode: p.tail.mode ?? p.head.mode ?? "agent",
+    });
+  }
+  pruneCopilotHealth(scanned);
+  rows.sort((a, b) => b.updatedMs - a.updatedMs);
+  return rows;
+}
+
+function yamlStr(y: Record<string, string> | null, key: string): string {
+  return y !== null && typeof y[key] === "string" ? y[key] : "";
 }

@@ -23,6 +23,8 @@
 // no per-tick disk work (verified on the perf bench: quiet-tick counters unchanged).
 // It is testable under bun like triage.ts / alerts.ts / capability.ts.
 
+import { join } from "node:path";
+
 /** ≥2 affected files/sessions before an alarm — a single corrupt file is noise. */
 const DRIFT_MIN = 2;
 
@@ -40,8 +42,10 @@ export const KNOWN_CODEX_VERSION_CEILING = "0.142.5";
 /** Cursor chat `meta.json` `schemaVersion` (an integer; store.db meta['0'] carries
  *  no version of its own — verified: its keys are agentId/name/mode/…). */
 export const KNOWN_CURSOR_SCHEMA_CEILING = "1";
+/** Copilot CLI `events.jsonl` `session.start.data.copilotVersion`. */
+export const COPILOT_CLI_CEILING = "1.0.98";
 
-export type Harness = "claude" | "codex" | "cursor" | "titles";
+export type Harness = "claude" | "codex" | "copilot" | "cursor" | "titles";
 
 export interface HarnessReport {
   harness: Harness;
@@ -64,6 +68,7 @@ export interface HarnessReport {
 export interface FormatHealthReport {
   claude: HarnessReport;
   codex: HarnessReport;
+  copilot: HarnessReport;
   cursor: HarnessReport;
   titles: HarnessReport;
 }
@@ -115,6 +120,8 @@ export function compareVersions(a: string, b: string): number {
 export interface CanaryState {
   claude: Map<string, boolean>;
   codex: Map<string, boolean>;
+  /** Copilot CLI session dirs (key = the dir path). */
+  copilot: Map<string, boolean>;
   cursor: Map<string, boolean>;
   /** Editor title DBs the last local scan actually queried (cache misses only). */
   titleAttempted: number;
@@ -122,6 +129,7 @@ export interface CanaryState {
   titleFailed: number;
   claudeVersion?: string;
   codexVersion?: string;
+  copilotVersion?: string;
   cursorSchema?: string;
   /** Hook-payload shape canary. A ring of the last HOOK_WINDOW consumed events:
    *  `ok` = all required consumer fields present; `legacy` = healthy but written by
@@ -136,9 +144,15 @@ function emptyState(): CanaryState {
   return {
     claude: new Map(),
     codex: new Map(),
+    copilot: new Map(),
     cursor: new Map(),
     titleAttempted: 0,
     titleFailed: 0,
+    // Explicit, so resetCanary()'s Object.assign clears a version seen earlier.
+    claudeVersion: undefined,
+    codexVersion: undefined,
+    copilotVersion: undefined,
+    cursorSchema: undefined,
     hookRing: [],
     hookConsumed: 0,
   };
@@ -197,6 +211,15 @@ export function recordCodexHealth(path: string, healthy: boolean, cliVersion?: s
   if (cliVersion !== undefined) state.codexVersion = maxVersion(state.codexVersion, cliVersion);
 }
 
+/** A recent Copilot CLI session dir: healthy ⟺ `events.jsonl` opens with a
+ *  `session.start` whose `sessionId` names the dir, and a present `workspace.yaml`
+ *  parses. `cliVersion` is `session.start.data.copilotVersion`. */
+export function recordCopilotHealth(dir: string, healthy: boolean, cliVersion?: string): void {
+  state.copilot.set(dir, healthy);
+  cap(state.copilot);
+  if (cliVersion !== undefined) state.copilotVersion = maxVersion(state.copilotVersion, cliVersion);
+}
+
 /** A Cursor chat whose store.db was successfully queried (engine present): healthy ⟺
  *  meta['0'] decoded into JSON. Only call when the query itself succeeded — a null
  *  read (no engine / busy db) is not a drift signal and must NOT be recorded. */
@@ -253,6 +276,11 @@ export function pruneCodexHealth(livePaths: Set<string>): void {
   for (const p of state.codex.keys()) if (!livePaths.has(p)) state.codex.delete(p);
 }
 
+/** Drop copilot health entries for session dirs not read this tick. */
+export function pruneCopilotHealth(liveDirs: Set<string>): void {
+  for (const p of state.copilot.keys()) if (!liveDirs.has(p)) state.copilot.delete(p);
+}
+
 /** Test-only: wipe all accumulated state so a suite starts clean. */
 export function resetCanary(): void {
   Object.assign(state, emptyState());
@@ -307,6 +335,7 @@ export function evaluate(s: CanaryState, enginePresent: boolean): FormatHealthRe
   return {
     claude: versionedReport("claude", "Claude transcript", s.claude, KNOWN_CLAUDE_VERSION_CEILING, s.claudeVersion),
     codex: versionedReport("codex", "Codex rollout", s.codex, KNOWN_CODEX_VERSION_CEILING, s.codexVersion),
+    copilot: versionedReport("copilot", "Copilot CLI session", s.copilot, COPILOT_CLI_CEILING, s.copilotVersion),
     cursor: versionedReport("cursor", "Cursor store", s.cursor, KNOWN_CURSOR_SCHEMA_CEILING, s.cursorSchema),
     titles: titlesReport(s, enginePresent),
   };
@@ -346,7 +375,7 @@ export function hooksHealth(): HooksReport {
  *  undefined when every parser is healthy. Ceiling-exceeded alone is NOT drift —
  *  a new version is not a broken parser — so it never selects a harness here. */
 export function driftHarness(r: FormatHealthReport): string | undefined {
-  for (const h of [r.claude, r.codex, r.cursor, r.titles]) if (h.driftSuspected) return h.label;
+  for (const h of [r.claude, r.codex, r.copilot, r.cursor, r.titles]) if (h.driftSuspected) return h.label;
   return undefined;
 }
 
@@ -373,7 +402,7 @@ export function driftHarness(r: FormatHealthReport): string | undefined {
 // surface retains no per-file sample and is not capturable.
 
 /** The three harnesses whose drift produces a capturable file slice. */
-export type CaptureHarness = "claude" | "codex" | "cursor";
+export type CaptureHarness = "claude" | "codex" | "copilot" | "cursor";
 
 /** Runtime identity used only to REFUSE a slice that still leaks it (never to edit
  *  the slice — anonymization already destroyed content; this is the backstop grep). */
@@ -394,6 +423,11 @@ export function affectedSources(h: CaptureHarness): string[] {
   const out: string[] = [];
   if (h === "codex") {
     for (const [path, ok] of state.codex) if (!ok) out.push(path);
+    return out;
+  }
+  if (h === "copilot") {
+    // Copilot keys are session dirs; the slice comes from their event log.
+    for (const [dir, ok] of state.copilot) if (!ok) out.push(join(dir, "events.jsonl"));
     return out;
   }
   const health = h === "claude" ? state.claude : state.cursor;
@@ -458,7 +492,7 @@ export function extractCursorSlice(rawValue: string): string | null {
  *  is nothing to slice. */
 export function extractSlice(harness: CaptureHarness, rawText: string): string | null {
   if (harness === "cursor") return extractCursorSlice(rawText);
-  const slice = harness === "codex" ? codexSlice(rawText) : jsonlTail(rawText, SLICE_LINES);
+  const slice = harness === "codex" || harness === "copilot" ? codexSlice(rawText) : jsonlTail(rawText, SLICE_LINES);
   return slice === "" ? null : slice;
 }
 
@@ -508,9 +542,16 @@ const STRUCT_KEYS = new Set([
   "cwd", "source", "originator", "timestamp", "git", "branch", "base_instructions",
 ]);
 
+/** Copilot CLI event-envelope keys, kept by name for that harness only. */
+const COPILOT_STRUCT_KEYS = new Set(["data", "context", "sessionId", "agentId", "requestId", "copilotVersion"]);
+
+function isStructKey(harness: CaptureHarness, key: string): boolean {
+  return STRUCT_KEYS.has(key) || (harness === "copilot" && COPILOT_STRUCT_KEYS.has(key));
+}
+
 /** Allowlisted key → the value-domain its kept value must match. `source`/`originator`
  *  are deliberately ABSENT (name kept for shape, value never). */
-type KeepDomain = "enum" | "version" | "name";
+type KeepDomain = "enum" | "event" | "version" | "name";
 const KEEP_DOMAINS: Record<string, KeepDomain> = {
   type: "enum",
   role: "enum",
@@ -528,7 +569,10 @@ const KEEP_DOMAINS: Record<string, KeepDomain> = {
 /** The value-domain in force for a key on this harness — or undefined (value destroyed).
  *  Cursor's `name` is a free-text chat title, so it is forced off-domain. */
 function keepDomainFor(harness: CaptureHarness, key: string): KeepDomain | undefined {
-  if (harness === "cursor" && key === "name") return undefined;
+  if ((harness === "cursor" || harness === "copilot") && key === "name") return undefined;
+  // Copilot event types are dotted (`assistant.turn_end`); its version is copilotVersion.
+  if (harness === "copilot" && key === "type") return "event";
+  if (harness === "copilot" && key === "copilotVersion") return "version";
   return KEEP_DOMAINS[key];
 }
 
@@ -545,8 +589,11 @@ const VERSION_RE = /^[0-9]+(\.[0-9]+){0,3}(-[0-9a-z.]+)?$/i;
 const NAME_RE = /^[A-Za-z][\w.-]{0,63}$/;
 const MCP_NAME_RE = /^mcp__[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*__[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*$/;
 
+const EVENT_TOKEN_RE = /^[a-z][a-z0-9_]{0,31}(\.[a-z][a-z0-9_]{0,31}){0,3}$/;
+
 function valueInDomain(domain: KeepDomain, v: string): boolean {
   if (domain === "enum") return ENUM_TOKEN_RE.test(v);
+  if (domain === "event") return EVENT_TOKEN_RE.test(v);
   if (domain === "version") return VERSION_RE.test(v);
   // name
   if (!NAME_RE.test(v)) return false;
@@ -570,7 +617,7 @@ function isIdKey(key: string): boolean {
  *  decisions); `outKey` is the placeholder used when the value is destroyed — a STRUCT
  *  name or a positional `kN`, so the RAW key is never echoed into a value slot. */
 function anonString(harness: CaptureHarness, origKey: string | null, outKey: string | null, value: string): string {
-  if (origKey !== null && STRUCT_KEYS.has(origKey)) {
+  if (origKey !== null && isStructKey(harness, origKey)) {
     const domain = keepDomainFor(harness, origKey);
     if (domain !== undefined && valueInDomain(domain, value)) return value; // structural + shape-valid
     // fell through: a structural key whose value is free text / off-domain → destroy it.
@@ -592,7 +639,7 @@ function anonValue(harness: CaptureHarness, origKey: string | null, outKey: stri
       // resets per object, so k1 in one record is unrelated to k1 in another — the token
       // marks POSITION within its object, not a stable identity across records. The key
       // is never used as a value.
-      const ok = STRUCT_KEYS.has(k) ? k : `k${++ki}`;
+      const ok = isStructKey(harness, k) ? k : `k${++ki}`;
       out[ok] = anonValue(harness, k, ok, v);
     }
     return out;
@@ -705,7 +752,13 @@ export function personalDataLeak(text: string, ctx: CaptureIdentity): string | u
  *  names in test/fixtures/; a second+ file of the same harness gets an index suffix. */
 export function fixtureName(harness: CaptureHarness, index = 0): string {
   const base =
-    harness === "claude" ? "claude-transcript" : harness === "codex" ? "codex-rollout" : "cursor-store-meta0";
+    harness === "claude"
+      ? "claude-transcript"
+      : harness === "codex"
+        ? "codex-rollout"
+        : harness === "copilot"
+          ? "copilot-events"
+          : "cursor-store-meta0";
   const ext = harness === "cursor" ? "json" : "jsonl";
   return index === 0 ? `${base}.${ext}` : `${base}-${index + 1}.${ext}`;
 }

@@ -11,3 +11,6 @@
 *.woff binary
 *.woff2 binary
 *.vsix binary
+
+# Verbatim /proc files (NUL-separated cmdline): recorded bytes, never normalized.
+test/fixtures/proctable/linux-proc/** binary

@@ -24,6 +24,8 @@ import {
 import {
   claimActiveSince,
   codexHomeOf,
+  copilotHomeOf,
+  copilotHoldsLock,
   focusLocalTerminal,
   identitySources,
   moveClaimIdentity,
@@ -61,7 +63,7 @@ import {
 import { TitleSource } from "./titles";
 import { TokenScanner } from "./discovery";
 import { cursorSessions, CursorEventTail, ComposerTracker } from "./cursor";
-import { codexSessions } from "./codex";
+import { codexSessions, copilotSessions } from "./codex";
 import { fmtAge, snapshot, hotWatchTargets, watchEventDirty, ReuseHint, WatchTarget, registryStatus, registryStartEntries, setDiscoveryLog } from "./discovery";
 import {
   sanitizeReason,
@@ -494,6 +496,8 @@ async function startSessionDeck(
     vscode.workspace.getConfiguration("sessionDeck").get<boolean>("showCursorAgents", true);
   const showCodexAgents = (): boolean =>
     vscode.workspace.getConfiguration("sessionDeck").get<boolean>("showCodexAgents", true);
+  const showCopilotAgents = (): boolean =>
+    vscode.workspace.getConfiguration("sessionDeck").get<boolean>("showCopilotAgents", true);
   const showCursorComposer = (): boolean =>
     vscode.workspace.getConfiguration("sessionDeck").get<boolean>("showCursorComposer", true);
   const composerTracker = new ComposerTracker();
@@ -542,7 +546,8 @@ async function startSessionDeck(
     (labels) => decorations.syncLabels(labels),
     () => vscode.workspace.getConfiguration("sessionDeck").get<boolean>("activityTree", false),
     () => (showCursorAgents() ? cursorSessions() : []),
-    () => (showCodexAgents() ? codexSessions() : []),
+    // Copilot CLI sessions ride the codex lane (CodexRow family "copilot").
+    () => [...(showCodexAgents() ? codexSessions() : []), ...(showCopilotAgents() ? copilotSessions() : [])],
     () => {
       composerTracker.ingest(cursorTail.readNew());
       return showCursorComposer() ? composerTracker.rows() : [];
@@ -1353,7 +1358,8 @@ async function startSessionDeck(
         return cursorCodexReport(await vscode.commands.executeCommand<unknown>("sessionDeck.openCursor", node));
       }
       const node = provider.findCodex(a.sessionId);
-      if (node === undefined) return { outcome: "not-found" };
+      // A codex-lane row answers only to its own family's tool.
+      if (node === undefined || node.row.family !== a.tool) return { outcome: "not-found" };
       return cursorCodexReport(await vscode.commands.executeCommand<unknown>("sessionDeck.openCodex", node));
     } catch (err) {
       return { outcome: "failed", detail: err instanceof Error ? err.message : String(err) };
@@ -1882,6 +1888,7 @@ async function startSessionDeck(
     const order = [
       ["claude", fh.claude],
       ["codex", fh.codex],
+      ["copilot", fh.copilot],
       ["cursor", fh.cursor],
     ] as const;
     const drifted = order.find(([, r]) => r.driftSuspected);
@@ -1972,6 +1979,7 @@ async function startSessionDeck(
     "layout",
     "showCursorAgents",
     "showCodexAgents",
+    "showCopilotAgents",
     "floatAlwaysOnTop",
     "editorCliPath",
     "cursorCliPath",
@@ -2062,7 +2070,8 @@ async function startSessionDeck(
       if (e.affectsConfiguration("sessionDeck.extraConfigDirs")) scheduleRefresh("config");
       if (
         e.affectsConfiguration("sessionDeck.showCursorAgents") ||
-        e.affectsConfiguration("sessionDeck.showCodexAgents")
+        e.affectsConfiguration("sessionDeck.showCodexAgents") ||
+        e.affectsConfiguration("sessionDeck.showCopilotAgents")
       ) {
         provider.forceReload();
         if (overviewPanel.isOpen()) overviewPanel.update(buildPanelModel());
@@ -2395,15 +2404,21 @@ async function startSessionDeck(
       const loc = provider.codexLocationOf(row);
       const where = place(loc, false);
       if (where === undefined || row.pid === undefined) return undefined;
-      // The census matched this pid to the rollout by cwd; confirm it is still a
-      // codex process before offering to stop it.
-      if (basename(pidCmdline(row.pid)?.[0] ?? "") !== "codex") return undefined;
-      // Uncached: the process may have closed this session's file since it was listed.
-      if (!pidHasOpen(row.pid, row.rolloutPath, true)) return undefined;
+      const copilot = row.family === "copilot";
+      // A VS Code Copilot Chat session is neither moved (no terminal resume, no
+      // way to reopen that chat by id) nor stopped: its lock names VS Code's
+      // shared agent-host runtime, which runs every chat of that window.
+      if (row.surface === "vscode") return undefined;
+      // The census matched this pid to the rollout by cwd (Copilot: the session's
+      // lock names it); confirm it is still that CLI's process before offering to stop it.
+      if (basename(pidCmdline(row.pid)?.[0] ?? "") !== row.family) return undefined;
+      // Uncached: the process may have closed this session since it was listed
+      // (Copilot removes its inuse.<pid>.lock on exit).
+      if (copilot ? !copilotHoldsLock(row.pid, row.rolloutPath) : !pidHasOpen(row.pid, row.rolloutPath, true)) return undefined;
       const pid = row.pid;
       const protectedPid = pid <= 1 || pid === process.pid || pid === process.ppid;
       return {
-        tool: "codex",
+        tool: row.family,
         id: row.id,
         title: row.name,
         cwd: row.cwd,
@@ -2413,7 +2428,7 @@ async function startSessionDeck(
         working: row.status === "working",
         owner: loc.owner,
         where,
-        codexHome: codexHomeOf(row.rolloutPath),
+        codexHome: copilot ? copilotHomeOf(row.rolloutPath) : codexHomeOf(row.rolloutPath),
       };
     }
     return undefined;
@@ -2515,7 +2530,9 @@ async function startSessionDeck(
   remoteStop = async (a, deadline) => {
     const id = a.id;
     if (id === undefined) return;
-    const node = a.tool === "claude" ? provider.findSession(a.sessionId) : a.tool === "codex" ? provider.findCodex(a.sessionId) : undefined;
+    const found = a.tool === "claude" ? provider.findSession(a.sessionId) : a.tool === "codex" || a.tool === "copilot" ? provider.findCodex(a.sessionId) : undefined;
+    // A codex-lane row answers only to its own family's tool.
+    const node = found?.kind === "codex" && found.row.family !== a.tool ? undefined : found;
     await actOnRemoteStop(deadline, {
       find: () => (node === undefined ? undefined : { pid: node.kind === "session" ? node.row.meta.pid : node.row.pid }),
       subject: () => sessionSubjectOf(node, "stop"),

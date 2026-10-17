@@ -56,12 +56,13 @@ export function terminalStatusKind(working: boolean, unread: boolean): StatusKin
   return "done";
 }
 
-export type AgentFamily = "claude" | "cursor" | "codex";
-export const AGENT_FAMILIES: readonly AgentFamily[] = ["claude", "cursor", "codex"];
+export type AgentFamily = "claude" | "cursor" | "codex" | "copilot";
+export const AGENT_FAMILIES: readonly AgentFamily[] = ["claude", "cursor", "codex", "copilot"];
 export const AGENT_FAMILY_LABELS: Record<AgentFamily, string> = {
   claude: "Claude",
   cursor: "Cursor",
   codex: "Codex",
+  copilot: "Copilot",
 };
 
 /** Short, honest badge fragment naming the family filtering, or undefined when no
@@ -622,7 +623,7 @@ export function outsideSentence(v: { where?: string; owner?: "sdk" | "agent" }):
 
 /** Vendor sessions render a hand-drawn brand mark (an SVG from media/) instead of
  *  a codicon: file Uris in the tree, inline SVG in the webview panel. */
-export type BrandIcon = "cursor" | "codex";
+export type BrandIcon = "cursor" | "codex" | "copilot";
 
 export interface IconVisual {
   icon: string;
@@ -687,9 +688,12 @@ export function composerDescription(row: ComposerRow): string {
   return parts.join(" · ");
 }
 
-/** Codex CLI session icon: the Codex/OpenAI brand mark, spinning while working. */
-export function codexVisual(working: boolean): IconVisual {
-  return { icon: "sparkle", spin: working, brand: "codex" };
+/** Codex-lane session icon: the CLI's brand mark (Codex or Copilot), spinning
+ *  while working. A Copilot session waiting on a permission prompt takes the
+ *  Claude approval visual instead (red bell), so it reads as "needs you". */
+export function codexVisual(working: boolean, family: "codex" | "copilot" = "codex", attention = false): IconVisual {
+  if (attention) return sessionVisual("attention", false);
+  return { icon: "sparkle", spin: working, brand: family };
 }
 
 /** The colored status glyph a terminal (Cursor/Codex) session's HOVER leads with —
@@ -996,6 +1000,10 @@ export interface PanelCursor {
  *  attention — just status, age, kind and unread. */
 export interface PanelCodex {
   id: string;
+  /** Which CLI wrote it (absent = codex, as before). */
+  family?: "copilot";
+  /** Copilot: waiting on a permission prompt (renders as the approval visual). */
+  attention?: boolean;
   /** Runs outside the editor: the row offers Move into Editor (see PanelSession). */
   outside?: boolean;
   /** Free-tier LOCKED placeholder (see PanelSession.locked). */

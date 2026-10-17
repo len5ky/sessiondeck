@@ -41,6 +41,8 @@ export interface TriageCursorLike {
 }
 export interface TriageCodexLike {
   readonly unread: boolean;
+  /** Copilot approval prompt: blocks ON you (tier 1, like a Claude approval). */
+  readonly attention?: boolean;
   readonly dimmed?: boolean;
   readonly row: { readonly id: string; readonly updatedMs: number };
 }
@@ -126,10 +128,10 @@ export function buildTriageSet<
         });
     }
     for (const x of p.codexes) {
-      if (x.unread && !x.dimmed)
+      if ((x.unread || x.attention === true) && !x.dimmed)
         ranked.push({
           target: { id: `codex:${x.row.id}`, node: x },
-          tier: TIER_UNREAD,
+          tier: x.attention === true ? TIER_ATTENTION : TIER_UNREAD,
           onset: x.row.updatedMs,
         });
     }

@@ -911,6 +911,7 @@ export function doctorChecks(p: DoctorProbes): DoctorCheck[] {
     unfocusedAlertsCheck(p),
     formatCheck("Claude transcript format", fh.claude, "sessions degrade to idle/unknown status"),
     formatCheck("Codex rollout format", fh.codex, "affected Codex sessions vanish from the tree"),
+    formatCheck("Copilot CLI session format", fh.copilot, "affected Copilot sessions vanish from the tree"),
     formatCheck("Cursor store format", fh.cursor, "Cursor chats degrade to fallback names"),
     formatCheck("Editor title storage format", fh.titles, "rows fall back to project labels"),
     hooksCanaryCheck(p),
@@ -1070,7 +1071,7 @@ function harnessLine(r: HarnessReport): string {
 }
 
 function canaryBlock(fh: FormatHealthReport): string[] {
-  const rows = [fh.claude, fh.codex, fh.cursor, fh.titles];
+  const rows = [fh.claude, fh.codex, fh.copilot, fh.cursor, fh.titles];
   return [
     "| harness | seen | failed | observed | ceiling |",
     "| --- | --- | --- | --- | --- |",

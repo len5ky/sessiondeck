@@ -191,7 +191,7 @@ export function brandSvg(extensionUri: vscode.Uri, name: string): string {
 function html(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   const n = nonce();
   const codiconUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, "media", "codicon.css"));
-  const brand = { cursor: brandSvg(extensionUri, "cursor"), codex: brandSvg(extensionUri, "codex") };
+  const brand = { cursor: brandSvg(extensionUri, "cursor"), codex: brandSvg(extensionUri, "codex"), copilot: brandSvg(extensionUri, "copilot") };
   const csp = [
     `default-src 'none'`,
     `style-src ${webview.cspSource} 'nonce-${n}'`,

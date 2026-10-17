@@ -12,6 +12,7 @@
 // and injectable, so tests drive them with a virtual clock; the vscode wiring is
 // the thin layer at the bottom.
 import * as vscode from "vscode";
+import { copilotHoldsLock } from "./codex";
 import { accessSync, constants as fsConstants, existsSync, linkSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
@@ -83,7 +84,7 @@ export const CLAUDE_OPEN_COMMAND = "claude-vscode.editor.open";
 
 export type MoveSetting = "auto" | "claudeTab" | "terminal";
 export type MoveTarget = "claudeTab" | "terminal";
-export type MoveTool = "claude" | "codex";
+export type MoveTool = "claude" | "codex" | "copilot";
 
 export function readMoveSetting(raw: unknown): MoveSetting {
   return raw === "claudeTab" || raw === "terminal" ? raw : "auto";
@@ -113,12 +114,12 @@ const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9-]{7,127}$/;
 /** The shell line that resumes a session, or undefined for an unsafe id. */
 export function resumeCommand(tool: MoveTool, id: string): string | undefined {
   if (!SAFE_ID.test(id)) return undefined;
-  return tool === "claude" ? `claude --resume ${id}` : `codex resume ${id}`;
+  return tool === "claude" ? `claude --resume ${id}` : tool === "copilot" ? `copilot --resume=${id}` : `codex resume ${id}`;
 }
 
 /** The arguments after the program that resume a session (id allow-listed). */
 export function resumeArgs(tool: MoveTool, id: string): string[] {
-  return tool === "claude" ? ["--resume", id] : ["resume", id];
+  return tool === "claude" ? ["--resume", id] : tool === "copilot" ? [`--resume=${id}`] : ["resume", id];
 }
 
 /** The exact program that runs a CLI: an absolute executable, plus the leading
@@ -223,12 +224,16 @@ function isNativeCli(tool: MoveTool, exe: string, platform: NodeJS.Platform): bo
   const p = platform === "win32" ? win32 : posix;
   const name = p.basename(exe).toLowerCase().replace(/\.exe$/, "");
   if (tool === "claude") return name === "claude" || /[\\/]claude[\\/]versions[\\/][^\\/]+$/.test(exe);
+  // Copilot's npm package runs `…/@github/copilot-<platform>/copilot`; the
+  // standalone install is `copilot` too.
+  if (tool === "copilot") return name === "copilot";
   return /^codex(-[a-z0-9_]+)*$/.test(name);
 }
 
 /** Is `script` the CLI's npm entry point (Claude Code's cli.js, Codex's bin script)? */
 function isCliEntry(tool: MoveTool, script: string): boolean {
   const n = script.replace(/\\/g, "/").toLowerCase();
+  if (tool === "copilot") return /\/@github\/copilot\/(npm-loader|index)\.m?js$/.test(n);
   return tool === "claude" ? /\/@anthropic-ai\/claude-code\/cli\.m?js$/.test(n) : /\/@openai\/codex\/bin\/codex\.m?js$/.test(n);
 }
 
@@ -324,6 +329,10 @@ const NOT_CARRIED: Record<MoveTool, readonly string[]> = {
     "--profile", "-p", "--config", "-c", "--add-dir", "--sandbox", "-s", "--ask-for-approval", "-a",
     "--full-auto", "--dangerously-bypass-approvals-and-sandbox",
   ],
+  copilot: [
+    "--allow-all-tools", "--allow-all-paths", "--allow-all", "--yolo", "--allow-tool", "--deny-tool", "--add-dir",
+    "--additional-mcp-config", "--disable-mcp-server", "--agent", "--allow-url", "--deny-url", "--allow-all-urls",
+  ],
 };
 
 /** Which of NOT_CARRIED the old process was started with (in order, once each). */
@@ -406,6 +415,20 @@ export function isDefaultClaudeHome(dir: string, home = homedir(), platform: Nod
   return samePath(dir, (platform === "win32" ? win32 : posix).join(home, ".claude"), platform);
 }
 
+export { copilotHoldsLock };
+
+/** The Copilot home a session's events.jsonl belongs to:
+ *  <home>/session-state/<uuid>/events.jsonl. */
+export function copilotHomeOf(eventsPath: string): string | undefined {
+  const state = dirname(dirname(eventsPath));
+  return state.endsWith("/session-state") || state.endsWith("\\session-state") ? dirname(state) : undefined;
+}
+
+/** Is `dir` the default Copilot home (no COPILOT_HOME needed)? */
+export function isDefaultCopilotHome(dir: string, home = homedir(), platform: NodeJS.Platform = process.platform): boolean {
+  return samePath(dir, (platform === "win32" ? win32 : posix).join(home, ".copilot"), platform);
+}
+
 /** Is `dir` the default Codex home (no CODEX_HOME needed)? */
 export function isDefaultCodexHome(dir: string, home = homedir(), platform: NodeJS.Platform = process.platform): boolean {
   return samePath(dir, (platform === "win32" ? win32 : posix).join(home, ".codex"), platform);
@@ -451,9 +474,11 @@ export interface MoveSubject {
   where: string;
   /** Claude config home the session lives in (CLAUDE_CONFIG_DIR for the resume). */
   homeDir?: string;
-  /** Codex home the rollout lives in (CODEX_HOME for the resume). */
+  /** Codex home the rollout lives in (CODEX_HOME for the resume); for Copilot,
+   *  the Copilot home (COPILOT_HOME). */
   codexHome?: string;
-  /** Codex rollout file the process must hold open. */
+  /** Codex rollout file the process must hold open; for Copilot, the session's
+   *  events.jsonl (its directory holds the process's `inuse.<pid>.lock`). */
   rolloutPath?: string;
   /** The program that resumes it (see LaunchSpec); undefined = not found. */
   launch?: LaunchSpec;
@@ -600,6 +625,7 @@ export function recoveryCommand(
   let env: [string, string] | undefined;
   if (s.tool === "claude" && s.homeDir !== undefined && !isDefaultClaudeHome(s.homeDir, homedir(), platform)) env = ["CLAUDE_CONFIG_DIR", s.homeDir];
   if (s.tool === "codex" && s.codexHome !== undefined && !isDefaultCodexHome(s.codexHome, homedir(), platform)) env = ["CODEX_HOME", s.codexHome];
+  if (s.tool === "copilot" && s.codexHome !== undefined && !isDefaultCopilotHome(s.codexHome, homedir(), platform)) env = ["COPILOT_HOME", s.codexHome];
   if (env === undefined) return cmd;
   if (platform === "win32") return `$env:${env[0]} = ${psQuote(env[1])}; ${cmd}`;
   return `${env[0]}=${shellQuote(env[1])} ${cmd}`;
@@ -1424,8 +1450,12 @@ export async function programProblem(s: MoveSubject, src: IdentitySources): Prom
   const facts = await src.program(s.pid);
   if (facts === undefined || facts.start === undefined || facts.start !== s.start) return "SessionDeck could not read which program it runs";
   if (editorProgram(facts.exe === undefined ? undefined : withoutDeleted(facts.exe), src.editorRoots())) return `pid ${s.pid} is part of the editor`;
-  if (!src.isCli(s.tool, facts)) return `pid ${s.pid} is not running ${s.tool === "claude" ? "Claude Code" : "Codex"}`;
+  if (!src.isCli(s.tool, facts)) return `pid ${s.pid} is not running ${toolName(s.tool)}`;
   return undefined;
+}
+
+function toolName(tool: MoveTool): string {
+  return tool === "claude" ? "Claude Code" : tool === "copilot" ? "Copilot" : "Codex";
 }
 
 function protectedPid(pid: number, src: IdentitySources): string | undefined {
@@ -1481,8 +1511,13 @@ export async function identityProblem(s: MoveSubject, src: IdentitySources): Pro
     const prot = protectedPid(s.pid, src);
     if (prot !== undefined) return prot;
     const exe = src.argv0(s.pid);
-    if (exe === undefined || basename(exe) !== "codex") return `pid ${s.pid} is no longer Codex`;
-    if (s.rolloutPath === undefined || !src.codexHolds(s.pid, s.rolloutPath)) return "that Codex process no longer has this session open";
+    if (s.tool === "copilot") {
+      if (exe === undefined || basename(exe) !== "copilot") return `pid ${s.pid} is no longer Copilot`;
+      if (s.rolloutPath === undefined || !copilotHoldsLock(s.pid, s.rolloutPath)) return "that Copilot process no longer has this session open";
+    } else {
+      if (exe === undefined || basename(exe) !== "codex") return `pid ${s.pid} is no longer Codex`;
+      if (s.rolloutPath === undefined || !src.codexHolds(s.pid, s.rolloutPath)) return "that Codex process no longer has this session open";
+    }
   }
   if ((await src.freshStart(s.pid)) !== s.start) return `pid ${s.pid} now belongs to a different process`;
   return programProblem(s, src);
@@ -1708,6 +1743,7 @@ export async function resumeHere(
   // Codex finds a session only in the home it was written to, and that home
   // carries the login: point the resume at it.
   if (s.tool === "codex" && s.codexHome !== undefined) env.CODEX_HOME = s.codexHome;
+  if (s.tool === "copilot" && s.codexHome !== undefined) env.COPILOT_HOME = s.codexHome;
   const name = s.title.length > 40 ? `${s.title.slice(0, 39)}…` : s.title;
   // An editor tab, not the bottom panel. Every later lookup (focus, the ↗ badge,
   // Stop) goes through window.terminals and the shell pid, which hold for
@@ -1778,6 +1814,29 @@ export async function resumedRunning(s: MoveSubject, sinceMs: number): Promise<b
     return false;
   }
   if (s.rolloutPath === undefined) return false;
+  if (s.tool === "copilot") {
+    // Any live lock other than the stopped pid's: the resumed copy holds the session.
+    let names: string[];
+    try {
+      names = readdirSync(dirname(s.rolloutPath));
+    } catch {
+      return false;
+    }
+    // A lock written since the stop, by a live process that is Copilot (a
+    // stale lock whose pid was reused by something else does not count).
+    return names.some((f) => {
+      const m = /^inuse\.(\d+)\.lock$/.exec(f);
+      const pid = m === null ? NaN : Number(m[1]);
+      if (!Number.isInteger(pid) || pid === s.pid || !processRunning(pid, undefined)) return false;
+      try {
+        if (statSync(join(dirname(s.rolloutPath as string), f)).mtimeMs < sinceMs) return false;
+      } catch {
+        return false;
+      }
+      const exe = linuxIdentitySources.argv0(pid);
+      return exe === undefined || basename(exe) === "copilot";
+    });
+  }
   const holder = codexHolderPid(s.rolloutPath);
   return holder !== undefined && holder !== s.pid;
 }
@@ -2011,7 +2070,7 @@ export function readMovedRecords(raw: unknown): MovedRecord[] {
     if (!Number.isInteger(x.pid) || (x.pid as number) <= 1 || typeof x.since !== "number") continue;
     if (x.start !== undefined && typeof x.start !== "number") continue;
     if (s === null || typeof s !== "object") continue;
-    if ((s.tool !== "claude" && s.tool !== "codex") || !str(s.id) || !SAFE_ID.test(s.id) || typeof s.title !== "string" || !str(s.cwd)) continue;
+    if ((s.tool !== "claude" && s.tool !== "codex" && s.tool !== "copilot") || !str(s.id) || !SAFE_ID.test(s.id) || typeof s.title !== "string" || !str(s.cwd)) continue;
     const subject: ResumeSubject = { tool: s.tool, id: s.id, title: s.title.slice(0, 200), cwd: s.cwd };
     if (str(s.homeDir)) subject.homeDir = s.homeDir;
     if (str(s.codexHome)) subject.codexHome = s.codexHome;

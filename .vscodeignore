@@ -9,7 +9,11 @@
 !media/codicon.css
 !media/codicon.ttf
 !media/cursor-dark.svg
+!media/cursor-light.svg
 !media/codex-dark.svg
+!media/codex-light.svg
+!media/copilot-dark.svg
+!media/copilot-light.svg
 !media/unfocused-ping.wav
 !package.json
 !README.md

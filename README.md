@@ -1,6 +1,8 @@
 # SessionDeck
 
-A sidebar tree of every Claude Code, Codex and Cursor agent session running on your machine, grouped by project, with a status icon on each row. A red bell means a session is waiting on you. Click the row and you land in its tab.
+SessionDeck tracks the Claude Code, Codex, GitHub Copilot and Cursor agent sessions running on your machine in one sidebar tree, grouped by project, with a status icon on each row. A red bell shows which Claude Code session is waiting on you. Click the row and you land in its tab or terminal; for a Claude Code session that works from another window too.
+
+If you searched for a way to track Claude Code or Codex agent sessions across VS Code or Cursor windows, this is that.
 
 ![SessionDeck: live session tree](media/mission-control.gif)
 
@@ -80,6 +82,10 @@ Hooks make it faster. **Install Hooks** adds Stop, Notification and UserPromptSu
 When a session blocks, you get a VS Code notification naming what it wants ("needs your permission to use Bash", or the question text) with an **Open** button. One notification per incident. Three or more blocks within 45 seconds collapse into one notice with a **Triage** button. Notifications live inside the editor window, which is exactly where you aren't when they fire, so two settings (both off by default) reach you when it's unfocused: `sessionDeck.unfocusedSound` and `sessionDeck.unfocusedOsNotification`. They fire at most once per 30 seconds.
 
 The extension makes no network calls, licensing included.
+
+### GitHub Copilot
+
+GitHub Copilot sessions appear under their projects too: the Copilot CLI (`copilot`) and VS Code's Copilot Chat, which runs every chat through an agent host. Both write the same session files under `~/.copilot/session-state` (or `$COPILOT_HOME`). The row says which one it is, and a VS Code Ask chat is marked "ask". A running session waiting for you to approve a tool gets the red bell and counts as needing you. Stop Session and Move into Editor work on CLI sessions only; Move resumes them with `copilot --resume=<id>`. VS Code chats have neither: every chat in a window shares one Copilot runtime process, and stopping it would end them all. Turn the rows off with `sessionDeck.showCopilotAgents`.
 
 ### Codex and Cursor
 
@@ -196,6 +202,7 @@ To uninstall cleanly, run **SessionDeck: Remove All Integrations** first (Claude
 | `sessionDeck.showCursorAgents` | `true` | Show Cursor Agent CLI sessions |
 | `sessionDeck.showCursorComposer` | `true` | Show Cursor Composer sessions seen through Cursor hooks |
 | `sessionDeck.showCodexAgents` | `true` | Show Codex CLI sessions |
+| `sessionDeck.showCopilotAgents` | `true` | Show GitHub Copilot sessions (CLI and VS Code chat) |
 | `sessionDeck.crossHost` | `true` | Publish and merge cross-host snapshots via the bridge |
 | `sessionDeck.floatAlwaysOnTop` | `true` | Keep the floating window on top |
 | `sessionDeck.extraConfigDirs` | `[]` | Extra Claude config homes to scan |
@@ -203,9 +210,21 @@ To uninstall cleanly, run **SessionDeck: Remove All Integrations** first (Claude
 
 ## Where it can be wrong
 
-Status is a reading of private, undocumented file formats: Claude transcripts, Codex rollouts, Cursor's `store.db`, and the editor's title storage. A vendor update can change any of them. When that happens, rows go blank or fall back to plain names rather than showing wrong data, so SessionDeck watches for it: Run Diagnostics shows a line per format, and a dim "Format drift suspected" note appears in the tree once a format stops parsing. **SessionDeck: Capture Drift Fixture** saves an anonymized sample of the broken file for a bug report.
+Status is a reading of private, undocumented file formats: Claude transcripts, Codex rollouts, Copilot session files, Cursor's `store.db`, and the editor's title storage. A vendor update can change any of them. When that happens, rows go blank or fall back to plain names rather than showing wrong data, so SessionDeck watches for it: Run Diagnostics shows a line per format, and a dim "Format drift suspected" note appears in the tree once a format stops parsing. **SessionDeck: Capture Drift Fixture** saves an anonymized sample of the broken file for a bug report.
 
 A turn killed before it wrote anything just drops off when its process dies.
+
+## Questions people ask
+
+**How do I see which Claude Code session is waiting on me?** A session that stops for a permission prompt or a question gets a red bell, and the activity bar and status bar count those sessions. `Ctrl+Alt+]` jumps to the one that has waited longest (`Cmd+Alt+]` on macOS). Seeing permission prompts needs **Install Hooks**; without hooks a waiting session looks like it is still working.
+
+**Does VS Code's Agents window show Claude Code or Codex sessions?** Partly. It manages sessions that run through VS Code's own agent harnesses, and [VS Code's documentation](https://code.visualstudio.com/docs/agents/run/sessions/manage-sessions) says it can also discover Claude Code and Codex sessions created elsewhere so you can open and continue them (hidden until you change the External filter). SessionDeck watches the running sessions themselves, in VS Code or Cursor, and gives each a status row. It also shows GitHub Copilot sessions, from the CLI and from VS Code's Copilot Chat.
+
+**Can I see Claude Code sessions running in tmux or over SSH?** Yes. Sessions in a plain terminal, tmux, cron, over SSH or started by an Agent SDK app all appear, with a ↗ badge when they run outside the editor. Remote windows show up through the bridge (above).
+
+**Is SessionDeck open source?** No. It is source-available: the code is public under a custom license (see [License](#license)). The bridge companion is MIT.
+
+More at [sessiondeck.dev/faq](https://sessiondeck.dev/faq).
 
 ## Pricing
 

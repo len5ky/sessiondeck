@@ -24,7 +24,7 @@ import {
 } from "./discovery";
 import { ConfigHome } from "./homes";
 import { CursorRow, ComposerRow } from "./cursor";
-import { CodexRow } from "./codex";
+import { CodexRow, copilotHoldsLock } from "./codex";
 import { editorFamilyRoots, LocationVerdict, pidHasOpen, sessionLocation } from "./procs";
 import { sessionResourceUri, dimResourceUri, outsideResourceUri, PreviewDocs } from "./decorations";
 import {
@@ -195,10 +195,10 @@ export interface RowFinders {
 /** The body of Show Last Message for a row from another host. Hosts publish the
  *  last message of Claude sessions only (bridge.ts buildSnapshot), so an empty
  *  Codex or Cursor row says where the message is instead of implying it has none. */
-export function remotePreviewBody(session: { tool: "claude" | "cursor" | "codex"; lastText?: string }): string {
+export function remotePreviewBody(session: { tool: "claude" | "cursor" | "codex" | "copilot"; lastText?: string }): string {
   if (session.lastText !== undefined && session.lastText !== "") return session.lastText;
-  if (session.tool === "codex" || session.tool === "cursor") {
-    const name = session.tool === "codex" ? "Codex" : "Cursor";
+  if (session.tool !== "claude") {
+    const name = session.tool === "codex" ? "Codex" : session.tool === "copilot" ? "Copilot" : "Cursor";
     return `_The last message of a ${name} session is only available on the machine that runs it._`;
   }
   return "_No message text._";
@@ -328,6 +328,11 @@ export class CodexNode {
     readonly row: CodexRow,
     readonly unread: boolean = false
   ) {}
+  /** Copilot: a live session of the user's own blocked on a permission prompt.
+   *  Counts as needs-you like a Claude approval (badge, triage tier 1). */
+  get attention(): boolean {
+    return this.row.attention === true && this.row.provenance === "interactive";
+  }
   /** Free-tier over-limit dim (see SessionNode.dimmed). */
   dimmed = false;
   /** Demoted external ENDED run: a machine/agent-driven `codex exec` (or subagent)
@@ -891,7 +896,7 @@ function projectHeatConstituents(p: ProjectNode, now: number): HeatConstituents 
     if (c.row.updatedMs > newestMs) newestMs = c.row.updatedMs;
   }
   for (const c of p.codexes) {
-    kinds.push(c.row.status === "working" ? "working" : c.unread ? "unread" : "idle");
+    kinds.push(c.attention && !c.dimmed ? "attention" : c.row.status === "working" ? "working" : c.unread ? "unread" : "idle");
     if (c.row.updatedMs > newestMs) newestMs = c.row.updatedMs;
   }
   const ageMin =
@@ -1190,9 +1195,11 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
    *  badge/alerts/triage), so the 🔔 count matches the badge and a license-gated
    *  row can never force a project to auto-expand. */
   private projectNeedsYou(p: ProjectNode): number {
-    return p.sessions.filter((s) =>
-      localNeedsYou({ attention: s.attention, pendingQuestion: s.row.pendingQuestion, dimmed: s.dimmed })
-    ).length;
+    return (
+      p.sessions.filter((s) =>
+        localNeedsYou({ attention: s.attention, pendingQuestion: s.row.pendingQuestion, dimmed: s.dimmed })
+      ).length + p.codexes.filter((x) => x.attention && !x.dimmed).length
+    );
   }
 
   /** Needs-you rows on a remote project: attention sessions on a LIVE host (already
@@ -1585,7 +1592,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
   /** Codex rows filter exactly like Cursor rows (age windows; working OR unread
    *  under "attention"). */
   private passesCodexNode(node: CodexNode): boolean {
-    if (!this.isTypeVisible("codex")) return false;
+    if (!this.isTypeVisible(node.row.family)) return false;
     switch (this.filterMode) {
       case "all":
         return true;
@@ -1594,7 +1601,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       case "24h":
         return node.row.ageSec < 86400;
       case "attention":
-        return node.row.status === "working" || node.unread;
+        return node.row.status === "working" || node.unread || node.attention;
     }
   }
 
@@ -1794,7 +1801,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
         orphanCodexes.push(node);
         continue;
       }
-      if (isUnread) unread++;
+      if (isUnread || node.attention) unread++;
       const key = normalizeDriveLetter(row.cwd);
       const list = codexByProject.get(key) ?? [];
       list.push(node);
@@ -2033,7 +2040,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
         for (const c of p.cursors)
           freeSessions.push({ key: "cursor:" + c.row.chatId, active: c.row.status === "working", recencyMs: c.row.updatedMs });
         for (const x of p.codexes)
-          freeSessions.push({ key: "codex:" + x.row.id, active: x.row.status === "working", recencyMs: x.row.updatedMs });
+          freeSessions.push({ key: "codex:" + x.row.id, active: x.row.status === "working" || x.attention, recencyMs: x.row.updatedMs });
         for (const m of p.composers)
           freeSessions.push({ key: "composer:" + m.row.conversationId, active: m.row.status === "working", recencyMs: m.row.updatedMs });
       }
@@ -2057,7 +2064,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
         for (const x of p.codexes) {
           if (coverage.dimmed.has("codex:" + x.row.id)) {
             x.dimmed = true;
-            if (x.unread) unread--;
+            if (x.unread || x.attention) unread--;
           }
         }
         for (const m of p.composers) {
@@ -3020,7 +3027,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
       title,
       status: node.demoted ? "ended" : row.status,
       why,
-      surface: "Codex CLI",
+      surface: row.family === "copilot" ? (row.surface === "vscode" ? "VS Code Copilot Chat" : "Copilot CLI") : "Codex CLI",
       kind: row.kind,
       provenance: row.provenance,
       demoted: node.demoted,
@@ -3541,7 +3548,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
    *  last-known status text still shows in the description/hover). */
   private remoteVisual(s: BridgeSession, unread: boolean, stale: boolean): IconVisual {
     if (s.tool === "cursor") return cursorVisual(!stale && s.status === "working");
-    if (s.tool === "codex") return codexVisual(!stale && s.status === "working");
+    if ((s.tool === "codex" || s.tool === "copilot") && !(s.attention === true && !stale)) return codexVisual(!stale && s.status === "working", s.tool);
     const kind = statusKind(remoteSessionFlags(s, unread));
     const v = sessionVisual(stale && kind === "working" ? "idle" : kind, false);
     return stale ? { ...v, spin: false } : v;
@@ -3732,20 +3739,23 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     if (node.dimmed) return lockedPanelCodex();
     const { row } = node;
     const working = row.status === "working";
-    const v = codexVisual(working);
-    const statusKind = terminalStatusKind(working, node.unread);
-    const status = statusKind === "working" ? "working" : statusKind === "unread" ? "done, unread" : "done";
+    const v = codexVisual(working, row.family, node.attention);
+    const statusKind = node.attention ? "attention" : terminalStatusKind(working, node.unread);
+    const status = node.attention ? "needs approval" : statusKind === "working" ? "working" : statusKind === "unread" ? "done, unread" : "done";
     const caption = doneCaption(node.unread, row.lastAgentMessage);
     const loc = node.demoted ? undefined : this.codexLocationOf(row);
-    const outside = loc?.location === "outside";
+    // A VS Code Copilot Chat session never offers Move (no terminal resume).
+    const outside = loc?.location === "outside" && row.surface !== "vscode";
     const hover = this.codexHover(row, outside);
     return {
       id: row.id,
+      ...(row.family === "copilot" ? { family: "copilot" as const } : {}),
+      ...(node.attention ? { attention: true } : {}),
       title: row.name,
       statusKind,
-      stoppable: loc !== undefined && loc.location !== "unknown" ? true : undefined,
+      stoppable: loc !== undefined && loc.location !== "unknown" && row.surface !== "vscode" ? true : undefined,
       columns: { time: fmtAge(row.ageSec), status, model: undefined, tokens: undefined },
-      description: `${node.unread ? "● " : ""}${fmtAge(row.ageSec)} ❯${caption !== undefined ? ` · ${caption}` : ""}`,
+      description: `${node.unread ? "● " : ""}${row.mode === "ask" ? "ask · " : ""}${fmtAge(row.ageSec)} ${row.surface === "vscode" ? "VS Code" : "❯"}${caption !== undefined ? ` · ${caption}` : ""}`,
       outside: outside || undefined,
       ...visual(v),
       unread: node.unread,
@@ -3765,7 +3775,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
   /** Plain-text hover for a Codex CLI session (name, kind, model provider, cwd,
    *  last activity, pid when live), shared by the tree tooltip and the panel row. */
   private codexHover(row: CodexRow, outside = false): string {
-    const lines: string[] = [`${row.name} — ${row.kind} (${row.status})`];
+    const lines: string[] = [`${row.name} — ${row.kind} (${row.attention === true ? "waiting for approval" : row.status})`];
     if (row.originator !== "") lines.push(`originator: ${row.originator}`);
     if (row.model !== "") lines.push(`model: ${shortModel(row.model)}`);
     if (row.modelProvider !== "") lines.push(`provider: ${row.modelProvider}`);
@@ -4313,7 +4323,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     if (s.outside === true && !node.stale) item.resourceUri = outsideResourceUri(`remote:${node.hostId}:${s.id}`);
     item.description = parts.join(" ");
     if (s.tool === "cursor") item.iconPath = this.brandIcon("cursor");
-    else if (s.tool === "codex") item.iconPath = this.brandIcon("codex");
+    else if ((s.tool === "codex" || s.tool === "copilot") && !(s.attention === true && !node.stale)) item.iconPath = this.brandIcon(s.tool);
     else item.iconPath = themeIcon(this.remoteVisual(s, node.unread, node.stale));
     const md = new vscode.MarkdownString(undefined, true);
     md.supportHtml = true;
@@ -4967,11 +4977,12 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
   /** Where a Codex session runs. Only a live, interactive, user-run session gets a
    *  verdict: exec runs and agent-spawned runs end on their own and are not moved. */
   codexLocationOf(row: CodexRow): LocationVerdict {
-    if (!row.live || row.pid === undefined || row.external || row.kind !== "codex") return { location: "unknown" };
+    if (!row.live || row.pid === undefined || row.external) return { location: "unknown" };
+    if (row.family === "codex" && row.kind !== "codex") return { location: "unknown" };
     if (row.parentClaudePid !== undefined) return { location: "unknown" };
     // The census pairs pid and rollout by folder; only a pid that holds this
-    // rollout open is provably this session.
-    if (!pidHasOpen(row.pid, row.rolloutPath)) return { location: "unknown" };
+    // rollout open is provably this session. Copilot: the session's lock names it.
+    if (row.family === "copilot" ? !copilotHoldsLock(row.pid, row.rolloutPath) : !pidHasOpen(row.pid, row.rolloutPath)) return { location: "unknown" };
     return sessionLocation(row.pid, undefined, undefined, this.familyRoots, { editorPids: this.terminalPids });
   }
 
@@ -4986,17 +4997,22 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     // adds the move action.
     const loc = node.demoted ? { location: "unknown" as const } : this.codexLocationOf(row);
     const outside = loc.location === "outside";
-    // A run whose place is known gets "codex-stop": Stop Session.
-    item.contextValue = outside ? "codex-outside" : loc.location !== "unknown" ? "codex-stop" : "codex";
+    // A run whose place is known gets "codex-stop": Stop Session. Copilot rows take
+    // the same three values under a "copilot" prefix (menus match /^(codex|copilot)/).
+    // A VS Code Copilot Chat session (surface "vscode") has no resume in a
+    // terminal (no Move), and its lock names VS Code's shared agent-host runtime,
+    // which runs every chat of that window, so it offers no Stop either.
+    const vscodeChat = row.surface === "vscode";
+    item.contextValue = vscodeChat ? "copilot-vscode" : outside ? `${row.family}-outside` : loc.location !== "unknown" ? `${row.family}-stop` : row.family;
     // age glyphs: ●(unread) + age + ❯ (Codex sessions are always terminal-run). A
     // finished-unread row also says WHAT it finished (last_agent_message snippet).
     const codexCaption = doneCaption(node.unread, row.lastAgentMessage);
     if (outside) item.resourceUri = outsideResourceUri("codex:" + row.id);
-    item.description = `${node.unread ? "● " : ""}${fmtAge(row.ageSec)} ❯${codexCaption !== undefined ? ` · ${codexCaption}` : ""}`;
-    item.iconPath = this.brandIcon("codex");
+    item.description = `${node.unread ? "● " : ""}${node.attention ? "approval · " : ""}${row.mode === "ask" ? "ask · " : ""}${fmtAge(row.ageSec)} ${row.surface === "vscode" ? "VS Code" : "❯"}${codexCaption !== undefined ? ` · ${codexCaption}` : ""}`;
+    item.iconPath = node.attention ? themeIcon(codexVisual(false, row.family, true)) : this.brandIcon(row.family);
     const md = new vscode.MarkdownString(undefined, true);
     md.supportHtml = true;
-    const codexState = node.orphan ? "orphaned" : node.unread ? "finished · unread" : row.status;
+    const codexState = node.orphan ? "orphaned" : node.attention ? "waiting for approval" : node.unread ? "finished · unread" : row.status;
     const vis = terminalStateVisual(row.status, node.unread);
     // ── Header: colored state glyph · name · kind (state). Rollout-file values
     //    (name/kind/originator/model/provider/cwd/subagent) are free text → mdText.
@@ -5052,7 +5068,7 @@ export class SessionsProvider implements vscode.TreeDataProvider<Node> {
     if (!node.demoted) {
       item.command = {
         command: "sessionDeck.openCodex",
-        title: "Focus Codex Session",
+        title: row.family === "copilot" ? "Focus Copilot Session" : "Focus Codex Session",
         arguments: [node],
       };
     }

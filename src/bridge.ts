@@ -923,11 +923,13 @@ export function buildSnapshot(model: PanelModel, identity: HostIdentity): HostSn
       if (c.locked === true) continue; // locked: not published cross-host (see above)
       sessions.push({
         id: c.id,
-        tool: "codex",
+        tool: c.family ?? "codex",
         cwd: project.cwd,
         title: c.title,
-        status: c.spin ? "working" : "idle",
+        // A Copilot approval prompt publishes "working" + attention, like a Claude one.
+        status: c.spin || c.attention === true ? "working" : "idle",
         ageSec: c.rawAgeSec ?? 0,
+        ...(c.attention === true ? { attention: true } : {}),
         ...(c.stoppable === true ? { stoppable: true as const } : {}),
         ...(c.outside === true ? { outside: true as const } : {}),
       });

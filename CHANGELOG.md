@@ -5,6 +5,32 @@ packages share one version number.
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-10-17
+
+### Added
+- GitHub Copilot sessions show in the tree, the panel and the table: the
+  Copilot CLI and VS Code Copilot Chat, which both write to
+  `~/.copilot/session-state` (or `$COPILOT_HOME`). The row says which one it
+  came from, and a VS Code Ask chat is marked "ask". A running session waiting
+  for you to approve a tool gets the red bell and counts as needing you, here
+  and on your other machines. Stop Session and Move into Editor work on CLI
+  sessions, and Move resumes them with `copilot --resume`. VS Code chats get
+  neither, because every chat in a window shares one Copilot process.
+- A Copilot entry in the type filter, and the `sessionDeck.showCopilotAgents`
+  setting to hide these rows.
+
+### Fixed
+- On Windows, a session started by a program (`claude -p`, the Agent SDK) with
+  a quoted folder ending in a backslash, such as a folder on a `subst` drive, is
+  now recognised as program-driven; the flags after that folder used to be lost.
+
+## [0.42.9] - 2026-10-16
+
+### Changed
+- Marketplace listing: display name, description, keywords and categories
+  now say what the extension does, so it shows up in Marketplace and Open VSX
+  search for agent sessions.
+
 ## [0.42.8] - 2026-10-07
 
 ### Fixed

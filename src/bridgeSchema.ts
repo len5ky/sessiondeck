@@ -445,7 +445,7 @@ export interface BridgeChild {
 
 export interface BridgeSession {
   id: string;
-  tool: "claude" | "cursor" | "codex";
+  tool: "claude" | "cursor" | "codex" | "copilot";
   cwd: string;
   title?: string;
   status: string;
@@ -494,7 +494,7 @@ export interface StoredHostSnapshot extends HostSnapshot {
 export const KNOWN_SESSION_STATUSES: readonly string[] = ["working", "waiting", "idle", "unknown"];
 
 const PLATFORMS: readonly string[] = ["wsl", "linux", "darwin", "win32"];
-const TOOLS: readonly string[] = ["claude", "cursor", "codex"];
+const TOOLS: readonly string[] = ["claude", "cursor", "codex", "copilot"];
 const CHILD_KINDS: readonly string[] = ["agent", "workflow", "task"];
 
 // ---- small pure helpers -----------------------------------------------------
@@ -699,7 +699,7 @@ export interface FocusAction {
   kind: "focus" | "stop";
   targetHostId: string;
   sessionId: string;
-  tool: "claude" | "cursor" | "codex";
+  tool: "claude" | "cursor" | "codex" | "copilot";
   cwd: string;
   postedAt: number;
   /** Set by a main that waits for a FocusResult (companion command rev 3). Added

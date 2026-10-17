@@ -51,19 +51,40 @@ export function pidAlive(pid: number): boolean {
   }
 }
 
+// ---- /proc text parsers (pure; tested from recorded fixtures on any OS) ------
+
+/** The fields of a /proc/<pid>/stat line this module reads. Fields 1-2 are
+ *  "pid (comm)" and comm may contain spaces and parens, so the line is split only
+ *  after the final ")". `state` is field 3 ("Z" = zombie), `ppid` field 4
+ *  (undefined unless a positive number), `start` field 22 (kernel jiffies since
+ *  boot; undefined when missing or not a number). */
+export function parseProcStat(stat: string): { state: string | undefined; ppid: number | undefined; start: number | undefined } {
+  const tail = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+  const ppid = Number(tail[1]);
+  const rawStart = tail[19];
+  const start = rawStart === undefined ? undefined : Number(rawStart);
+  return {
+    state: tail[0],
+    ppid: Number.isFinite(ppid) && ppid > 0 ? ppid : undefined,
+    start: start !== undefined && Number.isFinite(start) ? start : undefined,
+  };
+}
+
+/** /proc/<pid>/cmdline (NUL-separated, NUL-terminated) → argv, trailing empty
+ *  dropped. A kernel thread or zombie has an empty cmdline → []. */
+export function splitProcCmdline(raw: string): string[] {
+  const parts = raw.split("\0");
+  if (parts.length > 0 && parts[parts.length - 1] === "") parts.pop();
+  return parts;
+}
+
 /** Kernel start-time (jiffies since boot, field 22 of /proc/<pid>/stat) used to
  *  detect pid reuse. Linux only; `undefined` everywhere else (and on any read
  *  error) — callers treat undefined as "reuse-check unavailable", not "dead". */
 export function pidStartTime(pid: number): number | undefined {
   if (!isLinux) return undefined;
   try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    // fields 1-2 are "pid (comm)"; comm may contain spaces and parens, so split
-    // only after the final ")". starttime is field 22 => index 19 of the tail.
-    const raw = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
-    if (raw === undefined) return undefined;
-    const n = Number(raw);
-    return Number.isFinite(n) ? n : undefined;
+    return parseProcStat(readFileSync(`/proc/${pid}/stat`, "utf8")).start;
   } catch {
     return undefined;
   }
@@ -74,9 +95,7 @@ export function pidStartTime(pid: number): number | undefined {
 export function pidCmdline(pid: number): string[] | undefined {
   if (!isLinux) return undefined;
   try {
-    const parts = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
-    if (parts.length > 0 && parts[parts.length - 1] === "") parts.pop();
-    return parts;
+    return splitProcCmdline(readFileSync(`/proc/${pid}/cmdline`, "utf8"));
   } catch {
     return undefined;
   }
@@ -87,9 +106,7 @@ export function pidCmdline(pid: number): string[] | undefined {
 export function pidPpid(pid: number): number | undefined {
   if (!isLinux) return undefined;
   try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
-    return Number.isFinite(ppid) && ppid > 0 ? ppid : undefined;
+    return parseProcStat(readFileSync(`/proc/${pid}/stat`, "utf8")).ppid;
   } catch {
     return undefined;
   }
@@ -266,6 +283,17 @@ export function claudeAncestorPid(
   return undefined;
 }
 
+let censusReaders: CensusReaders = realReaders;
+
+/** Test-only: override the readers the census uses and drop the cache. The
+ *  activation harness passes an empty pid list so a live Claude session on the
+ *  machine running the tests (a self-hosted CI runner, a dev box) never becomes a
+ *  config home in a run that must see only its scratch HOME. */
+export function __setCensusReaders(r: Partial<CensusReaders>): void {
+  censusReaders = { ...realReaders, ...r };
+  __resetCensusCache();
+}
+
 /** Match the three old scanners' shared 30s TTL — the set of running CLIs turns
  *  over slowly and reading every /proc entry each 3s tick is wasteful. */
 const CENSUS_TTL_MS = 30_000;
@@ -283,7 +311,7 @@ let censusAt = 0;
 export function procCensus(): ProcCensus {
   const now = Date.now();
   if (censusCache !== null && censusAt !== 0 && now - censusAt < CENSUS_TTL_MS) return censusCache;
-  const c = classifyProcs(realReaders);
+  const c = classifyProcs(censusReaders);
   if (c.listed || !isLinux) {
     censusCache = c;
     censusAt = now;
@@ -569,8 +597,7 @@ export function classifyLocation(input: {
 export function pidState(pid: number): string | undefined {
   if (!isLinux) return undefined;
   try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    return stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+    return parseProcStat(readFileSync(`/proc/${pid}/stat`, "utf8")).state;
   } catch {
     return undefined;
   }
@@ -595,22 +622,34 @@ function pidComm(pid: number): string | undefined {
   }
 }
 
+/** The per-pid /proc reads the ancestry walk needs. The live reader goes to the
+ *  real /proc; tests pass one over recorded /proc files (any OS). */
+export interface ProcFsReader {
+  ppid(pid: number): number | undefined;
+  comm(pid: number): string | undefined;
+  cmdline(pid: number): string[] | undefined;
+}
+
+const liveProcFs: ProcFsReader = { ppid: pidPpid, comm: pidComm, cmdline: pidCmdline };
+
 /** Parent chain of `pid` (nearest first, `pid` itself excluded). `complete` is true
- *  only when the walk reached init or a pid without a parent. Linux only. */
-export function procAncestry(pid: number): { chain: ProcInfo[]; complete: boolean } | undefined {
-  if (!isLinux) return undefined;
+ *  only when the walk reached init or a pid without a parent. Linux only, unless
+ *  a reader is passed. */
+export function procAncestry(pid: number, fs?: ProcFsReader): { chain: ProcInfo[]; complete: boolean } | undefined {
+  if (fs === undefined && !isLinux) return undefined;
+  const r = fs ?? liveProcFs;
   const chain: ProcInfo[] = [];
   const seen = new Set<number>([pid]);
-  let cur = pidPpid(pid);
+  let cur = r.ppid(pid);
   for (let hops = 0; hops < 64; hops++) {
     if (cur === undefined) return { chain, complete: false };
     if (cur <= 1 || seen.has(cur)) return { chain, complete: cur <= 1 };
     seen.add(cur);
-    const comm = pidComm(cur);
-    const argv = pidCmdline(cur);
+    const comm = r.comm(cur);
+    const argv = r.cmdline(cur);
     if (comm === undefined || argv === undefined) return { chain, complete: false };
     chain.push({ pid: cur, comm, argv });
-    cur = pidPpid(cur);
+    cur = r.ppid(cur);
   }
   return { chain, complete: false };
 }
@@ -675,7 +714,8 @@ export function parsePsArgs(out: string): Map<number, string[]> {
   return argv;
 }
 
-/** Split a Windows command line into argv (quotes group, backslash-quote escapes). */
+/** Split a Windows command line into argv the way CommandLineToArgvW does
+ *  (quotes group; backslashes escape only before a quote). */
 export function splitWindowsCommandLine(line: string): string[] {
   const out: string[] = [];
   let cur = "";
@@ -683,9 +723,22 @@ export function splitWindowsCommandLine(line: string): string[] {
   let any = false;
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
-    if (c === "\\" && line[i + 1] === '"') {
-      cur += '"';
-      i++;
+    if (c === "\\") {
+      // CommandLineToArgvW: backslashes are literal unless a quote follows them;
+      // then 2n backslashes give n and the quote delimits, 2n+1 give n and a
+      // literal quote. Node and the Agent SDK double a trailing backslash inside
+      // quotes, so `"S:\sd cv win\\"` is the folder, not an open quote.
+      let n = 0;
+      while (line[i + n] === "\\") n++;
+      if (line[i + n] !== '"') {
+        cur += "\\".repeat(n);
+      } else {
+        cur += "\\".repeat(Math.floor(n / 2));
+        if (n % 2 === 1) cur += '"';
+        else quoted = !quoted;
+        n++; // the quote is consumed here too
+      }
+      i += n - 1;
       any = true;
     } else if (c === '"') {
       quoted = !quoted;

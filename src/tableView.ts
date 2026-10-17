@@ -117,7 +117,7 @@ export class TableViewProvider implements vscode.WebviewViewProvider {
 function tableHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   const n = nonce();
   const codiconUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, "media", "codicon.css"));
-  const brands = { cursor: brandSvg(extensionUri, "cursor"), codex: brandSvg(extensionUri, "codex") };
+  const brands = { cursor: brandSvg(extensionUri, "cursor"), codex: brandSvg(extensionUri, "codex"), copilot: brandSvg(extensionUri, "copilot") };
   const csp = [
     `default-src 'none'`,
     `style-src ${webview.cspSource} 'nonce-${n}'`,
